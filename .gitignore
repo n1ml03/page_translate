@@ -1,0 +1,48 @@
+# Dependencies
+node_modules/
+venv/
+__pycache__/
+*.pyc
+
+# Environment
+.env
+.env.local
+*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build
+dist/
+build/
+*.egg-info/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Lock files (optional - remove if you want to track them)
+bun.lock
+package-lock.json
+yarn.lock
+
+# Test coverage
+coverage/
+.coverage
+htmlcov/
+tests/
+
+# Kiro
+.kiro/
+
+web.html
+vba.bas
+prompt.md
+bun.lock

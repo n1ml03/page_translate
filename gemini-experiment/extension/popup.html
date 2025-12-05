@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Gemini Page Translator</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="header">
+    <h1>Gemini Translator</h1>
+    <div class="connection-status">
+      <div id="statusIndicator" class="status-indicator unconfigured">
+        <span class="status-dot"></span>
+        <span class="status-text">Not configured</span>
+      </div>
+      <button type="button" id="refreshBtn" class="refresh-btn" aria-label="Refresh connection status" title="Check connection">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M23 4v6h-6"></path>
+          <path d="M1 20v-6h6"></path>
+          <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+        </svg>
+      </button>
+    </div>
+  </header>
+  
+  <main>
+    <!-- Server Configuration Section -->
+    <section class="settings-group collapsible" id="serverConfigSection">
+      <div class="section-header" data-section="serverConfigSection">
+        <h2>Server Configuration <span class="section-status" id="serverConfigStatus"></span></h2>
+        <span class="toggle-icon">▼</span>
+      </div>
+      <div class="section-content">
+        <div class="section-content-inner">
+          <div class="form-group">
+            <label for="serverUrl">Server URL</label>
+            <input type="text" id="serverUrl" placeholder="http://192.168.0.101:8001/proxy/translate" tabindex="1">
+          </div>
+        </div>
+      </div>
+    </section>
+    
+    <!-- Translation Settings Section -->
+    <section class="settings-group">
+      <h2>Translation Settings</h2>
+      <div class="form-group">
+        <label for="model">Model Name</label>
+        <input type="text" id="model" placeholder="gemini-2.0-flash" tabindex="2">
+      </div>
+      <div class="form-group">
+        <label for="targetLanguage">Target Language</label>
+        <input type="text" id="targetLanguage" placeholder="English" tabindex="3">
+      </div>
+    </section>
+  </main>
+  
+  <footer>
+    <div class="button-group">
+      <button id="saveBtn" class="btn-secondary" tabindex="4">Save</button>
+      <button id="translateBtn" class="btn-primary" tabindex="5">Translate</button>
+    </div>
+  </footer>
+  
+  <div id="status" class="status"></div>
+  
+  <!-- Toast notification container -->
+  <div id="toastContainer" class="toast-container"></div>
+  
+  <script type="module" src="popup.js"></script>
+</body>
+</html>
