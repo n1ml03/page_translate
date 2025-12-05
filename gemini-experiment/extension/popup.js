@@ -77,14 +77,15 @@ function showToast(message, type = 'info', autoDismissMs = null) {
   toast.querySelector('.toast-dismiss').addEventListener('click', () => dismissToast(toast));
   container.appendChild(toast);
 
-  const dismissTime = autoDismissMs ?? (type === 'error' ? 5000 : 3000);
+  const dismissTime = autoDismissMs ?? (type === 'error' ? 2500 : 1500);
   if (dismissTime > 0) setTimeout(() => dismissToast(toast), dismissTime);
 }
 
 function dismissToast(toast) {
   if (!toast?.parentNode) return;
   toast.classList.add('toast-exit');
-  toast.addEventListener('animationend', () => toast.parentNode?.removeChild(toast));
+  // Fallback: remove after animation duration even if animationend doesn't fire
+  setTimeout(() => toast.parentNode?.removeChild(toast), 200);
 }
 
 // ============================================================================
@@ -368,9 +369,10 @@ async function initializePopup() {
   document.getElementById('translateBtn').addEventListener('click', handleTranslate);
   document.getElementById('refreshBtn')?.addEventListener('click', handleRefreshConnection);
 
-  ['serverUrl', 'model', 'targetLanguage'].forEach(id => {
+  ['serverUrl', 'model'].forEach(id => {
     document.getElementById(id)?.addEventListener('input', handleInputChange);
   });
+  document.getElementById('targetLanguage')?.addEventListener('change', handleInputChange);
 
   document.querySelectorAll('.section-header[data-section]').forEach(header => {
     header.addEventListener('click', () => toggleSection(header.dataset.section));

@@ -2,28 +2,28 @@
    CSS Design Tokens
    ======================================== */
 :root {
-  /* Colors - Primary Palette (Gemini-inspired) */
-  --color-primary: #4285F4;
-  --color-primary-hover: #3367D6;
+  /* Colors - Primary Palette */
+  --color-primary: #4F46E5;
+  --color-primary-hover: #4338CA;
   --color-secondary: #6B7280;
   --color-secondary-hover: #4B5563;
-  --color-success: #34A853;
-  --color-error: #EA4335;
-  --color-warning: #FBBC04;
+  --color-success: #10B981;
+  --color-error: #EF4444;
+  --color-warning: #F59E0B;
   
   /* Backgrounds */
   --bg-primary: #FFFFFF;
-  --bg-secondary: #F8F9FA;
+  --bg-secondary: #F9FAFB;
   --bg-input: #FFFFFF;
   
   /* Text Colors */
-  --text-primary: #202124;
-  --text-secondary: #5F6368;
-  --text-placeholder: #9AA0A6;
+  --text-primary: #111827;
+  --text-secondary: #6B7280;
+  --text-placeholder: #9CA3AF;
   --text-inverse: #FFFFFF;
   
   /* Borders */
-  --border-color: #DADCE0;
+  --border-color: #E5E7EB;
   --border-focus: var(--color-primary);
   --border-error: var(--color-error);
   
@@ -38,20 +38,20 @@
   
   /* Border Radius */
   --radius-sm: 4px;
-  --radius-md: 8px;
-  --radius-lg: 12px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
   
   /* Shadows */
-  --shadow-sm: 0 1px 2px rgba(60, 64, 67, 0.1);
-  --shadow-md: 0 2px 6px rgba(60, 64, 67, 0.15);
-  --shadow-lg: 0 4px 12px rgba(60, 64, 67, 0.2);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
+  --shadow-md: 0 4px 6px rgba(0, 0, 0, 0.1);
+  --shadow-lg: 0 10px 15px rgba(0, 0, 0, 0.1);
   
   /* Transitions */
   --transition-fast: 150ms ease;
   --transition-normal: 200ms ease;
   
   /* Typography */
-  --font-family: 'Google Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
   --font-size-xs: 11px;
   --font-size-sm: 13px;
   --font-size-base: 14px;
@@ -74,8 +74,8 @@
 }
 
 body {
-  width: 340px;
-  min-height: 320px;
+  width: 360px;
+  min-height: 400px;
   padding: var(--space-4);
   font-family: var(--font-family);
   font-size: var(--font-size-base);
@@ -136,7 +136,7 @@ select {
 select {
   cursor: pointer;
   appearance: none;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%235F6368' d='M2 4l4 4 4-4'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%236B7280' d='M2 4l4 4 4-4'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
   background-position: right var(--space-3) center;
   padding-right: var(--space-8);
@@ -152,7 +152,7 @@ input[type="password"]:focus,
 select:focus {
   outline: none;
   border-color: var(--border-focus);
-  box-shadow: 0 0 0 3px rgba(66, 133, 244, 0.15);
+  box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.1);
 }
 
 input[type="text"]:hover:not(:focus),
@@ -161,13 +161,12 @@ select:hover:not(:focus) {
   border-color: var(--text-secondary);
 }
 
-/* Input error state */
 input.error {
   border-color: var(--border-error);
 }
 
 input.error:focus {
-  box-shadow: 0 0 0 3px rgba(234, 67, 53, 0.15);
+  box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.1);
 }
 
 /* ========================================
@@ -201,20 +200,18 @@ button:active:not(:disabled) {
   transform: scale(0.98);
 }
 
-/* Primary button (Translate) */
 button.btn-primary,
 #translateBtn {
-  background: linear-gradient(135deg, #4285F4, #34A853);
+  background-color: var(--color-primary);
   color: var(--text-inverse);
   box-shadow: var(--shadow-sm);
 }
 
 button.btn-primary:hover:not(:disabled),
 #translateBtn:hover:not(:disabled) {
-  background: linear-gradient(135deg, #3367D6, #2E7D32);
+  background-color: var(--color-primary-hover);
 }
 
-/* Secondary button (Save) */
 button.btn-secondary,
 #saveBtn {
   background-color: var(--bg-secondary);
@@ -224,16 +221,14 @@ button.btn-secondary,
 
 button.btn-secondary:hover:not(:disabled),
 #saveBtn:hover:not(:disabled) {
-  background-color: #E8EAED;
+  background-color: #E5E7EB;
 }
 
-/* Disabled button state */
 button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
 
-/* Focus visible for keyboard navigation */
 button:focus-visible {
   outline: 2px solid var(--color-primary);
   outline-offset: 2px;
@@ -243,7 +238,6 @@ input:focus-visible {
   outline: none;
 }
 
-/* Button loading spinner */
 .spinner {
   width: 16px;
   height: 16px;
@@ -257,14 +251,13 @@ input:focus-visible {
   to { transform: rotate(360deg); }
 }
 
-/* Unsaved changes indicator */
 button.has-changes {
   border-color: var(--color-warning);
-  background-color: #FEF7E0;
+  background-color: #FFFBEB;
 }
 
 /* ========================================
-   Status Messages (legacy support)
+   Status Messages
    ======================================== */
 .status {
   margin-top: var(--space-3);
@@ -276,16 +269,16 @@ button.has-changes {
 
 .status.success {
   display: block;
-  background-color: #E6F4EA;
-  color: #137333;
-  border: 1px solid #CEEAD6;
+  background-color: #ECFDF5;
+  color: #065F46;
+  border: 1px solid #A7F3D0;
 }
 
 .status.error {
   display: block;
-  background-color: #FCE8E6;
-  color: #C5221F;
-  border: 1px solid #F5C6CB;
+  background-color: #FEF2F2;
+  color: #991B1B;
+  border: 1px solid #FECACA;
 }
 
 /* ========================================
@@ -344,21 +337,21 @@ button.has-changes {
 }
 
 .toast-success {
-  background-color: #E6F4EA;
-  color: #137333;
-  border: 1px solid #CEEAD6;
+  background-color: #ECFDF5;
+  color: #065F46;
+  border: 1px solid #A7F3D0;
 }
 
 .toast-error {
-  background-color: #FCE8E6;
-  color: #C5221F;
-  border: 1px solid #F5C6CB;
+  background-color: #FEF2F2;
+  color: #991B1B;
+  border: 1px solid #FECACA;
 }
 
 .toast-info {
-  background-color: #E8F0FE;
-  color: #1967D2;
-  border: 1px solid #D2E3FC;
+  background-color: #EFF6FF;
+  color: #1E40AF;
+  border: 1px solid #BFDBFE;
 }
 
 .toast-message {
@@ -397,7 +390,51 @@ button.has-changes {
 }
 
 .form-group.has-error input:focus {
-  box-shadow: 0 0 0 3px rgba(234, 67, 53, 0.15);
+  box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.1);
+}
+
+/* ========================================
+   Password Visibility Toggle
+   ======================================== */
+.password-wrapper {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.password-wrapper input {
+  padding-right: 40px;
+}
+
+.password-toggle {
+  position: absolute;
+  right: var(--space-2);
+  background: none;
+  border: none;
+  padding: var(--space-1);
+  cursor: pointer;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: color var(--transition-fast);
+  flex: none;
+  width: 28px;
+  height: 28px;
+}
+
+.password-toggle:hover {
+  color: var(--text-primary);
+}
+
+.password-toggle:focus {
+  outline: none;
+  color: var(--color-primary);
+}
+
+.password-toggle svg {
+  width: 18px;
+  height: 18px;
 }
 
 /* ========================================
@@ -412,10 +449,6 @@ button.has-changes {
 
 .header h1 {
   margin: 0;
-  background: linear-gradient(135deg, #4285F4, #34A853);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
 }
 
 .connection-status {
@@ -442,29 +475,26 @@ button.has-changes {
   flex-shrink: 0;
 }
 
-/* Connected state - green */
 .status-indicator.connected .status-dot {
   background-color: var(--color-success);
   box-shadow: 0 0 4px var(--color-success);
 }
 
 .status-indicator.connected {
-  color: #137333;
-  background-color: #E6F4EA;
+  color: #065F46;
+  background-color: #ECFDF5;
 }
 
-/* Disconnected state - red */
 .status-indicator.disconnected .status-dot {
   background-color: var(--color-error);
   box-shadow: 0 0 4px var(--color-error);
 }
 
 .status-indicator.disconnected {
-  color: #C5221F;
-  background-color: #FCE8E6;
+  color: #991B1B;
+  background-color: #FEF2F2;
 }
 
-/* Unconfigured state - gray */
 .status-indicator.unconfigured .status-dot {
   background-color: var(--text-secondary);
 }
@@ -474,15 +504,14 @@ button.has-changes {
   background-color: var(--bg-secondary);
 }
 
-/* Checking state - animated */
 .status-indicator.checking .status-dot {
   background-color: var(--color-warning);
   animation: pulse 1s ease-in-out infinite;
 }
 
 .status-indicator.checking {
-  color: #E37400;
-  background-color: #FEF7E0;
+  color: #92400E;
+  background-color: #FFFBEB;
 }
 
 @keyframes pulse {
@@ -490,7 +519,6 @@ button.has-changes {
   50% { opacity: 0.4; }
 }
 
-/* Refresh button */
 .refresh-btn {
   display: flex;
   align-items: center;
@@ -569,7 +597,7 @@ main {
 }
 
 .settings-group.collapsible .section-header:hover {
-  background-color: rgba(66, 133, 244, 0.05);
+  background-color: rgba(79, 70, 229, 0.03);
 }
 
 .settings-group.collapsible .section-header h2 {
@@ -629,7 +657,7 @@ main {
 .section-header:hover .toggle-icon {
   border-color: var(--color-primary);
   color: var(--color-primary);
-  background: rgba(66, 133, 244, 0.05);
+  background: rgba(79, 70, 229, 0.05);
 }
 
 .settings-group.collapsed .toggle-icon {

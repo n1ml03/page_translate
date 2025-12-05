@@ -1,4 +1,4 @@
-// Background Script - Handles translation requests from content script
+// Background Script - Handles translation requests from content script with streaming support
 
 const ERROR_TYPES = {
   CONTEXT_LENGTH_EXCEEDED: 'CONTEXT_LENGTH_EXCEEDED',
@@ -39,7 +39,7 @@ function sleep(ms) {
 // PAYLOAD & RESPONSE
 // ============================================================================
 
-function constructPayload(batch, settings) {
+function constructPayload(batch, settings, stream = false) {
   const systemPrompt = `You are a professional web translator.
 Task: Translate the following JSON array of strings into ${settings.targetLanguage}.
 Input: A JSON array of strings.
@@ -61,7 +61,8 @@ Rules:
       { role: 'system', content: systemPrompt },
       { role: 'user', content: JSON.stringify(batch) }
     ],
-    temperature: 0.3
+    temperature: 0.3,
+    stream
   };
 }
 
@@ -117,11 +118,78 @@ function parseErrorResponse(statusCode, data) {
 }
 
 // ============================================================================
-// API REQUEST
+// STREAMING API REQUEST
+// ============================================================================
+
+async function sendStreamingTranslationRequest(batch, settings, onTranslation) {
+  const payload = constructPayload(batch, settings, true);
+
+  const response = await fetch(settings.proxyUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok) {
+    let data;
+    try { data = await response.json(); } catch { data = await response.text(); }
+    const errorInfo = parseErrorResponse(response.status, data);
+    throw new Error(formatErrorMessage(errorInfo));
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  const translations = [];
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+
+      const data = line.slice(6).trim();
+      if (!data) continue;
+
+      try {
+        const parsed = JSON.parse(data);
+
+        if (parsed.error) {
+          throw new Error(parsed.error.message || 'Translation error');
+        }
+
+        if (parsed.translation !== undefined && parsed.index !== undefined) {
+          translations[parsed.index] = parsed.translation;
+          onTranslation(parsed.index, parsed.translation, parsed.cached);
+        }
+
+        if (parsed.done) {
+          return translations;
+        }
+      } catch (e) {
+        if (e.message !== 'Translation error') {
+          // JSON parse error, skip this line
+          continue;
+        }
+        throw e;
+      }
+    }
+  }
+
+  return translations;
+}
+
+// ============================================================================
+// NON-STREAMING API REQUEST (fallback)
 // ============================================================================
 
 async function sendTranslationRequest(batch, settings, maxRetries = 2) {
-  const payload = constructPayload(batch, settings);
+  const payload = constructPayload(batch, settings, false);
   let lastError = null;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -182,6 +250,44 @@ function formatErrorMessage(errorInfo) {
 // MESSAGE HANDLER
 // ============================================================================
 
+// Store active ports for streaming communication
+const activePorts = new Map();
+
+async function handleStreamingTranslationRequest(request, port) {
+  try {
+    const settings = await new Promise((resolve, reject) => {
+      chrome.storage.local.get(DEFAULT_SETTINGS, (result) => {
+        chrome.runtime.lastError ? reject(chrome.runtime.lastError) : resolve(result);
+      });
+    });
+
+    if (!settings.targetEndpoint) {
+      throw new Error('Target endpoint not configured');
+    }
+
+    if (!settings.username || !settings.password) {
+      throw new Error('Credentials not configured');
+    }
+
+    await sendStreamingTranslationRequest(
+      request.batch,
+      settings,
+      (index, translation, cached) => {
+        port.postMessage({
+          type: 'translation',
+          index,
+          translation,
+          cached: !!cached
+        });
+      }
+    );
+
+    port.postMessage({ type: 'done' });
+  } catch (error) {
+    port.postMessage({ type: 'error', error: error.message });
+  }
+}
+
 async function handleTranslationRequest(request) {
   try {
     const settings = await new Promise((resolve, reject) => {
@@ -205,6 +311,25 @@ async function handleTranslationRequest(request) {
   }
 }
 
+// Handle long-lived connections for streaming
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== 'translate-stream') return;
+
+  const portId = Date.now() + Math.random();
+  activePorts.set(portId, port);
+
+  port.onMessage.addListener((request) => {
+    if (request.type === 'translate' && request.batch) {
+      handleStreamingTranslationRequest(request, port);
+    }
+  });
+
+  port.onDisconnect.addListener(() => {
+    activePorts.delete(portId);
+  });
+});
+
+// Handle simple one-shot messages (fallback for non-streaming)
 chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
   if (request.type === 'translate' && request.batch) {
     handleTranslationRequest(request)

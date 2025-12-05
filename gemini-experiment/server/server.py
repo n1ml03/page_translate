@@ -1,6 +1,6 @@
 """
 Gemini Translation Server.
-FastAPI server for HTML-aware translation using Google Gemini API.
+FastAPI server for HTML-aware translation using Google Gemini API with streaming support.
 """
 
 import asyncio
@@ -11,12 +11,12 @@ import re
 import socket
 import time
 from collections import OrderedDict
-from typing import Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
@@ -123,15 +123,49 @@ limiter = RateLimiter()
 # TRANSLATION VALIDATION
 # ============================================================================
 
-# Common English words to detect untranslated text
-ENGLISH_PATTERNS = re.compile(
-    r"\b(the|and|is|are|was|were|have|has|been|will|would|could|should|"
-    r"this|that|with|from|for|not|but|what|all|when|there|can|an|your|"
-    r"which|their|said|each|she|do|how|if|its|about|into|than|them|"
-    r"these|some|her|him|my|make|like|just|over|such|our|most|other|"
-    r"click|here|more|see|read|view|next|back|home|page|link|button)\b",
-    re.IGNORECASE,
-)
+# Common English words to detect untranslated text (expanded list)
+ENGLISH_COMMON_WORDS = {
+    # Articles & determiners
+    "the", "a", "an", "this", "that", "these", "those", "my", "your", "his",
+    "her", "its", "our", "their", "some", "any", "no", "every", "each", "all",
+    # Pronouns
+    "i", "you", "he", "she", "it", "we", "they", "me", "him", "them", "us",
+    "who", "what", "which", "whom", "whose",
+    # Verbs (common)
+    "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+    "do", "does", "did", "will", "would", "could", "should", "may", "might",
+    "must", "can", "shall", "get", "got", "make", "made", "go", "went", "come",
+    "came", "take", "took", "see", "saw", "know", "knew", "think", "thought",
+    # Prepositions & conjunctions
+    "in", "on", "at", "to", "for", "of", "with", "by", "from", "up", "down",
+    "out", "into", "over", "under", "about", "after", "before", "between",
+    "and", "or", "but", "if", "when", "where", "while", "because", "although",
+    "than", "then", "so", "as", "not", "just", "only", "also", "even", "still",
+    # Common nouns & UI terms
+    "click", "here", "more", "view", "read", "next", "back", "home", "page",
+    "link", "button", "menu", "search", "login", "logout", "sign", "submit",
+    "cancel", "save", "delete", "edit", "add", "remove", "close", "open",
+    "settings", "profile", "account", "help", "contact", "about", "privacy",
+    "terms", "loading", "error", "success", "warning", "info", "message",
+}
+
+ENGLISH_WORD_PATTERN = re.compile(r"\b[a-zA-Z]+\b")
+
+# Pattern to detect ASCII-only content (likely English)
+ASCII_LETTER_PATTERN = re.compile(r"[a-zA-Z]")
+
+# Non-Latin target languages that should have minimal English
+NON_LATIN_LANGS = {
+    "japanese", "chinese", "korean", "thai", "vietnamese", "arabic", "hebrew",
+    "hindi", "russian", "greek", "persian", "bengali", "tamil", "telugu",
+    "marathi", "gujarati", "kannada", "malayalam", "punjabi", "urdu",
+    "tiếng việt", "日本語", "中文", "简体中文", "繁體中文", "한국어", "ไทย",
+    "العربية", "עברית", "हिन्दी", "русский", "ελληνικά", "فارسی",
+}
+
+# HTML tag pattern for extraction and validation
+HTML_TAG_PATTERN = re.compile(r"<(/?)(\w+)([^>]*)>", re.IGNORECASE)
+HTML_SELF_CLOSING_TAGS = {"br", "hr", "img", "input", "meta", "link", "area", "base", "col", "embed", "source", "track", "wbr"}
 
 
 def strip_html_tags(text: str) -> str:
@@ -139,63 +173,264 @@ def strip_html_tags(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text)
 
 
+def extract_text_words(text: str) -> List[str]:
+    """Extract words from text, excluding HTML tags."""
+    clean_text = strip_html_tags(text)
+    return [w.lower() for w in ENGLISH_WORD_PATTERN.findall(clean_text) if len(w) > 1]
+
+
+def is_non_latin_target(target_lang: str) -> bool:
+    """Check if target language uses non-Latin script."""
+    return any(lang in target_lang.lower() for lang in NON_LATIN_LANGS)
+
+
+def count_english_indicators(text: str) -> tuple[int, int]:
+    """
+    Count English word indicators in text.
+    Returns (english_word_count, total_word_count).
+    """
+    words = extract_text_words(text)
+    if not words:
+        return 0, 0
+    english_count = sum(1 for w in words if w in ENGLISH_COMMON_WORDS)
+    return english_count, len(words)
+
+
+def has_significant_ascii_content(text: str) -> bool:
+    """Check if text has significant ASCII letter content (potential untranslated)."""
+    clean_text = strip_html_tags(text)
+    if not clean_text:
+        return False
+    ascii_letters = len(ASCII_LETTER_PATTERN.findall(clean_text))
+    total_chars = len(clean_text.replace(" ", ""))
+    if total_chars == 0:
+        return False
+    return ascii_letters / total_chars > 0.5
+
+
 def detect_untranslated(original: str, translated: str, target_lang: str) -> bool:
     """
     Check if translation appears incomplete (still contains source language).
     Returns True if untranslated content is detected.
     """
-    # Strip HTML for comparison
-    orig_clean = strip_html_tags(original).lower().strip()
-    trans_clean = strip_html_tags(translated).lower().strip()
+    orig_clean = strip_html_tags(original).strip()
+    trans_clean = strip_html_tags(translated).strip()
 
-    # If translation is identical to original, likely untranslated
-    if orig_clean == trans_clean and len(orig_clean) > 3:
+    # Empty translation
+    if not trans_clean and orig_clean:
         return True
 
-    # For non-Latin target languages, check for excessive English words
-    non_latin_langs = [
-        "japanese",
-        "chinese",
-        "korean",
-        "thai",
-        "vietnamese",
-        "arabic",
-        "hebrew",
-        "hindi",
-        "russian",
-        "greek",
-        "tiếng việt",
-        "日本語",
-        "中文",
-        "한국어",
-        "ไทย",
-        "العربية",
-        "עברית",
-        "हिन्दी",
-        "русский",
-    ]
+    orig_lower = orig_clean.lower()
+    trans_lower = trans_clean.lower()
 
-    is_non_latin = any(lang in target_lang.lower() for lang in non_latin_langs)
+    # Identical content (case-insensitive) - likely untranslated
+    if orig_lower == trans_lower and len(orig_clean) > 2:
+        return True
 
-    if is_non_latin:
-        # Count English word matches in translated text
-        matches = ENGLISH_PATTERNS.findall(trans_clean)
-        words = trans_clean.split()
-        if len(words) > 0 and len(matches) / max(len(words), 1) > 0.3:
+    # Check for high similarity (>80% same characters)
+    if len(orig_lower) > 5 and len(trans_lower) > 5:
+        common = sum(1 for c in orig_lower if c in trans_lower)
+        similarity = common / max(len(orig_lower), len(trans_lower))
+        if similarity > 0.85:
+            return True
+
+    # For non-Latin targets, apply stricter checks
+    if is_non_latin_target(target_lang):
+        # Check for excessive ASCII content
+        if has_significant_ascii_content(trans_clean):
+            # Allow some ASCII (numbers, proper nouns), but flag if too much
+            eng_count, total_count = count_english_indicators(trans_clean)
+            if total_count > 0:
+                # More than 20% common English words is suspicious
+                if eng_count / total_count > 0.2:
+                    return True
+                # Or more than 3 common English words in short text
+                if eng_count >= 3 and total_count < 10:
+                    return True
+
+        # Check if original English words are still present
+        orig_words = set(extract_text_words(original))
+        trans_words = set(extract_text_words(translated))
+        common_words = orig_words & trans_words & ENGLISH_COMMON_WORDS
+        if len(common_words) >= 2:
             return True
 
     return False
 
 
+def extract_html_tags(text: str) -> List[tuple[str, str, bool]]:
+    """
+    Extract HTML tags from text.
+    Returns list of (tag_name, full_match, is_closing).
+    """
+    tags = []
+    for match in HTML_TAG_PATTERN.finditer(text):
+        is_closing = match.group(1) == "/"
+        tag_name = match.group(2).lower()
+        tags.append((tag_name, match.group(0), is_closing))
+    return tags
+
+
+def detect_residual_tags(original: str, translated: str) -> bool:
+    """
+    Check for residual/malformed HTML tags in translation.
+    Returns True if issues are detected.
+    """
+    orig_tags = extract_html_tags(original)
+    trans_tags = extract_html_tags(translated)
+
+    # Build tag structure for original
+    orig_tag_names = [t[0] for t in orig_tags]
+    trans_tag_names = [t[0] for t in trans_tags]
+
+    # Check 1: Tag count mismatch (excluding self-closing)
+    orig_paired = [t for t in orig_tag_names if t not in HTML_SELF_CLOSING_TAGS]
+    trans_paired = [t for t in trans_tag_names if t not in HTML_SELF_CLOSING_TAGS]
+    if sorted(orig_paired) != sorted(trans_paired):
+        return True
+
+    # Check 2: Validate tag balance in translation
+    tag_stack = []
+    for tag_name, _, is_closing in trans_tags:
+        if tag_name in HTML_SELF_CLOSING_TAGS:
+            continue
+        if is_closing:
+            if not tag_stack or tag_stack[-1] != tag_name:
+                return True  # Mismatched closing tag
+            tag_stack.pop()
+        else:
+            tag_stack.append(tag_name)
+
+    if tag_stack:
+        return True  # Unclosed tags
+
+    # Check 3: Detect broken/partial tags
+    broken_tag_pattern = re.compile(r"<[^>]*$|^[^<]*>|<[^a-zA-Z/]|<\s+\w")
+    if broken_tag_pattern.search(translated):
+        return True
+
+    # Check 4: Detect duplicate adjacent tags (e.g., <b><b>)
+    duplicate_pattern = re.compile(r"<(\w+)([^>]*)>\s*<\1[^>]*>", re.IGNORECASE)
+    if duplicate_pattern.search(translated):
+        return True
+
+    # Check 5: Detect empty tag pairs (e.g., <b></b> with no content)
+    empty_tag_pattern = re.compile(r"<(\w+)[^>]*>\s*</\1>", re.IGNORECASE)
+    empty_matches = empty_tag_pattern.findall(translated)
+    orig_empty = empty_tag_pattern.findall(original)
+    if len(empty_matches) > len(orig_empty):
+        return True
+
+    return False
+
+
+def validate_translation(original: str, translated: str, target_lang: str) -> tuple[bool, str]:
+    """
+    Comprehensive validation of a translation.
+    Returns (is_valid, reason).
+    """
+    if not translated:
+        return False, "empty_translation"
+
+    if detect_untranslated(original, translated, target_lang):
+        return False, "untranslated"
+
+    if detect_residual_tags(original, translated):
+        return False, "residual_tags"
+
+    return True, "ok"
+
+
 def get_incomplete_indices(
     originals: List[str], translations: List[str], target_lang: str
 ) -> List[int]:
-    """Find indices of translations that appear incomplete."""
+    """Find indices of translations that appear incomplete or have issues."""
     incomplete = []
     for i, (orig, trans) in enumerate(zip(originals, translations)):
-        if detect_untranslated(orig, trans, target_lang):
+        is_valid, _ = validate_translation(orig, trans, target_lang)
+        if not is_valid:
             incomplete.append(i)
     return incomplete
+
+
+# ============================================================================
+# STREAMING JSON PARSER
+# ============================================================================
+
+
+class StreamingJSONArrayParser:
+    """Parses a streaming JSON array and yields complete items as they arrive."""
+
+    def __init__(self):
+        self.buffer = ""
+        self.in_array = False
+        self.items_yielded = 0
+
+    def feed(self, chunk: str) -> List[str]:
+        """Feed a chunk of data and return any complete items found."""
+        self.buffer += chunk
+        items = []
+
+        # Find array start
+        if not self.in_array:
+            start_idx = self.buffer.find("[")
+            if start_idx != -1:
+                self.in_array = True
+                self.buffer = self.buffer[start_idx + 1 :]
+            else:
+                return items
+
+        # Parse items from buffer
+        while self.buffer:
+            self.buffer = self.buffer.lstrip()
+            if not self.buffer:
+                break
+
+            # Check for array end
+            if self.buffer.startswith("]"):
+                break
+
+            # Skip comma
+            if self.buffer.startswith(","):
+                self.buffer = self.buffer[1:].lstrip()
+                continue
+
+            # Try to parse a string item
+            if self.buffer.startswith('"'):
+                item, remaining = self._parse_string()
+                if item is not None:
+                    items.append(item)
+                    self.items_yielded += 1
+                    self.buffer = remaining
+                else:
+                    break  # Incomplete string, wait for more data
+            else:
+                # Not a string, might be incomplete or invalid
+                break
+
+        return items
+
+    def _parse_string(self) -> tuple[Optional[str], str]:
+        """Parse a JSON string from the buffer."""
+        if not self.buffer.startswith('"'):
+            return None, self.buffer
+
+        i = 1
+        while i < len(self.buffer):
+            char = self.buffer[i]
+            if char == "\\":
+                i += 2  # Skip escaped character
+                continue
+            if char == '"':
+                # Found end of string
+                try:
+                    parsed = json.loads(self.buffer[: i + 1])
+                    return parsed, self.buffer[i + 1 :]
+                except json.JSONDecodeError:
+                    return None, self.buffer
+            i += 1
+
+        return None, self.buffer  # Incomplete string
 
 
 # ============================================================================
@@ -226,26 +461,38 @@ Output ({target_lang}): Translate as complete phrase, keep tags around correspon
 Return ONLY the JSON array."""
 
 
-def get_retry_prompt(incomplete_texts: List[str], target_lang: str) -> str:
+def get_retry_prompt(incomplete_texts: List[str], target_lang: str, issues: List[str]) -> str:
     """Generate prompt for retrying incomplete translations."""
-    return f"""Some translations were incomplete. Please translate these texts COMPLETELY to {target_lang}.
+    issue_instructions = []
+    if "untranslated" in issues:
+        issue_instructions.append("- Translate ALL text content completely to " + target_lang)
+        issue_instructions.append("- Do NOT leave any source language words untranslated")
+        issue_instructions.append("- Common words like 'the', 'and', 'click', 'here' MUST be translated")
+    if "residual_tags" in issues:
+        issue_instructions.append("- Preserve HTML tag structure exactly as in original")
+        issue_instructions.append("- Ensure all opening tags have matching closing tags")
+        issue_instructions.append("- Do NOT duplicate, remove, or break HTML tags")
+    if "empty_translation" in issues:
+        issue_instructions.append("- Provide actual translated content, not empty strings")
 
-IMPORTANT: 
-- These MUST be fully translated to {target_lang}
-- Do NOT leave any English/source language words
-- Preserve HTML tags but translate ALL text content
+    instructions = "\n".join(issue_instructions) if issue_instructions else "- Translate completely and preserve HTML structure"
+
+    return f"""Previous translations had issues. Please fix and translate these texts to {target_lang}.
+
+CRITICAL REQUIREMENTS:
+{instructions}
 
 Input: {json.dumps(incomplete_texts)}
 
-Return ONLY a valid JSON array with complete translations."""
+Return ONLY a valid JSON array with corrected translations."""
 
 
 async def call_gemini(
     model: str,
     contents: list,
     config: types.GenerateContentConfig,
-    expected_len: int = None,
-) -> tuple[str, bool, dict]:
+    expected_len: Optional[int] = None,
+) -> tuple[Optional[str], bool, Any]:
     """Call Gemini API with retry logic for parse failures."""
     loop = asyncio.get_event_loop()
     response_text = None
@@ -281,16 +528,37 @@ async def call_gemini(
             usage = response.usage_metadata
 
             # Validate JSON
-            parsed = json.loads(response_text)
-            if isinstance(parsed, list):
-                if expected_len is None or len(parsed) == expected_len:
-                    return response_text, True, usage
+            if response_text is not None:
+                parsed = json.loads(response_text)
+                if isinstance(parsed, list):
+                    if expected_len is None or len(parsed) == expected_len:
+                        return response_text, True, usage
 
         except json.JSONDecodeError:
             if attempt == MAX_RETRIES:
                 return response_text, False, usage
 
     return response_text, False, usage
+
+
+async def call_gemini_streaming(
+    model: str,
+    contents: list,
+    config: types.GenerateContentConfig,
+) -> AsyncGenerator[str, None]:
+    """Call Gemini API with streaming and yield chunks."""
+    loop = asyncio.get_event_loop()
+
+    def generate_stream():
+        return client.models.generate_content_stream(
+            model=model, contents=contents, config=config
+        )
+
+    stream = await loop.run_in_executor(None, generate_stream)
+
+    for chunk in stream:
+        if chunk.text:
+            yield chunk.text
 
 
 # ============================================================================
@@ -312,6 +580,7 @@ class TranslateRequest(BaseModel):
     temperature: float = Field(default=0.3)
     target_language: Optional[str] = Field(default=None)
     html_aware: bool = Field(default=False)
+    stream: bool = Field(default=False, description="Enable streaming response")
 
 
 # ============================================================================
@@ -329,8 +598,40 @@ async def stats():
     return {"status": "ok", "cache": await cache.stats()}
 
 
+async def stream_translations(
+    request: TranslateRequest,
+    texts_to_translate: List[str],
+    contents: list,
+    config: types.GenerateContentConfig,
+) -> AsyncGenerator[str, None]:
+    """Stream translations as Server-Sent Events."""
+    try:
+        parser = StreamingJSONArrayParser()
+        all_translations = []
+
+        async for chunk in call_gemini_streaming(request.model, contents, config):
+            items = parser.feed(chunk)
+            for item in items:
+                all_translations.append(item)
+                yield f"data: {json.dumps({'index': len(all_translations) - 1, 'translation': item})}\n\n"
+
+        # Cache the complete translations
+        if texts_to_translate and len(all_translations) == len(texts_to_translate):
+            await cache.set(
+                texts_to_translate,
+                request.target_language or "English",
+                request.model,
+                all_translations,
+            )
+
+        yield f"data: {json.dumps({'done': True, 'total': len(all_translations)})}\n\n"
+
+    except Exception as e:
+        yield f"data: {json.dumps({'error': {'type': 'UNKNOWN_ERROR', 'message': str(e)}})}\n\n"
+
+
 @app.post("/proxy/translate")
-async def translate(request: TranslateRequest, req: Request) -> JSONResponse:
+async def translate(request: TranslateRequest, req: Request):
     """Translation endpoint with validation and retry for incomplete translations."""
     client_id = req.client.host if req.client else "unknown"
 
@@ -368,20 +669,37 @@ async def translate(request: TranslateRequest, req: Request) -> JSONResponse:
                         request.model,
                     )
                     if cached:
-                        return JSONResponse(
-                            content={
-                                "choices": [
-                                    {
-                                        "message": {
-                                            "role": "assistant",
-                                            "content": json.dumps(cached),
+                        if request.stream:
+                            # Stream cached items
+                            async def stream_cached():
+                                for i, item in enumerate(cached):
+                                    yield f"data: {json.dumps({'index': i, 'translation': item, 'cached': True})}\n\n"
+                                yield f"data: {json.dumps({'done': True, 'total': len(cached), 'cached': True})}\n\n"
+
+                            return StreamingResponse(
+                                stream_cached(),
+                                media_type="text/event-stream",
+                                headers={
+                                    "Cache-Control": "no-cache",
+                                    "Connection": "keep-alive",
+                                    "X-Accel-Buffering": "no",
+                                },
+                            )
+                        else:
+                            return JSONResponse(
+                                content={
+                                    "choices": [
+                                        {
+                                            "message": {
+                                                "role": "assistant",
+                                                "content": json.dumps(cached),
+                                            }
                                         }
-                                    }
-                                ],
-                                "model": request.model,
-                                "cached": True,
-                            }
-                        )
+                                    ],
+                                    "model": request.model,
+                                    "cached": True,
+                                }
+                            )
             except (json.JSONDecodeError, TypeError):
                 pass
 
@@ -410,14 +728,26 @@ async def translate(request: TranslateRequest, req: Request) -> JSONResponse:
             temperature=request.temperature, system_instruction=system_prompt
         )
 
-        # Call API
+        # Handle streaming request
+        if request.stream and texts_to_translate:
+            return StreamingResponse(
+                stream_translations(request, texts_to_translate, contents, config),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
+        # Non-streaming request (original behavior)
         expected_len = len(texts_to_translate) if texts_to_translate else None
         response_text, success, usage = await call_gemini(
             request.model, contents, config, expected_len
         )
 
         # Validate translations for completeness
-        if success and texts_to_translate and request.target_language:
+        if success and texts_to_translate and request.target_language and response_text:
             try:
                 translations = json.loads(response_text)
                 if isinstance(translations, list) and len(translations) == len(
@@ -429,17 +759,27 @@ async def translate(request: TranslateRequest, req: Request) -> JSONResponse:
                     )
 
                     if incomplete_idx:
-                        # Retry incomplete ones
-                        incomplete_texts = [
-                            texts_to_translate[i] for i in incomplete_idx
-                        ]
+                        # Collect issues for better retry prompt
+                        incomplete_texts = []
+                        issues = set()
+                        for i in incomplete_idx:
+                            incomplete_texts.append(texts_to_translate[i])
+                            _, reason = validate_translation(
+                                texts_to_translate[i],
+                                translations[i],
+                                request.target_language,
+                            )
+                            issues.add(reason)
+
                         retry_contents = [
                             types.Content(
                                 role="user",
                                 parts=[
                                     types.Part(
                                         text=get_retry_prompt(
-                                            incomplete_texts, request.target_language
+                                            incomplete_texts,
+                                            request.target_language,
+                                            list(issues),
                                         )
                                     )
                                 ],
@@ -450,7 +790,7 @@ async def translate(request: TranslateRequest, req: Request) -> JSONResponse:
                             request.model, retry_contents, config, len(incomplete_texts)
                         )
 
-                        if retry_ok:
+                        if retry_ok and retry_text:
                             retry_translations = json.loads(retry_text)
                             if len(retry_translations) == len(incomplete_idx):
                                 # Merge fixed translations
@@ -480,9 +820,9 @@ async def translate(request: TranslateRequest, req: Request) -> JSONResponse:
                 "cached": False,
                 "usage": (
                     {
-                        "prompt_tokens": usage.prompt_token_count,
-                        "completion_tokens": usage.candidates_token_count,
-                        "total_tokens": usage.total_token_count,
+                        "prompt_tokens": getattr(usage, "prompt_token_count", 0),
+                        "completion_tokens": getattr(usage, "candidates_token_count", 0),
+                        "total_tokens": getattr(usage, "total_token_count", 0),
                     }
                     if usage
                     else None

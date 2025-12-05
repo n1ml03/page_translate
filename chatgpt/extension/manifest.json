@@ -13,7 +13,8 @@
   ],
   "action": {
     "default_popup": "popup.html",
-    "default_title": "Page Translator"
+    "default_title": "Page Translator",
+    "default_icon": "favicon.ico"
   },
   "background": {
     "service_worker": "background.js"
