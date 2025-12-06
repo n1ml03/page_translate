@@ -15,7 +15,7 @@ const DEFAULT_SETTINGS = {
   targetEndpoint: '',
   username: '',
   password: '',
-  model: '4o-mini',
+  model: '41-mini',
   targetLanguage: 'English'
 };
 
@@ -33,6 +33,14 @@ function cleanMarkdownCodeBlocks(text) {
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function getSettings() {
+  return new Promise((resolve, reject) => {
+    chrome.storage.local.get(DEFAULT_SETTINGS, (result) => {
+      chrome.runtime.lastError ? reject(chrome.runtime.lastError) : resolve(result);
+    });
+  });
 }
 
 // ============================================================================
@@ -255,11 +263,7 @@ const activePorts = new Map();
 
 async function handleStreamingTranslationRequest(request, port) {
   try {
-    const settings = await new Promise((resolve, reject) => {
-      chrome.storage.local.get(DEFAULT_SETTINGS, (result) => {
-        chrome.runtime.lastError ? reject(chrome.runtime.lastError) : resolve(result);
-      });
-    });
+    const settings = await getSettings();
 
     if (!settings.targetEndpoint) {
       throw new Error('Target endpoint not configured');
@@ -267,6 +271,11 @@ async function handleStreamingTranslationRequest(request, port) {
 
     if (!settings.username || !settings.password) {
       throw new Error('Credentials not configured');
+    }
+
+    // Override targetLanguage if provided in request (for inline translator)
+    if (request.targetLang) {
+      settings.targetLanguage = request.targetLang;
     }
 
     await sendStreamingTranslationRequest(
@@ -290,11 +299,7 @@ async function handleStreamingTranslationRequest(request, port) {
 
 async function handleTranslationRequest(request) {
   try {
-    const settings = await new Promise((resolve, reject) => {
-      chrome.storage.local.get(DEFAULT_SETTINGS, (result) => {
-        chrome.runtime.lastError ? reject(chrome.runtime.lastError) : resolve(result);
-      });
-    });
+    const settings = await getSettings();
 
     if (!settings.targetEndpoint) {
       throw new Error('Target endpoint not configured');
@@ -306,6 +311,38 @@ async function handleTranslationRequest(request) {
 
     const translations = await sendTranslationRequest(request.batch, settings);
     return { translations };
+  } catch (error) {
+    return { error: error.message };
+  }
+}
+
+/**
+ * Handle inline translation request (single text translation)
+ */
+async function handleInlineTranslationRequest(request) {
+  try {
+    const settings = await getSettings();
+
+    if (!settings.targetEndpoint) {
+      throw new Error('Target endpoint not configured. Please configure in extension settings.');
+    }
+
+    if (!settings.username || !settings.password) {
+      throw new Error('Credentials not configured. Please configure in extension settings.');
+    }
+
+    // Override target language if provided in request
+    const targetLanguage = request.targetLanguage || settings.targetLanguage;
+    const settingsWithLang = { ...settings, targetLanguage };
+
+    // Translate single text as a batch of one
+    const translations = await sendTranslationRequest([request.text], settingsWithLang);
+
+    if (translations && translations.length > 0) {
+      return { translation: translations[0] };
+    } else {
+      throw new Error('No translation returned');
+    }
   } catch (error) {
     return { error: error.message };
   }
@@ -333,6 +370,14 @@ chrome.runtime.onConnect.addListener((port) => {
 chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
   if (request.type === 'translate' && request.batch) {
     handleTranslationRequest(request)
+      .then(sendResponse)
+      .catch(error => sendResponse({ error: error.message }));
+    return true;
+  }
+
+  // Handle inline translation requests (single text)
+  if (request.type === 'translateInline' && request.text) {
+    handleInlineTranslationRequest(request)
       .then(sendResponse)
       .catch(error => sendResponse({ error: error.message }));
     return true;

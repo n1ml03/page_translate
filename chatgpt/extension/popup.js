@@ -15,9 +15,7 @@ const FIELD_LABELS = {
   proxyUrl: 'Proxy URL',
   targetEndpoint: 'Target Endpoint',
   username: 'Username',
-  password: 'Password',
-  model: 'Model Name',
-  targetLanguage: 'Target Language'
+  password: 'Password'
 };
 
 let lastSavedSettings = null;
@@ -104,7 +102,6 @@ function showToast(message, type = 'info', autoDismissMs = null) {
 function dismissToast(toast) {
   if (!toast?.parentNode) return;
   toast.classList.add('toast-exit');
-  // Fallback: remove after animation duration even if animationend doesn't fire
   setTimeout(() => toast.parentNode?.removeChild(toast), 200);
 }
 
@@ -117,7 +114,6 @@ function setButtonLoading(buttonId, loading) {
   if (!button) return;
 
   if (loading && !button.dataset.originalText) button.dataset.originalText = button.textContent;
-
   button.disabled = loading;
   const spinner = button.querySelector('.spinner');
 
@@ -187,10 +183,8 @@ async function checkProxyConnection(proxyUrl) {
   try {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), CONNECTION_TIMEOUT);
-
     await fetch(proxyUrl, { method: 'HEAD', mode: 'no-cors', signal: controller.signal });
     clearTimeout(timeoutId);
-
     return { status: 'connected', message: 'Connected' };
   } catch (error) {
     return { status: 'disconnected', message: error.name === 'AbortError' ? 'Connection timed out' : 'Cannot connect to proxy' };
@@ -317,7 +311,7 @@ async function handleRefreshConnection() {
 
 async function handleSave() {
   const settings = getFormSettings();
-  [...REQUIRED_FIELDS, 'proxyUrl', 'targetEndpoint'].forEach(clearFieldError);
+  REQUIRED_FIELDS.forEach(clearFieldError);
 
   const { isValid, errors } = validateSettings(settings);
 
@@ -360,7 +354,7 @@ async function handleSave() {
 
 async function handleTranslate() {
   const settings = getFormSettings();
-  [...REQUIRED_FIELDS, 'proxyUrl', 'targetEndpoint'].forEach(clearFieldError);
+  REQUIRED_FIELDS.forEach(clearFieldError);
 
   const { isValid, errors } = validateSettings(settings);
 
@@ -384,9 +378,15 @@ async function handleTranslate() {
       return;
     }
 
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id, allFrames: true },
-      files: ['content.js']
+    chrome.tabs.sendMessage(tab.id, { action: 'translate' }, _response => {
+      if (chrome.runtime.lastError) {
+        chrome.scripting.executeScript({
+          target: { tabId: tab.id, allFrames: true },
+          files: ['content.js']
+        }).then(() => {
+          setTimeout(() => chrome.tabs.sendMessage(tab.id, { action: 'translate' }), 100);
+        });
+      }
     });
 
     showToast('Translation started!', 'success');
@@ -431,7 +431,7 @@ async function initializePopup() {
   });
 
   updateAllSectionStatuses(settings);
-  await restoreCollapsedState();
+  restoreCollapsedState();
 
   // Check connection
   updateConnectionStatusUI({ status: 'checking', message: 'Checking...' });

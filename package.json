@@ -1,5 +1,5 @@
 {
-  "name": "llm-page-translator",
+  "name": "page-translator",
   "version": "1.0.0",
   "description": "Page Translator Chrome Extension",
   "type": "module",

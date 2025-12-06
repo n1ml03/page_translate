@@ -11,7 +11,7 @@ const ERROR_TYPES = {
 };
 
 const DEFAULT_SETTINGS = {
-  serverUrl: 'http://192.168.0.101:8001/proxy/translate',
+  serverUrl: 'http://192.168.110.58:8001/proxy/translate',
   model: 'gemini-2.0-flash',
   targetLanguage: 'English'
 };
@@ -30,6 +30,14 @@ function cleanMarkdownCodeBlocks(text) {
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function getSettings() {
+  return new Promise((resolve, reject) => {
+    chrome.storage.local.get(DEFAULT_SETTINGS, (result) => {
+      chrome.runtime.lastError ? reject(chrome.runtime.lastError) : resolve(result);
+    });
+  });
 }
 
 // ============================================================================
@@ -238,14 +246,15 @@ const activePorts = new Map();
 
 async function handleStreamingTranslationRequest(request, port) {
   try {
-    const settings = await new Promise((resolve, reject) => {
-      chrome.storage.local.get(DEFAULT_SETTINGS, (result) => {
-        chrome.runtime.lastError ? reject(chrome.runtime.lastError) : resolve(result);
-      });
-    });
+    const settings = await getSettings();
 
     if (!settings.serverUrl) {
       throw new Error('Server URL not configured');
+    }
+
+    // Override targetLanguage if provided in request (for inline translator)
+    if (request.targetLang) {
+      settings.targetLanguage = request.targetLang;
     }
 
     await sendStreamingTranslationRequest(
@@ -269,11 +278,7 @@ async function handleStreamingTranslationRequest(request, port) {
 
 async function handleTranslationRequest(request) {
   try {
-    const settings = await new Promise((resolve, reject) => {
-      chrome.storage.local.get(DEFAULT_SETTINGS, (result) => {
-        chrome.runtime.lastError ? reject(chrome.runtime.lastError) : resolve(result);
-      });
-    });
+    const settings = await getSettings();
 
     if (!settings.serverUrl) {
       throw new Error('Server URL not configured');

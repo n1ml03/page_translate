@@ -1,7 +1,7 @@
 // Popup Script - Settings UI for Gemini Page Translator
 
 const DEFAULT_SETTINGS = {
-  serverUrl: 'http://192.168.0.101:8001/proxy/translate',
+  serverUrl: 'http://192.168.110.58:8001/proxy/translate',
   model: 'gemini-2.0-flash',
   targetLanguage: 'English'
 };
@@ -333,9 +333,20 @@ async function handleTranslate() {
       return;
     }
 
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id, allFrames: true },
-      files: ['content.js']
+    // Send message to content script to start translation
+    chrome.tabs.sendMessage(tab.id, { action: 'translate' }, _response => {
+      if (chrome.runtime.lastError) {
+        // Content script not loaded yet, inject it first
+        chrome.scripting.executeScript({
+          target: { tabId: tab.id, allFrames: true },
+          files: ['content.js']
+        }).then(() => {
+          // Wait a bit for script to initialize, then send message
+          setTimeout(() => {
+            chrome.tabs.sendMessage(tab.id, { action: 'translate' });
+          }, 100);
+        });
+      }
     });
 
     showToast('Translation started!', 'success');
@@ -379,7 +390,7 @@ async function initializePopup() {
   });
 
   updateAllSectionStatuses(settings);
-  await restoreCollapsedState();
+  restoreCollapsedState();
 
   // Check connection
   updateConnectionStatusUI({ status: 'checking', message: 'Checking...' });
