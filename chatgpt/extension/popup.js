@@ -1,4 +1,4 @@
-// Popup Script - Settings UI for Page Translator
+// Popup Script - Settings UI for Page Translator with Page & Text Translation
 
 const DEFAULT_SETTINGS = {
   proxyUrl: '',
@@ -6,11 +6,15 @@ const DEFAULT_SETTINGS = {
   username: '',
   password: '',
   model: '',
-  targetLanguage: 'English'
+  targetLanguage: 'English',
+  activeTab: 'page',
+  textModel: '41-mini',
+  textTargetLang: 'English'
 };
 
 const REQUIRED_FIELDS = ['proxyUrl', 'targetEndpoint', 'username', 'password'];
 const CONNECTION_TIMEOUT = 5000;
+const MAX_TEXT_LENGTH = 5000;
 const FIELD_LABELS = {
   proxyUrl: 'Proxy URL',
   targetEndpoint: 'Target Endpoint',
@@ -21,35 +25,27 @@ const FIELD_LABELS = {
 let lastSavedSettings = null;
 
 // ============================================================================
-// VALIDATION
+// VALIDATION & STORAGE
 // ============================================================================
 
 const validateUrl = (url) => typeof url === 'string' && /^https?:\/\/[^\s/$.?#].[^\s]*$/i.test(url.trim());
 
 function validateSettings(settings) {
   const errors = new Map();
-
   for (const field of REQUIRED_FIELDS) {
     const value = settings[field];
     if (!value || (typeof value === 'string' && !value.trim())) {
       errors.set(field, `${FIELD_LABELS[field] || field} is required`);
     }
   }
-
   if (settings.proxyUrl?.trim() && !errors.has('proxyUrl') && !validateUrl(settings.proxyUrl)) {
     errors.set('proxyUrl', 'Invalid URL format (must start with http:// or https://)');
   }
-
   if (settings.targetEndpoint?.trim() && !errors.has('targetEndpoint') && !validateUrl(settings.targetEndpoint)) {
     errors.set('targetEndpoint', 'Invalid URL format (must start with http:// or https://)');
   }
-
   return { isValid: errors.size === 0, errors };
 }
-
-// ============================================================================
-// STORAGE
-// ============================================================================
 
 const saveSettings = (settings) => new Promise((resolve, reject) => {
   chrome.storage.local.set(settings, () => chrome.runtime.lastError ? reject(chrome.runtime.lastError) : resolve());
@@ -60,7 +56,7 @@ const loadSettings = () => new Promise((resolve, reject) => {
 });
 
 // ============================================================================
-// FORM
+// FORM HELPERS
 // ============================================================================
 
 const getFormSettings = () => ({
@@ -69,7 +65,9 @@ const getFormSettings = () => ({
   username: document.getElementById('username').value,
   password: document.getElementById('password').value,
   model: document.getElementById('model').value,
-  targetLanguage: document.getElementById('targetLanguage').value
+  targetLanguage: document.getElementById('targetLanguage').value,
+  textModel: document.getElementById('textModel').value,
+  textTargetLang: document.getElementById('textTargetLang').value
 });
 
 const populateForm = (settings) => {
@@ -79,6 +77,8 @@ const populateForm = (settings) => {
   document.getElementById('password').value = settings.password;
   document.getElementById('model').value = settings.model;
   document.getElementById('targetLanguage').value = settings.targetLanguage;
+  document.getElementById('textModel').value = settings.textModel || DEFAULT_SETTINGS.textModel;
+  document.getElementById('textTargetLang').value = settings.textTargetLang || DEFAULT_SETTINGS.textTargetLang;
 };
 
 // ============================================================================
@@ -112,11 +112,9 @@ function dismissToast(toast) {
 function setButtonLoading(buttonId, loading) {
   const button = document.getElementById(buttonId);
   if (!button) return;
-
   if (loading && !button.dataset.originalText) button.dataset.originalText = button.textContent;
   button.disabled = loading;
   const spinner = button.querySelector('.spinner');
-
   if (loading && !spinner) {
     const s = document.createElement('span');
     s.className = 'spinner';
@@ -130,7 +128,6 @@ function highlightInvalidField(fieldId, errorMessage) {
   const field = document.getElementById(fieldId);
   const formGroup = field?.closest('.form-group');
   if (!formGroup) return;
-
   formGroup.classList.add('has-error');
   let errorEl = formGroup.querySelector('.field-error-message');
   if (!errorEl) {
@@ -145,7 +142,6 @@ function clearFieldError(fieldId) {
   const field = document.getElementById(fieldId);
   const formGroup = field?.closest('.form-group');
   if (!formGroup) return;
-
   formGroup.classList.remove('has-error');
   formGroup.querySelector('.field-error-message')?.remove();
 }
@@ -194,7 +190,6 @@ async function checkProxyConnection(proxyUrl) {
 function updateConnectionStatusUI({ status, message }) {
   const indicator = document.getElementById('statusIndicator');
   if (!indicator) return;
-
   indicator.classList.remove('connected', 'disconnected', 'unconfigured', 'checking');
   indicator.classList.add(status);
   const statusText = indicator.querySelector('.status-text');
@@ -272,7 +267,7 @@ const setLastSavedSettings = (settings) => { lastSavedSettings = { ...settings }
 const hasUnsavedChanges = () => {
   if (!lastSavedSettings) return false;
   const current = getFormSettings();
-  return Object.keys(DEFAULT_SETTINGS).some(key => current[key] !== lastSavedSettings[key]);
+  return ['proxyUrl', 'targetEndpoint', 'username', 'password', 'model', 'targetLanguage'].some(key => current[key] !== lastSavedSettings[key]);
 };
 
 const markUnsavedChanges = (hasChanges) => {
@@ -292,14 +287,144 @@ function handleInputChange() {
 }
 
 // ============================================================================
-// HANDLERS
+// TAB MANAGEMENT
+// ============================================================================
+
+function switchTab(tabId) {
+  document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.tab === tabId));
+  document.querySelectorAll('.tab-content').forEach(content => content.classList.toggle('active', content.id === `${tabId}Tab`));
+  chrome.storage.local.set({ activeTab: tabId });
+}
+
+// ============================================================================
+// TEXT TRANSLATION
+// ============================================================================
+
+function updateCharCount() {
+  const sourceText = document.getElementById('sourceText');
+  const charCount = document.getElementById('charCount');
+  if (!sourceText || !charCount) return;
+
+  const len = sourceText.value.length;
+  charCount.textContent = `${len} / ${MAX_TEXT_LENGTH}`;
+  charCount.classList.remove('warning', 'error');
+  if (len > MAX_TEXT_LENGTH) charCount.classList.add('error');
+  else if (len > MAX_TEXT_LENGTH * 0.9) charCount.classList.add('warning');
+}
+
+function saveTextTabState() {
+  const sourceText = document.getElementById('sourceText')?.value || '';
+  const translatedText = document.getElementById('translatedText')?.innerText || '';
+  chrome.storage.local.set({ _textTabState: { sourceText, translatedText } });
+}
+
+function restoreTextTabState() {
+  chrome.storage.local.get({ _textTabState: null }, (r) => {
+    if (r._textTabState) {
+      const sourceEl = document.getElementById('sourceText');
+      const translatedEl = document.getElementById('translatedText');
+      if (sourceEl) sourceEl.value = r._textTabState.sourceText || '';
+      if (translatedEl) translatedEl.innerText = r._textTabState.translatedText || '';
+      updateCharCount();
+    }
+  });
+}
+
+async function handleTextTranslate() {
+  const sourceTextEl = document.getElementById('sourceText');
+  const sourceText = sourceTextEl.value;
+  const translatedText = document.getElementById('translatedText');
+  const textModel = document.getElementById('textModel').value;
+  const textTargetLang = document.getElementById('textTargetLang').value;
+
+  if (!sourceText.trim()) {
+    showToast('Enter text to translate', 'error');
+    return;
+  }
+
+  if (sourceText.length > MAX_TEXT_LENGTH) {
+    showToast(`Text exceeds ${MAX_TEXT_LENGTH} characters`, 'error');
+    return;
+  }
+
+  const settings = await loadSettings();
+  if (!validateUrl(settings.proxyUrl) || !settings.targetEndpoint || !settings.username || !settings.password) {
+    showToast('Configure server and auth in Page tab', 'error');
+    return;
+  }
+
+  setButtonLoading('textTranslateBtn', true);
+  translatedText.innerText = '';
+  translatedText.classList.add('loading');
+
+  try {
+    const response = await fetch(settings.proxyUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        target_endpoint: settings.targetEndpoint,
+        username: settings.username,
+        password: settings.password,
+        model: textModel,
+        messages: [
+          { role: 'system', content: `Translate the following text to ${textTargetLang}. IMPORTANT: Preserve exact formatting - keep all line breaks, paragraph spacing, and special characters exactly as in the original. Return only the translation.` },
+          { role: 'user', content: sourceText }
+        ],
+        temperature: 0.3,
+        stream: false
+      })
+    });
+
+    if (!response.ok) throw new Error(`Server error: ${response.status}`);
+
+    const data = await response.json();
+    const translation = data.choices?.[0]?.message?.content || '';
+    translatedText.innerText = translation;
+
+    // Save preferences and state
+    chrome.storage.local.set({ textModel, textTargetLang });
+    saveTextTabState();
+  } catch (error) {
+    showToast(`Translation failed: ${error.message}`, 'error');
+    translatedText.textContent = '';
+  } finally {
+    translatedText.classList.remove('loading');
+    setButtonLoading('textTranslateBtn', false);
+  }
+}
+
+function handleClearSource() {
+  const sourceText = document.getElementById('sourceText');
+  const translatedText = document.getElementById('translatedText');
+  if (sourceText) sourceText.value = '';
+  if (translatedText) translatedText.innerText = '';
+  updateCharCount();
+  saveTextTabState();
+}
+
+async function handleCopyResult() {
+  const translatedText = document.getElementById('translatedText');
+  const copyBtn = document.getElementById('copyResultBtn');
+  if (!translatedText?.textContent) return;
+
+  try {
+    await navigator.clipboard.writeText(translatedText.textContent);
+    copyBtn?.classList.add('copied');
+    showToast('Copied!', 'success');
+    setTimeout(() => copyBtn?.classList.remove('copied'), 1500);
+  } catch {
+    showToast('Failed to copy', 'error');
+  }
+}
+
+// ============================================================================
+// PAGE TRANSLATION HANDLERS
 // ============================================================================
 
 async function handleRefreshConnection() {
   const settings = getFormSettings();
   updateConnectionStatusUI({ status: 'checking', message: 'Checking...' });
   setRefreshButtonSpinning(true);
-
   try {
     const status = await checkProxyConnection(settings.proxyUrl);
     updateConnectionStatusUI(status);
@@ -314,7 +439,6 @@ async function handleSave() {
   REQUIRED_FIELDS.forEach(clearFieldError);
 
   const { isValid, errors } = validateSettings(settings);
-
   if (!isValid) {
     let firstField = null;
     errors.forEach((msg, fieldId) => {
@@ -327,7 +451,6 @@ async function handleSave() {
   }
 
   setButtonLoading('saveBtn', true);
-
   try {
     await saveSettings(settings);
     setLastSavedSettings(settings);
@@ -357,7 +480,6 @@ async function handleTranslate() {
   REQUIRED_FIELDS.forEach(clearFieldError);
 
   const { isValid, errors } = validateSettings(settings);
-
   if (!isValid) {
     let firstField = null;
     errors.forEach((msg, fieldId) => {
@@ -370,7 +492,6 @@ async function handleTranslate() {
   }
 
   setButtonLoading('translateBtn', true);
-
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab) {
@@ -403,7 +524,6 @@ async function handleTranslate() {
 
 async function initializePopup() {
   let settings;
-
   try {
     settings = await loadSettings();
     populateForm(settings);
@@ -415,7 +535,15 @@ async function initializePopup() {
     updateTranslateButtonState(settings);
   }
 
-  // Event listeners
+  // Tab navigation
+  document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.addEventListener('click', () => switchTab(btn.dataset.tab));
+  });
+
+  // Restore active tab
+  if (settings.activeTab) switchTab(settings.activeTab);
+
+  // Page tab events
   document.getElementById('saveBtn').addEventListener('click', handleSave);
   document.getElementById('translateBtn').addEventListener('click', handleTranslate);
   document.getElementById('refreshBtn')?.addEventListener('click', handleRefreshConnection);
@@ -430,8 +558,26 @@ async function initializePopup() {
     header.addEventListener('click', () => toggleSection(header.dataset.section));
   });
 
+  // Text tab events
+  document.getElementById('sourceText')?.addEventListener('input', () => {
+    updateCharCount();
+    saveTextTabState();
+  });
+  document.getElementById('textTranslateBtn')?.addEventListener('click', handleTextTranslate);
+  document.getElementById('clearSourceBtn')?.addEventListener('click', handleClearSource);
+  document.getElementById('copyResultBtn')?.addEventListener('click', handleCopyResult);
+
+  // Ctrl+Enter to translate
+  document.getElementById('sourceText')?.addEventListener('keydown', (e) => {
+    if (e.ctrlKey && e.key === 'Enter') handleTextTranslate();
+  });
+
+  // Restore text tab state
+  restoreTextTabState();
+
   updateAllSectionStatuses(settings);
   restoreCollapsedState();
+  updateCharCount();
 
   // Check connection
   updateConnectionStatusUI({ status: 'checking', message: 'Checking...' });
@@ -464,5 +610,7 @@ export {
   toggleSection, setSectionCollapsed, updateSectionStatus, isServerConfigValid,
   isAuthValid, updateAllSectionStatuses, autoCollapseSectionsOnSuccess,
   saveCollapsedState, restoreCollapsedState,
-  DEFAULT_SETTINGS, REQUIRED_FIELDS, CONNECTION_TIMEOUT
+  switchTab, handleTextTranslate, handleClearSource, handleCopyResult, updateCharCount,
+  saveTextTabState, restoreTextTabState,
+  DEFAULT_SETTINGS, REQUIRED_FIELDS, CONNECTION_TIMEOUT, MAX_TEXT_LENGTH
 };

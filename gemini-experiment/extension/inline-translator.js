@@ -590,9 +590,22 @@ class InlineTranslator {
     e.preventDefault();
     e.stopPropagation();
     
-    // Revert to original text
-    const textNode = document.createTextNode(originalText);
-    target.parentNode?.replaceChild(textNode, target);
+    // Revert to original text - preserve line breaks
+    const parent = target.parentNode;
+    if (!parent) return;
+    
+    // Check if original text has line breaks
+    if (originalText.includes('\n')) {
+      // Create a span to preserve formatting
+      const wrapper = document.createElement('span');
+      wrapper.style.whiteSpace = 'pre-wrap';
+      this._setTextWithLineBreaks(wrapper, originalText);
+      parent.replaceChild(wrapper, target);
+    } else {
+      // Simple text node for single-line text
+      const textNode = document.createTextNode(originalText);
+      parent.replaceChild(textNode, target);
+    }
     
     // Clear any selection that might have been made
     window.getSelection()?.removeAllRanges();
@@ -798,7 +811,9 @@ class InlineTranslator {
     
     const sourceBox = document.createElement('div');
     sourceBox.className = 'it-text-box it-source';
-    sourceBox.textContent = displayText; // Safe: textContent escapes HTML
+    sourceBox.style.whiteSpace = 'pre-wrap';
+    // Preserve line breaks in source text display
+    this._setTextWithLineBreaks(sourceBox, displayText);
     sourceSection.appendChild(sourceBox);
     
     body.appendChild(sourceSection);
@@ -955,7 +970,8 @@ class InlineTranslator {
       if (!this.panelElement || signal.aborted) return;
       
       translatedBox.classList.remove('it-loading');
-      translatedBox.textContent = translation;
+      translatedBox.style.whiteSpace = 'pre-wrap';
+      this._setTextWithLineBreaks(translatedBox, translation);
       translatedBox.dataset.translation = translation;
       copyBtn.disabled = false;
       if (replaceBtn) replaceBtn.disabled = false;
@@ -1216,13 +1232,32 @@ class InlineTranslator {
   _replaceSingleSelection(translation) {
     const wrapper = document.createElement('span');
     wrapper.className = 'pt-inline-replaced';
-    wrapper.textContent = translation;
+    wrapper.style.whiteSpace = 'pre-wrap';
     wrapper.dataset.ptOriginal = this.selectedText;
     wrapper.title = 'Click to revert to original';
+    
+    // Preserve line breaks by converting \n to <br>
+    this._setTextWithLineBreaks(wrapper, translation);
     
     // Delete the selected content and insert the translation
     this.selectionRange.deleteContents();
     this.selectionRange.insertNode(wrapper);
+  }
+  
+  /**
+   * Set text content while preserving line breaks
+   */
+  _setTextWithLineBreaks(element, text) {
+    element.innerHTML = '';
+    const lines = text.split('\n');
+    lines.forEach((line, index) => {
+      if (index > 0) {
+        element.appendChild(document.createElement('br'));
+      }
+      if (line) {
+        element.appendChild(document.createTextNode(line));
+      }
+    });
   }
 
   /**
@@ -1244,9 +1279,12 @@ class InlineTranslator {
     // Create wrapper for the translation
     const wrapper = document.createElement('span');
     wrapper.className = 'pt-inline-replaced';
-    wrapper.textContent = translation;
+    wrapper.style.whiteSpace = 'pre-wrap';
     wrapper.dataset.ptOriginal = this.selectedText;
     wrapper.title = 'Click to revert to original';
+    
+    // Preserve line breaks
+    this._setTextWithLineBreaks(wrapper, translation);
     
     // Split the first text node and insert wrapper
     const beforeText = firstNode.node.textContent.substring(0, startOffset);

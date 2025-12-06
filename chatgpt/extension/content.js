@@ -470,17 +470,14 @@
       iconUrl,
       defaultLang: 'en',
       languages: [
-        { code: 'en', name: 'English' },
         { code: 'ja', name: 'Japanese (日本語)' },
+        { code: 'en', name: 'English' },
         { code: 'zh-CN', name: 'Chinese Simplified (简体中文)' },
         { code: 'zh-TW', name: 'Chinese Traditional (繁體中文)' },
         { code: 'ko', name: 'Korean (한국어)' },
         { code: 'vi', name: 'Vietnamese (Tiếng Việt)' },
-        { code: 'es', name: 'Spanish (Español)' },
-        { code: 'fr', name: 'French (Français)' },
-        { code: 'de', name: 'German (Deutsch)' },
-        { code: 'pt', name: 'Portuguese (Português)' },
       ],
+      // Use the same streaming translation API as page translation with abort support
       translateFn: async (text, lang, signal) => {
         return new Promise((resolve, reject) => {
           if (signal?.aborted) {
@@ -529,7 +526,8 @@
             }
           });
 
-          port.postMessage({ type: 'translate', batch: [text], targetLang: lang });
+          // Send single text for translation with target language and preserveFormat flag
+          port.postMessage({ type: 'translate', batch: [text], targetLang: lang, preserveFormat: true });
         });
       }
     });

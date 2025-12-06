@@ -23,8 +23,15 @@
       </button>
     </div>
   </header>
-  
-  <main>
+
+  <!-- Tab Navigation -->
+  <nav class="tab-nav">
+    <button type="button" class="tab-btn active" data-tab="page">Page</button>
+    <button type="button" class="tab-btn" data-tab="text">Text</button>
+  </nav>
+
+  <!-- Page Translation Tab -->
+  <main id="pageTab" class="tab-content active">
     <!-- Server Configuration Section -->
     <section class="settings-group collapsible" id="serverConfigSection">
       <div class="section-header" data-section="serverConfigSection">
@@ -96,20 +103,60 @@
         </select>
       </div>
     </section>
+
+    <footer>
+      <div class="button-group">
+        <button id="saveBtn" class="btn-secondary" tabindex="8">Save</button>
+        <button id="translateBtn" class="btn-primary" tabindex="9">Translate</button>
+      </div>
+    </footer>
   </main>
-  
-  <footer>
-    <div class="button-group">
-      <button id="saveBtn" class="btn-secondary" tabindex="8">Save</button>
-      <button id="translateBtn" class="btn-primary" tabindex="9">Translate</button>
-    </div>
-  </footer>
-  
+
+  <!-- Text Translation Tab -->
+  <main id="textTab" class="tab-content">
+    <section class="translator-panel">
+      <div class="translator-header">
+        <select id="textModel" class="model-select" tabindex="10">
+          <option value="41-mini">41-mini</option>
+          <option value="41">41</option>
+          <option value="o4-mini">o4-mini</option>
+          <option value="o3">o3</option>
+        </select>
+        <select id="textTargetLang" class="lang-select" tabindex="11">
+          <option value="Japanese">日本語</option>
+          <option value="English">English</option>
+          <option value="Chinese (Simplified)">简体中文</option>
+          <option value="Chinese (Traditional)">繁體中文</option>
+          <option value="Korean">한국어</option>
+          <option value="Vietnamese">Tiếng Việt</option>
+        </select>
+      </div>
+      <div class="translator-body">
+        <div class="text-area-wrapper">
+          <textarea id="sourceText" placeholder="Enter text to translate..." tabindex="12"></textarea>
+          <button type="button" id="clearSourceBtn" class="clear-btn" aria-label="Clear text" title="Clear">×</button>
+        </div>
+        <div class="divider"></div>
+        <div class="text-area-wrapper output">
+          <div id="translatedText" class="translated-output" tabindex="-1"></div>
+          <button type="button" id="copyResultBtn" class="copy-btn" aria-label="Copy translation" title="Copy">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+              <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+            </svg>
+          </button>
+        </div>
+      </div>
+      <footer class="translator-footer">
+        <span id="charCount" class="char-count">0 / 5000</span>
+        <button id="textTranslateBtn" class="btn-primary" tabindex="13">Translate</button>
+      </footer>
+    </section>
+  </main>
+
   <div id="status" class="status"></div>
-  
-  <!-- Toast notification container -->
   <div id="toastContainer" class="toast-container"></div>
-  
+
   <script type="module" src="popup.js"></script>
 </body>
 </html>

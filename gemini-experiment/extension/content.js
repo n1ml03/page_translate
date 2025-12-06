@@ -548,8 +548,8 @@
             }
           });
 
-          // Send single text for translation with target language
-          port.postMessage({ type: 'translate', batch: [text], targetLang: lang });
+          // Send single text for translation with target language and preserveFormat flag
+          port.postMessage({ type: 'translate', batch: [text], targetLang: lang, preserveFormat: true });
         });
       },
       defaultLang: 'en',

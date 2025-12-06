@@ -129,7 +129,44 @@ function parseErrorResponse(statusCode, data) {
 // STREAMING API REQUEST
 // ============================================================================
 
-async function sendStreamingTranslationRequest(batch, settings, onTranslation) {
+async function sendStreamingTranslationRequest(batch, settings, onTranslation, options = {}) {
+  const isInlineTranslator = options.preserveFormat && batch.length === 1;
+  
+  // For inline translator, use non-streaming request to get plain text response
+  if (isInlineTranslator) {
+    const payload = {
+      target_endpoint: settings.targetEndpoint,
+      username: settings.username,
+      password: settings.password,
+      model: settings.model,
+      messages: [
+        { role: 'system', content: `Translate the following text to ${settings.targetLanguage}. IMPORTANT: Preserve exact formatting - keep all line breaks, paragraph spacing, and special characters exactly as in the original. Return only the translation.` },
+        { role: 'user', content: batch[0] }
+      ],
+      temperature: 0.3,
+      stream: false
+    };
+    
+    const response = await fetch(settings.proxyUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+
+    if (!response.ok) {
+      let data;
+      try { data = await response.json(); } catch { data = await response.text(); }
+      const errorInfo = parseErrorResponse(response.status, data);
+      throw new Error(formatErrorMessage(errorInfo));
+    }
+
+    const data = await response.json();
+    const translation = data.choices?.[0]?.message?.content || '';
+    onTranslation(0, translation, false);
+    return [translation];
+  }
+  
+  // Standard streaming for page translation
   const payload = constructPayload(batch, settings, true);
 
   const response = await fetch(settings.proxyUrl, {
@@ -278,6 +315,9 @@ async function handleStreamingTranslationRequest(request, port) {
       settings.targetLanguage = request.targetLang;
     }
 
+    // Check if this is an inline translator request (single text with preserveFormat)
+    const options = { preserveFormat: request.preserveFormat || false };
+
     await sendStreamingTranslationRequest(
       request.batch,
       settings,
@@ -288,7 +328,8 @@ async function handleStreamingTranslationRequest(request, port) {
           translation,
           cached: !!cached
         });
-      }
+      },
+      options
     );
 
     port.postMessage({ type: 'done' });

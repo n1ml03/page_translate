@@ -492,13 +492,16 @@ async def call_gemini(
     contents: list,
     config: types.GenerateContentConfig,
     expected_len: Optional[int] = None,
+    validate_json: bool = True,
 ) -> tuple[Optional[str], bool, Any]:
-    """Call Gemini API with retry logic for parse failures."""
+    """Call Gemini API with optional retry logic for JSON parse failures."""
     loop = asyncio.get_event_loop()
     response_text = None
     usage = None
 
-    for attempt in range(MAX_RETRIES + 1):
+    max_attempts = MAX_RETRIES + 1 if validate_json else 1
+
+    for attempt in range(max_attempts):
         try:
             if attempt > 0:
                 await asyncio.sleep(RETRY_DELAY)
@@ -527,6 +530,10 @@ async def call_gemini(
             response_text = response.text
             usage = response.usage_metadata
 
+            # Skip JSON validation for plain text mode
+            if not validate_json:
+                return response_text, True, usage
+
             # Validate JSON
             if response_text is not None:
                 parsed = json.loads(response_text)
@@ -535,7 +542,7 @@ async def call_gemini(
                         return response_text, True, usage
 
         except json.JSONDecodeError:
-            if attempt == MAX_RETRIES:
+            if attempt == max_attempts - 1:
                 return response_text, False, usage
 
     return response_text, False, usage
@@ -656,9 +663,9 @@ async def translate(request: TranslateRequest, req: Request):
                 user_content = msg.get("content", "")
                 break
 
-        # Parse texts
+        # Parse texts (only for html_aware mode)
         texts_to_translate = None
-        if user_content:
+        if user_content and request.html_aware:
             try:
                 texts_to_translate = json.loads(user_content)
                 if isinstance(texts_to_translate, list):
@@ -743,7 +750,7 @@ async def translate(request: TranslateRequest, req: Request):
         # Non-streaming request (original behavior)
         expected_len = len(texts_to_translate) if texts_to_translate else None
         response_text, success, usage = await call_gemini(
-            request.model, contents, config, expected_len
+            request.model, contents, config, expected_len, validate_json=request.html_aware
         )
 
         # Validate translations for completeness
