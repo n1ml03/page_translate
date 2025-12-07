@@ -806,8 +806,12 @@ async def stream_translations(
     texts_to_translate: List[str],
     contents: list,
     config: types.GenerateContentConfig,
+    client_id: str = "unknown",
+    start_time: Optional[float] = None,
 ) -> AsyncGenerator[str, None]:
     """Stream translations as Server-Sent Events."""
+    if start_time is None:
+        start_time = time.time()
     try:
         parser = StreamingJSONArrayParser()
         all_translations = []
@@ -826,10 +830,14 @@ async def stream_translations(
                 request.model,
                 all_translations,
             )
+            log_response(
+                client_id, len(all_translations), (time.time() - start_time) * 1000
+            )
 
         yield f"data: {json.dumps({'done': True, 'total': len(all_translations)})}\n\n"
 
     except Exception as e:
+        log_error(client_id, "STREAM_ERROR", str(e))
         yield f"data: {json.dumps({'error': {'type': 'UNKNOWN_ERROR', 'message': str(e)}})}\n\n"
 
 
@@ -837,10 +845,13 @@ async def stream_translations(
 async def translate(request: TranslateRequest, req: Request):
     """Translation endpoint with validation and retry for incomplete translations."""
     client_id = req.client.host if req.client else "unknown"
+    start_time = time.time()
+    target_lang = request.target_language or "English"
 
     # Rate limit
     allowed, wait = await limiter.acquire(client_id)
     if not allowed:
+        log_error(client_id, "RATE_LIMITED", f"Wait {wait:.1f}s")
         return JSONResponse(
             status_code=429,
             content={
@@ -868,10 +879,24 @@ async def translate(request: TranslateRequest, req: Request):
                     # Check cache
                     cached = await cache.get(
                         texts_to_translate,
-                        request.target_language or "English",
+                        target_lang,
                         request.model,
                     )
                     if cached:
+                        log_request(
+                            client_id,
+                            request.model,
+                            target_lang,
+                            len(texts_to_translate),
+                            cached=True,
+                            stream=request.stream,
+                        )
+                        log_response(
+                            client_id,
+                            len(cached),
+                            (time.time() - start_time) * 1000,
+                            cached=True,
+                        )
                         if request.stream:
                             # Stream cached items
                             async def stream_cached():
@@ -906,6 +931,17 @@ async def translate(request: TranslateRequest, req: Request):
             except (json.JSONDecodeError, TypeError):
                 pass
 
+        # Log the request
+        text_count = len(texts_to_translate) if texts_to_translate else 1
+        log_request(
+            client_id,
+            request.model,
+            target_lang,
+            text_count,
+            cached=False,
+            stream=request.stream,
+        )
+
         # Build contents
         system_prompt = None
         contents = []
@@ -934,7 +970,9 @@ async def translate(request: TranslateRequest, req: Request):
         # Handle streaming request
         if request.stream and texts_to_translate:
             return StreamingResponse(
-                stream_translations(request, texts_to_translate, contents, config),
+                stream_translations(
+                    request, texts_to_translate, contents, config, client_id, start_time
+                ),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -965,6 +1003,7 @@ async def translate(request: TranslateRequest, req: Request):
                         texts_to_translate, translations, request.target_language
                     )
 
+                    retried = False
                     if incomplete_idx:
                         # Collect issues for better retry prompt
                         incomplete_texts = []
@@ -977,6 +1016,8 @@ async def translate(request: TranslateRequest, req: Request):
                                 request.target_language,
                             )
                             issues.add(reason)
+
+                        log_validation(client_id, len(incomplete_idx), list(issues))
 
                         retry_contents = [
                             types.Content(
@@ -1004,6 +1045,7 @@ async def translate(request: TranslateRequest, req: Request):
                                 for i, idx in enumerate(incomplete_idx):
                                     translations[idx] = retry_translations[i]
                                 response_text = json.dumps(translations)
+                                retried = True
 
                     # Cache valid result
                     await cache.set(
@@ -1012,8 +1054,19 @@ async def translate(request: TranslateRequest, req: Request):
                         request.model,
                         translations,
                     )
+
+                    log_response(
+                        client_id,
+                        len(translations),
+                        (time.time() - start_time) * 1000,
+                        retried=retried,
+                    )
             except (json.JSONDecodeError, TypeError):
                 pass
+
+        duration_ms = (time.time() - start_time) * 1000
+        if not texts_to_translate:
+            log_response(client_id, 1, duration_ms)
 
         return JSONResponse(
             content={
@@ -1040,6 +1093,7 @@ async def translate(request: TranslateRequest, req: Request):
         )
 
     except Exception as e:
+        log_error(client_id, "EXCEPTION", str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1060,10 +1114,76 @@ def get_lan_ip() -> str:
         return "127.0.0.1"
 
 
+# ============================================================================
+# LOGGING HELPERS
+# ============================================================================
+
+
+def log_request(
+    client_id: str,
+    model: str,
+    target_lang: str,
+    text_count: int,
+    cached: bool = False,
+    stream: bool = False,
+):
+    """Log incoming translation request."""
+    mode = "STREAM" if stream else "BATCH"
+    cache_status = "CACHE-HIT" if cached else "NEW"
+    print(
+        f"[REQ] {client_id} | {mode} | {cache_status} | model={model} | lang={target_lang} | texts={text_count}"
+    )
+
+
+def log_response(
+    client_id: str,
+    text_count: int,
+    duration_ms: float,
+    cached: bool = False,
+    retried: bool = False,
+):
+    """Log translation response."""
+    status = "CACHED" if cached else ("RETRIED" if retried else "OK")
+    print(
+        f"[RES] {client_id} | {status} | texts={text_count} | time={duration_ms:.0f}ms"
+    )
+
+
+def log_error(client_id: str, error_type: str, message: str):
+    """Log error."""
+    print(f"[ERR] {client_id} | {error_type} | {message[:100]}")
+
+
+def log_validation(client_id: str, incomplete_count: int, issues: List[str]):
+    """Log validation issues triggering retry."""
+    print(
+        f"[VAL] {client_id} | incomplete={incomplete_count} | issues={','.join(issues)}"
+    )
+
+
 if __name__ == "__main__":
+    import argparse
+
     import uvicorn
 
-    ip = get_lan_ip()
-    port = 8001
-    print(f"Server: http://{ip}:{port}")
-    uvicorn.run(app, host=ip, port=port)
+    parser = argparse.ArgumentParser(description="Gemini Translation Server")
+    parser.add_argument(
+        "--host", default=None, help="Host to bind (default: auto-detect LAN IP)"
+    )
+    parser.add_argument(
+        "--port", type=int, default=8001, help="Port to bind (default: 8001)"
+    )
+    args = parser.parse_args()
+
+    host = args.host or get_lan_ip()
+
+    print("=" * 60)
+    print("Gemini Translation Server")
+    print("=" * 60)
+    print(f"Server: http://{host}:{args.port}")
+    print(f"Cache Size: {CACHE_MAX_SIZE} entries | TTL: {CACHE_TTL}s")
+    print(f"Max Retries: {MAX_RETRIES} | Retry Delay: {RETRY_DELAY}s")
+    print(f"API Key: {'✓ Set' if os.getenv('GEMINI_API_KEY') else '✗ Missing'}")
+    print("=" * 60)
+
+    uvicorn.run(app, host=host, port=args.port)

@@ -1049,10 +1049,12 @@ async def stream_translations(
 @app.post("/proxy/translate")
 async def translate(request: TranslateRequest, req: Request):
     client_id = req.client.host if req.client else "unknown"
+    start_time = time.time()
 
     # Check auth lockout
     is_locked, remaining = await auth_limiter.is_locked_out(client_id)
     if is_locked:
+        log_auth_failure(client_id, 0, locked=True)
         return JSONResponse(
             status_code=429,
             content={
@@ -1066,6 +1068,7 @@ async def translate(request: TranslateRequest, req: Request):
     # Check rate limit
     allowed, wait = await limiter.acquire(client_id)
     if not allowed:
+        log_error(client_id, "RATE_LIMITED", f"Wait {wait:.1f}s")
         return JSONResponse(
             status_code=429,
             content={
@@ -1078,11 +1081,24 @@ async def translate(request: TranslateRequest, req: Request):
 
     texts_to_translate = extract_texts(request.messages)
     target_language = extract_target_language(request.messages)
+    text_count = len(texts_to_translate) if texts_to_translate else 1
 
     # Check cache
     if texts_to_translate:
         cached = await cache.get(texts_to_translate, target_language, request.model)
         if cached:
+            log_request(
+                client_id,
+                request.model,
+                target_language,
+                text_count,
+                request.target_endpoint,
+                cached=True,
+                stream=request.stream,
+            )
+            log_response(
+                client_id, len(cached), (time.time() - start_time) * 1000, cached=True
+            )
             if request.stream:
 
                 async def stream_cached():
@@ -1118,6 +1134,17 @@ async def translate(request: TranslateRequest, req: Request):
                     headers={"X-Instance-ID": INSTANCE_ID},
                 )
 
+    # Log the new request
+    log_request(
+        client_id,
+        request.model,
+        target_language,
+        text_count,
+        request.target_endpoint,
+        cached=False,
+        stream=request.stream,
+    )
+
     # Streaming request
     if request.stream:
         return StreamingResponse(
@@ -1135,7 +1162,7 @@ async def translate(request: TranslateRequest, req: Request):
 
     # Non-streaming request
     return await handle_non_streaming_request(
-        request, texts_to_translate, target_language, client_id
+        request, texts_to_translate, target_language, client_id, start_time
     )
 
 
@@ -1144,8 +1171,12 @@ async def handle_non_streaming_request(
     texts_to_translate: Optional[List[str]],
     target_language: str,
     client_id: str,
+    start_time: Optional[float] = None,
 ) -> JSONResponse:
     """Handle non-streaming translation request with async httpx."""
+    if start_time is None:
+        start_time = time.time()
+
     headers = {
         "Authorization": generate_basic_auth_header(request.username, request.password),
         "Content-Type": "application/json",
@@ -1157,6 +1188,7 @@ async def handle_non_streaming_request(
     }
 
     if http_client is None:
+        log_error(client_id, "SERVER_ERROR", "HTTP client not initialized", 503)
         raise HTTPException(status_code=503, detail="HTTP client not initialized")
 
     try:
@@ -1174,13 +1206,17 @@ async def handle_non_streaming_request(
             if response.status_code in (401, 403):
                 is_locked, attempts_left = await auth_limiter.record_failure(client_id)
                 if is_locked:
+                    log_auth_failure(client_id, 0, locked=True)
                     error_message = (
                         "Too many failed attempts. Account temporarily locked."
                     )
                 elif attempts_left > 0:
+                    log_auth_failure(client_id, attempts_left)
                     error_message = (
                         f"{error_message} ({attempts_left} attempts remaining)"
                     )
+
+            log_error(client_id, error_type, error_message, response.status_code)
 
             return JSONResponse(
                 content={
@@ -1211,6 +1247,7 @@ async def handle_non_streaming_request(
                             texts_to_translate, translations, target_language
                         )
 
+                        retried = False
                         if incomplete_idx:
                             incomplete_texts = []
                             issues = set()
@@ -1222,6 +1259,8 @@ async def handle_non_streaming_request(
                                     target_language,
                                 )
                                 issues.add(reason)
+
+                            log_validation(client_id, len(incomplete_idx), list(issues))
 
                             retry_messages = [
                                 {
@@ -1261,6 +1300,7 @@ async def handle_non_streaming_request(
                                         json_response["choices"][0]["message"][
                                             "content"
                                         ] = json.dumps(translations)
+                                        retried = True
                                 except (json.JSONDecodeError, KeyError, IndexError):
                                     pass
 
@@ -1270,10 +1310,22 @@ async def handle_non_streaming_request(
                             request.model,
                             translations,
                         )
+
+                        # Log successful response
+                        duration_ms = (time.time() - start_time) * 1000
+                        log_response(
+                            client_id, len(translations), duration_ms, retried=retried
+                        )
                 except (json.JSONDecodeError, KeyError, IndexError):
                     pass
 
             json_response["cached"] = False
+
+            # Log response if not already logged (non-array responses)
+            if not texts_to_translate:
+                duration_ms = (time.time() - start_time) * 1000
+                log_response(client_id, 1, duration_ms)
+
             return JSONResponse(
                 content=json_response,
                 status_code=response.status_code,
@@ -1285,19 +1337,81 @@ async def handle_non_streaming_request(
                 "<html" in response.text.lower() or "<!doctype" in response.text.lower()
             )
             error_type = "PROXY_HTML_RESPONSE" if is_html else "INVALID_JSON_RESPONSE"
+            log_error(client_id, error_type, "Response is not valid JSON", 502)
             raise HTTPException(
                 status_code=502, detail=f"{error_type}: Response is not valid JSON"
             )
 
     except httpx.ConnectError:
+        log_error(client_id, "CONNECTION_ERROR", "Failed to connect to target API", 502)
         raise HTTPException(status_code=502, detail="Failed to connect to target API")
     except httpx.TimeoutException:
+        log_error(client_id, "TIMEOUT", "Target API timeout", 504)
         raise HTTPException(status_code=504, detail="Target API timeout")
 
 
 # ============================================================================
 # MAIN
 # ============================================================================
+
+# ============================================================================
+# LOGGING HELPERS
+# ============================================================================
+
+
+def log_request(
+    client_id: str,
+    model: str,
+    target_lang: str,
+    text_count: int,
+    endpoint: str,
+    cached: bool = False,
+    stream: bool = False,
+):
+    """Log incoming translation request."""
+    mode = "STREAM" if stream else "BATCH"
+    cache_status = "CACHE-HIT" if cached else "NEW"
+    # Truncate endpoint for display
+    endpoint_short = endpoint.split("/")[-1] if "/" in endpoint else endpoint[:30]
+    print(
+        f"[REQ] {client_id} | {mode} | {cache_status} | model={model} | lang={target_lang} | texts={text_count} | endpoint={endpoint_short}"
+    )
+
+
+def log_response(
+    client_id: str,
+    text_count: int,
+    duration_ms: float,
+    cached: bool = False,
+    retried: bool = False,
+):
+    """Log translation response."""
+    status = "CACHED" if cached else ("RETRIED" if retried else "OK")
+    print(
+        f"[RES] {client_id} | {status} | texts={text_count} | time={duration_ms:.0f}ms"
+    )
+
+
+def log_error(client_id: str, error_type: str, message: str, status_code: int = 0):
+    """Log error."""
+    code_str = f" | status={status_code}" if status_code else ""
+    print(f"[ERR] {client_id} | {error_type}{code_str} | {message[:100]}")
+
+
+def log_validation(client_id: str, incomplete_count: int, issues: List[str]):
+    """Log validation issues triggering retry."""
+    print(
+        f"[VAL] {client_id} | incomplete={incomplete_count} | issues={','.join(issues)}"
+    )
+
+
+def log_auth_failure(client_id: str, attempts_left: int, locked: bool = False):
+    """Log authentication failure."""
+    if locked:
+        print(f"[AUTH] {client_id} | LOCKED OUT")
+    else:
+        print(f"[AUTH] {client_id} | FAILED | attempts_left={attempts_left}")
+
 
 if __name__ == "__main__":
     import argparse
@@ -1318,16 +1432,19 @@ if __name__ == "__main__":
 
     host = args.host or get_lan_ip()
 
-    print(f"=" * 60)
-    print(f"Page Translator Middleware")
-    print(f"=" * 60)
+    print("=" * 60)
+    print("Page Translator Middleware (ChatGPT)")
+    print("=" * 60)
     print(f"Instance ID: {INSTANCE_ID}")
     print(f"Server: http://{host}:{args.port}")
     print(f"Workers: {args.workers}")
     print(f"Max Connections: {MAX_CONNECTIONS}")
     print(f"Rate Limit: {RATE_LIMIT_RPM} req/min per client")
-    print(f"Cache Size: {CACHE_MAX_SIZE} entries")
-    print(f"=" * 60)
+    print(f"Cache Size: {CACHE_MAX_SIZE} entries | TTL: {CACHE_TTL}s")
+    print(
+        f"Auth Lockout: {AUTH_FAILURE_MAX_ATTEMPTS} failures / {AUTH_FAILURE_LOCKOUT_SECONDS}s"
+    )
+    print("=" * 60)
 
     uvicorn.run(
         "server:app",
