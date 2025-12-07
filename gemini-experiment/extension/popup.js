@@ -1,70 +1,58 @@
-// Popup Script - Gemini Translator with Page & Text Translation
+// Popup Script - Gemini Translator with Unified Settings & History
+
+// ============================================================================
+// CONSTANTS & DEFAULTS
+// ============================================================================
 
 const DEFAULT_SETTINGS = {
-  serverUrl: 'http://192.168.110.58:8001/proxy/translate',
+  serverUrl: 'http://192.168.0.100:8001/proxy/translate',
   model: 'gemini-2.0-flash',
   targetLanguage: 'English',
   activeTab: 'page',
-  textModel: 'gemini-2.0-flash',
-  textTargetLang: 'English'
+  textTargetLang: 'English',
+  recentLanguages: ['Japanese', 'English', 'Vietnamese'],
+  translationHistory: []
 };
 
-const REQUIRED_FIELDS = ['serverUrl'];
-const CONNECTION_TIMEOUT = 5000;
+const LANGUAGES = [
+  { code: 'Japanese', name: 'Japanese', native: '日本語' },
+  { code: 'English', name: 'English', native: 'English' },
+  { code: 'Chinese (Simplified)', name: 'Chinese Simplified', native: '简体中文' },
+  { code: 'Chinese (Traditional)', name: 'Chinese Traditional', native: '繁體中文' },
+  { code: 'Korean', name: 'Korean', native: '한국어' },
+  { code: 'Vietnamese', name: 'Vietnamese', native: 'Tiếng Việt' }
+];
+
 const MAX_TEXT_LENGTH = 5000;
-
-let lastSavedSettings = null;
+const MAX_HISTORY_ITEMS = 20;
+const MAX_RECENT_LANGUAGES = 3;
+const CONNECTION_TIMEOUT = 5000;
 
 // ============================================================================
-// VALIDATION & STORAGE
+// STORAGE HELPERS
 // ============================================================================
-
-const validateUrl = (url) => typeof url === 'string' && /^https?:\/\/[^\s/$.?#].[^\s]*$/i.test(url.trim());
-
-function validateSettings(settings) {
-  const errors = new Map();
-  for (const field of REQUIRED_FIELDS) {
-    const value = settings[field];
-    if (!value || (typeof value === 'string' && !value.trim())) {
-      errors.set(field, `${field} is required`);
-    }
-  }
-  if (settings.serverUrl?.trim() && !errors.has('serverUrl') && !validateUrl(settings.serverUrl)) {
-    errors.set('serverUrl', 'Invalid URL format');
-  }
-  return { isValid: errors.size === 0, errors };
-}
 
 const saveSettings = (settings) => new Promise((resolve, reject) => {
-  chrome.storage.local.set(settings, () => chrome.runtime.lastError ? reject(chrome.runtime.lastError) : resolve());
+  chrome.storage.local.set(settings, () => 
+    chrome.runtime.lastError ? reject(chrome.runtime.lastError) : resolve()
+  );
 });
 
 const loadSettings = () => new Promise((resolve, reject) => {
-  chrome.storage.local.get(DEFAULT_SETTINGS, (result) => chrome.runtime.lastError ? reject(chrome.runtime.lastError) : resolve(result));
+  chrome.storage.local.get(DEFAULT_SETTINGS, (result) => 
+    chrome.runtime.lastError ? reject(chrome.runtime.lastError) : resolve(result)
+  );
 });
 
 // ============================================================================
-// FORM HELPERS
+// VALIDATION
 // ============================================================================
 
-const getFormSettings = () => ({
-  serverUrl: document.getElementById('serverUrl').value,
-  model: document.getElementById('model').value,
-  targetLanguage: document.getElementById('targetLanguage').value,
-  textModel: document.getElementById('textModel').value,
-  textTargetLang: document.getElementById('textTargetLang').value
-});
-
-const populateForm = (settings) => {
-  document.getElementById('serverUrl').value = settings.serverUrl;
-  document.getElementById('model').value = settings.model;
-  document.getElementById('targetLanguage').value = settings.targetLanguage;
-  document.getElementById('textModel').value = settings.textModel || DEFAULT_SETTINGS.textModel;
-  document.getElementById('textTargetLang').value = settings.textTargetLang || DEFAULT_SETTINGS.textTargetLang;
-};
+const validateUrl = (url) => 
+  typeof url === 'string' && /^https?:\/\/[^\s/$.?#].[^\s]*$/i.test(url.trim());
 
 // ============================================================================
-// TOAST
+// TOAST NOTIFICATIONS
 // ============================================================================
 
 function showToast(message, type = 'info', autoDismissMs = null) {
@@ -73,7 +61,10 @@ function showToast(message, type = 'info', autoDismissMs = null) {
 
   const toast = document.createElement('div');
   toast.className = `toast toast-${type}`;
-  toast.innerHTML = `<span class="toast-message">${message}</span><button class="toast-dismiss" aria-label="Dismiss">&times;</button>`;
+  toast.innerHTML = `
+    <span class="toast-message">${message}</span>
+    <button class="toast-dismiss" aria-label="Dismiss">&times;</button>
+  `;
   toast.querySelector('.toast-dismiss').addEventListener('click', () => dismissToast(toast));
   container.appendChild(toast);
 
@@ -91,61 +82,10 @@ function dismissToast(toast) {
 // UI HELPERS
 // ============================================================================
 
-function setButtonLoading(buttonId, loading) {
-  const button = document.getElementById(buttonId);
+function setButtonLoading(button, loading) {
   if (!button) return;
-  if (loading && !button.dataset.originalText) button.dataset.originalText = button.textContent;
   button.disabled = loading;
-  const spinner = button.querySelector('.spinner');
-  if (loading && !spinner) {
-    const s = document.createElement('span');
-    s.className = 'spinner';
-    button.insertBefore(s, button.firstChild);
-  } else if (!loading && spinner) {
-    spinner.remove();
-  }
-}
-
-function highlightInvalidField(fieldId, errorMessage) {
-  const field = document.getElementById(fieldId);
-  const formGroup = field?.closest('.form-group');
-  if (!formGroup) return;
-  formGroup.classList.add('has-error');
-  let errorEl = formGroup.querySelector('.field-error-message');
-  if (!errorEl) {
-    errorEl = document.createElement('span');
-    errorEl.className = 'field-error-message';
-    formGroup.appendChild(errorEl);
-  }
-  errorEl.textContent = errorMessage;
-}
-
-function clearFieldError(fieldId) {
-  const field = document.getElementById(fieldId);
-  const formGroup = field?.closest('.form-group');
-  if (!formGroup) return;
-  formGroup.classList.remove('has-error');
-  formGroup.querySelector('.field-error-message')?.remove();
-}
-
-// ============================================================================
-// CONNECTION STATUS
-// ============================================================================
-
-async function checkServerConnection(serverUrl) {
-  if (!serverUrl?.trim()) return { status: 'unconfigured', message: 'Configure server URL' };
-  if (!validateUrl(serverUrl)) return { status: 'disconnected', message: 'Invalid URL format' };
-
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), CONNECTION_TIMEOUT);
-    const healthUrl = serverUrl.replace('/proxy/translate', '/health');
-    const response = await fetch(healthUrl, { method: 'GET', signal: controller.signal });
-    clearTimeout(timeoutId);
-    return response.ok ? { status: 'connected', message: 'Connected' } : { status: 'disconnected', message: `Error: ${response.status}` };
-  } catch (error) {
-    return { status: 'disconnected', message: error.name === 'AbortError' ? 'Timeout' : 'Cannot connect' };
-  }
+  button.classList.toggle('loading', loading);
 }
 
 function updateConnectionStatusUI({ status, message }) {
@@ -157,81 +97,86 @@ function updateConnectionStatusUI({ status, message }) {
   if (statusText) statusText.textContent = message;
 }
 
-function setRefreshButtonSpinning(spinning) {
-  const btn = document.getElementById('refreshBtn');
-  if (!btn) return;
-  btn.classList.toggle('spinning', spinning);
-  btn.disabled = spinning;
-}
-
 // ============================================================================
-// SECTION COLLAPSE
+// CONNECTION CHECK
 // ============================================================================
 
-const toggleSection = (sectionId) => {
-  document.getElementById(sectionId)?.classList.toggle('collapsed');
-  saveCollapsedState();
-};
+async function checkServerConnection(serverUrl) {
+  if (!serverUrl?.trim()) return { status: 'unconfigured', message: 'Not configured' };
+  if (!validateUrl(serverUrl)) return { status: 'disconnected', message: 'Invalid URL' };
 
-const setSectionCollapsed = (sectionId, collapsed) => {
-  document.getElementById(sectionId)?.classList.toggle('collapsed', collapsed);
-};
-
-function updateSectionStatus(sectionId, isValid) {
-  const statusId = { serverConfigSection: 'serverConfigStatus' }[sectionId];
-  const el = statusId && document.getElementById(statusId);
-  if (el) {
-    el.className = `section-status ${isValid ? 'valid' : 'invalid'}`;
-    el.innerHTML = `<span class="section-status-dot"></span>${isValid ? 'OK' : '!'}`;
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), CONNECTION_TIMEOUT);
+    const healthUrl = serverUrl.replace('/proxy/translate', '/health');
+    const response = await fetch(healthUrl, { method: 'GET', signal: controller.signal });
+    clearTimeout(timeoutId);
+    return response.ok 
+      ? { status: 'connected', message: 'Connected' } 
+      : { status: 'disconnected', message: `Error: ${response.status}` };
+  } catch (error) {
+    return { 
+      status: 'disconnected', 
+      message: error.name === 'AbortError' ? 'Timeout' : 'Cannot connect' 
+    };
   }
 }
 
-const updateAllSectionStatuses = (settings) => {
-  updateSectionStatus('serverConfigSection', validateUrl(settings.serverUrl));
-};
+// ============================================================================
+// SETTINGS MODAL
+// ============================================================================
 
-function autoCollapseSectionsOnSuccess(status, settings) {
-  if (status.status !== 'connected') return;
-  if (validateUrl(settings.serverUrl)) setSectionCollapsed('serverConfigSection', true);
-  saveCollapsedState();
+function openSettingsModal() {
+  const modal = document.getElementById('settingsModal');
+  modal?.classList.remove('hidden');
+  document.getElementById('serverUrl')?.focus();
 }
 
-const saveCollapsedState = () => {
-  chrome.storage.local.set({ _collapsed: { serverConfigSection: document.getElementById('serverConfigSection')?.classList.contains('collapsed') } });
-};
+function closeSettingsModal() {
+  document.getElementById('settingsModal')?.classList.add('hidden');
+}
 
-const restoreCollapsedState = () => {
-  chrome.storage.local.get({ _collapsed: null }, (r) => {
-    if (r._collapsed) setSectionCollapsed('serverConfigSection', r._collapsed.serverConfigSection);
-  });
-};
+async function handleTestConnection() {
+  const serverUrl = document.getElementById('serverUrl').value;
+  const resultEl = document.getElementById('connectionResult');
+  const testBtn = document.getElementById('testConnectionBtn');
+  
+  setButtonLoading(testBtn, true);
+  resultEl.textContent = 'Testing...';
+  resultEl.className = 'connection-result checking';
+  
+  const status = await checkServerConnection(serverUrl);
+  
+  resultEl.textContent = status.message;
+  resultEl.className = `connection-result ${status.status}`;
+  setButtonLoading(testBtn, false);
+}
 
-// ============================================================================
-// UNSAVED CHANGES
-// ============================================================================
-
-const setLastSavedSettings = (settings) => { lastSavedSettings = { ...settings }; };
-
-const hasUnsavedChanges = () => {
-  if (!lastSavedSettings) return false;
-  const current = getFormSettings();
-  return ['serverUrl', 'model', 'targetLanguage'].some(key => current[key] !== lastSavedSettings[key]);
-};
-
-const markUnsavedChanges = (hasChanges) => {
-  document.getElementById('saveBtn')?.classList.toggle('has-changes', hasChanges);
-};
-
-const updateTranslateButtonState = (settings) => {
-  const btn = document.getElementById('translateBtn');
-  if (btn) btn.disabled = !validateSettings(settings).isValid;
-};
-
-function handleInputChange() {
-  markUnsavedChanges(hasUnsavedChanges());
-  const settings = getFormSettings();
-  updateTranslateButtonState(settings);
-  updateAllSectionStatuses(settings);
+async function handleSaveSettings() {
+  const serverUrl = document.getElementById('serverUrl').value;
+  const model = document.getElementById('model').value;
+  
+  if (!validateUrl(serverUrl)) {
+    showToast('Please enter a valid server URL', 'error');
+    return;
+  }
+  
+  setButtonLoading(document.getElementById('saveSettingsBtn'), true);
+  
+  try {
+    await saveSettings({ serverUrl, model });
+    showToast('Settings saved!', 'success');
+    closeSettingsModal();
+    
+    // Update connection status
+    updateConnectionStatusUI({ status: 'checking', message: 'Checking...' });
+    const status = await checkServerConnection(serverUrl);
+    updateConnectionStatusUI(status);
+  } catch (error) {
+    showToast('Failed to save settings', 'error');
+  } finally {
+    setButtonLoading(document.getElementById('saveSettingsBtn'), false);
+  }
 }
 
 // ============================================================================
@@ -239,14 +184,198 @@ function handleInputChange() {
 // ============================================================================
 
 function switchTab(tabId) {
-  document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.tab === tabId));
-  document.querySelectorAll('.tab-content').forEach(content => content.classList.toggle('active', content.id === `${tabId}Tab`));
+  document.querySelectorAll('.tab-btn').forEach(btn => 
+    btn.classList.toggle('active', btn.dataset.tab === tabId)
+  );
+  document.querySelectorAll('.tab-content').forEach(content => 
+    content.classList.toggle('active', content.id === `${tabId}Tab`)
+  );
   chrome.storage.local.set({ activeTab: tabId });
+  
+  // Refresh history when switching to history tab
+  if (tabId === 'history') {
+    renderHistoryList();
+  }
 }
 
 // ============================================================================
-// TEXT TRANSLATION
+// QUICK LANGUAGE TOGGLE
 // ============================================================================
+
+function renderQuickLanguageButtons(containerId, currentLang, recentLanguages, onSelect) {
+  const container = document.getElementById(containerId);
+  if (!container) return;
+  
+  container.innerHTML = '';
+  
+  // Show up to MAX_RECENT_LANGUAGES buttons
+  const langsToShow = recentLanguages
+    .filter(code => code !== currentLang)
+    .slice(0, MAX_RECENT_LANGUAGES);
+  
+  langsToShow.forEach(langCode => {
+    const lang = LANGUAGES.find(l => l.code === langCode);
+    if (!lang) return;
+    
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'quick-lang-btn';
+    btn.textContent = lang.name;
+    btn.title = lang.name;
+    btn.dataset.lang = langCode;
+    btn.addEventListener('click', () => onSelect(langCode));
+    container.appendChild(btn);
+  });
+}
+
+async function updateRecentLanguages(langCode) {
+  const settings = await loadSettings();
+  let recent = settings.recentLanguages || [];
+  
+  // Move selected language to front, remove duplicates
+  recent = [langCode, ...recent.filter(l => l !== langCode)].slice(0, MAX_RECENT_LANGUAGES + 1);
+  
+  await saveSettings({ recentLanguages: recent });
+  return recent;
+}
+
+// ============================================================================
+// TRANSLATION HISTORY
+// ============================================================================
+
+async function addToHistory(sourceText, translatedText, targetLang) {
+  const settings = await loadSettings();
+  const history = settings.translationHistory || [];
+  
+  const entry = {
+    id: Date.now(),
+    source: sourceText.substring(0, 200), // Truncate for storage
+    translation: translatedText.substring(0, 200),
+    targetLang,
+    timestamp: new Date().toISOString()
+  };
+  
+  // Add to front, limit size
+  const newHistory = [entry, ...history].slice(0, MAX_HISTORY_ITEMS);
+  await saveSettings({ translationHistory: newHistory });
+  
+  return newHistory;
+}
+
+async function clearHistory() {
+  await saveSettings({ translationHistory: [] });
+  renderHistoryList();
+  showToast('History cleared', 'success');
+}
+
+async function renderHistoryList() {
+  const container = document.getElementById('historyList');
+  if (!container) return;
+  
+  const settings = await loadSettings();
+  const history = settings.translationHistory || [];
+  
+  if (history.length === 0) {
+    container.innerHTML = '<div class="history-empty">No translation history yet</div>';
+    return;
+  }
+  
+  container.innerHTML = history.map(entry => `
+    <div class="history-item" data-id="${entry.id}">
+      <div class="history-item-header">
+        <span class="history-lang">${entry.targetLang}</span>
+        <span class="history-time">${formatRelativeTime(entry.timestamp)}</span>
+      </div>
+      <div class="history-source">${escapeHtml(entry.source)}</div>
+      <div class="history-translation">${escapeHtml(entry.translation)}</div>
+      <div class="history-actions">
+        <button type="button" class="history-copy-btn" data-text="${escapeAttr(entry.translation)}" title="Copy translation">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
+            <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+          </svg>
+        </button>
+        <button type="button" class="history-reuse-btn" data-source="${escapeAttr(entry.source)}" title="Translate again">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
+            <path d="M23 4v6h-6"></path>
+            <path d="M1 20v-6h6"></path>
+            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+          </svg>
+        </button>
+      </div>
+    </div>
+  `).join('');
+  
+  // Attach event listeners
+  container.querySelectorAll('.history-copy-btn').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      const text = e.currentTarget.dataset.text;
+      await navigator.clipboard.writeText(text);
+      showToast('Copied!', 'success');
+    });
+  });
+  
+  container.querySelectorAll('.history-reuse-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      const source = e.currentTarget.dataset.source;
+      document.getElementById('sourceText').value = source;
+      switchTab('text');
+      updateCharCount();
+    });
+  });
+}
+
+function formatRelativeTime(isoString) {
+  const date = new Date(isoString);
+  const now = new Date();
+  const diffMs = now - date;
+  const diffMins = Math.floor(diffMs / 60000);
+  const diffHours = Math.floor(diffMs / 3600000);
+  const diffDays = Math.floor(diffMs / 86400000);
+  
+  if (diffMins < 1) return 'Just now';
+  if (diffMins < 60) return `${diffMins}m ago`;
+  if (diffHours < 24) return `${diffHours}h ago`;
+  if (diffDays < 7) return `${diffDays}d ago`;
+  return date.toLocaleDateString();
+}
+
+function escapeHtml(str) {
+  return str.replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+
+function escapeAttr(str) {
+  return str.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// ============================================================================
+// TEXT TRANSLATION WITH PROGRESS
+// ============================================================================
+
+function showTranslationProgress(show) {
+  const progress = document.getElementById('translationProgress');
+  const output = document.getElementById('translatedText');
+  
+  if (show) {
+    progress?.classList.remove('hidden');
+    output?.classList.add('translating');
+    // Animate progress bar
+    const fill = progress?.querySelector('.progress-fill');
+    if (fill) {
+      fill.style.width = '0%';
+      setTimeout(() => fill.style.width = '70%', 100);
+    }
+  } else {
+    const fill = progress?.querySelector('.progress-fill');
+    if (fill) fill.style.width = '100%';
+    setTimeout(() => {
+      progress?.classList.add('hidden');
+      output?.classList.remove('translating');
+    }, 200);
+  }
+}
 
 function updateCharCount() {
   const sourceText = document.getElementById('sourceText');
@@ -258,6 +387,109 @@ function updateCharCount() {
   charCount.classList.remove('warning', 'error');
   if (len > MAX_TEXT_LENGTH) charCount.classList.add('error');
   else if (len > MAX_TEXT_LENGTH * 0.9) charCount.classList.add('warning');
+}
+
+async function handleTextTranslate() {
+  const sourceTextEl = document.getElementById('sourceText');
+  const sourceText = sourceTextEl.value;
+  const translatedTextEl = document.getElementById('translatedText');
+  const textTargetLang = document.getElementById('textTargetLang').value;
+  const translateBtn = document.getElementById('textTranslateBtn');
+
+  if (!sourceText.trim()) {
+    showToast('Enter text to translate', 'error');
+    return;
+  }
+
+  if (sourceText.length > MAX_TEXT_LENGTH) {
+    showToast(`Text exceeds ${MAX_TEXT_LENGTH} characters`, 'error');
+    return;
+  }
+
+  const settings = await loadSettings();
+  if (!validateUrl(settings.serverUrl)) {
+    showToast('Configure server URL in Settings', 'error');
+    openSettingsModal();
+    return;
+  }
+
+  setButtonLoading(translateBtn, true);
+  showTranslationProgress(true);
+  translatedTextEl.innerText = '';
+
+  try {
+    const response = await fetch(settings.serverUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messages: [
+          { role: 'system', content: `Translate the following text to ${textTargetLang}. IMPORTANT: Preserve exact formatting - keep all line breaks, paragraph spacing, and special characters exactly as in the original. Return only the translation.` },
+          { role: 'user', content: sourceText }
+        ],
+        model: settings.model || DEFAULT_SETTINGS.model,
+        temperature: 0.3,
+        html_aware: false
+      })
+    });
+
+    if (!response.ok) throw new Error(`Server error: ${response.status}`);
+
+    const data = await response.json();
+    const translation = data.choices?.[0]?.message?.content || '';
+    translatedTextEl.innerText = translation;
+
+    // Update recent languages and history
+    const recentLangs = await updateRecentLanguages(textTargetLang);
+    await addToHistory(sourceText, translation, textTargetLang);
+    
+    // Refresh quick language buttons
+    renderQuickLanguageButtons('textQuickLangs', textTargetLang, recentLangs, handleTextQuickLangSelect);
+    
+    // Save state
+    chrome.storage.local.set({ textTargetLang });
+    saveTextTabState();
+    
+  } catch (error) {
+    showToast(`Translation failed: ${error.message}`, 'error');
+    translatedTextEl.textContent = '';
+  } finally {
+    showTranslationProgress(false);
+    setButtonLoading(translateBtn, false);
+  }
+}
+
+function handleTextQuickLangSelect(langCode) {
+  document.getElementById('textTargetLang').value = langCode;
+  handleTextTranslate();
+}
+
+function handlePageQuickLangSelect(langCode) {
+  document.getElementById('targetLanguage').value = langCode;
+  updateRecentLanguages(langCode).then(recent => {
+    renderQuickLanguageButtons('pageQuickLangs', langCode, recent, handlePageQuickLangSelect);
+  });
+}
+
+function handleClearSource() {
+  document.getElementById('sourceText').value = '';
+  document.getElementById('translatedText').innerText = '';
+  updateCharCount();
+  saveTextTabState();
+}
+
+async function handleCopyResult() {
+  const translatedText = document.getElementById('translatedText');
+  const copyBtn = document.getElementById('copyResultBtn');
+  if (!translatedText?.textContent) return;
+
+  try {
+    await navigator.clipboard.writeText(translatedText.textContent);
+    copyBtn?.classList.add('copied');
+    showToast('Copied!', 'success');
+    setTimeout(() => copyBtn?.classList.remove('copied'), 1500);
+  } catch {
+    showToast('Failed to copy', 'error');
+  }
 }
 
 function saveTextTabState() {
@@ -278,166 +510,28 @@ function restoreTextTabState() {
   });
 }
 
-async function handleTextTranslate() {
-  const sourceTextEl = document.getElementById('sourceText');
-  const sourceText = sourceTextEl.value;
-  const translatedText = document.getElementById('translatedText');
-  const textModel = document.getElementById('textModel').value;
-  const textTargetLang = document.getElementById('textTargetLang').value;
-
-  if (!sourceText.trim()) {
-    showToast('Enter text to translate', 'error');
-    return;
-  }
-
-  if (sourceText.length > MAX_TEXT_LENGTH) {
-    showToast(`Text exceeds ${MAX_TEXT_LENGTH} characters`, 'error');
-    return;
-  }
-
-  const settings = await loadSettings();
-  if (!validateUrl(settings.serverUrl)) {
-    showToast('Configure server URL in Page tab', 'error');
-    return;
-  }
-
-  setButtonLoading('textTranslateBtn', true);
-  translatedText.innerText = '';
-  translatedText.classList.add('loading');
-
-  try {
-    const response = await fetch(settings.serverUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        messages: [
-          { role: 'system', content: `Translate the following text to ${textTargetLang}. IMPORTANT: Preserve exact formatting - keep all line breaks, paragraph spacing, and special characters exactly as in the original. Return only the translation.` },
-          { role: 'user', content: sourceText }
-        ],
-        model: textModel,
-        temperature: 0.3,
-        html_aware: false
-      })
-    });
-
-    if (!response.ok) throw new Error(`Server error: ${response.status}`);
-
-    const data = await response.json();
-    const translation = data.choices?.[0]?.message?.content || '';
-    translatedText.innerText = translation;
-
-    // Save preferences and state
-    chrome.storage.local.set({ textModel, textTargetLang });
-    saveTextTabState();
-  } catch (error) {
-    showToast(`Translation failed: ${error.message}`, 'error');
-    translatedText.textContent = '';
-  } finally {
-    translatedText.classList.remove('loading');
-    setButtonLoading('textTranslateBtn', false);
-  }
-}
-
-function handleClearSource() {
-  const sourceText = document.getElementById('sourceText');
-  const translatedText = document.getElementById('translatedText');
-  if (sourceText) sourceText.value = '';
-  if (translatedText) translatedText.innerText = '';
-  updateCharCount();
-  saveTextTabState();
-}
-
-async function handleCopyResult() {
-  const translatedText = document.getElementById('translatedText');
-  const copyBtn = document.getElementById('copyResultBtn');
-  if (!translatedText?.textContent) return;
-
-  try {
-    await navigator.clipboard.writeText(translatedText.textContent);
-    copyBtn?.classList.add('copied');
-    showToast('Copied!', 'success');
-    setTimeout(() => copyBtn?.classList.remove('copied'), 1500);
-  } catch {
-    showToast('Failed to copy', 'error');
-  }
-}
-
 // ============================================================================
-// PAGE TRANSLATION HANDLERS
+// PAGE TRANSLATION
 // ============================================================================
-
-async function handleRefreshConnection() {
-  const settings = getFormSettings();
-  updateConnectionStatusUI({ status: 'checking', message: 'Checking...' });
-  setRefreshButtonSpinning(true);
-  try {
-    const status = await checkServerConnection(settings.serverUrl);
-    updateConnectionStatusUI(status);
-    autoCollapseSectionsOnSuccess(status, settings);
-  } finally {
-    setRefreshButtonSpinning(false);
-  }
-}
-
-async function handleSave() {
-  const settings = getFormSettings();
-  REQUIRED_FIELDS.forEach(clearFieldError);
-
-  const { isValid, errors } = validateSettings(settings);
-  if (!isValid) {
-    let firstField = null;
-    errors.forEach((msg, fieldId) => {
-      highlightInvalidField(fieldId, msg);
-      if (!firstField) firstField = fieldId;
-    });
-    document.getElementById(firstField)?.focus();
-    showToast('Please fix validation errors', 'error');
-    return;
-  }
-
-  setButtonLoading('saveBtn', true);
-  try {
-    await saveSettings(settings);
-    setLastSavedSettings(settings);
-    markUnsavedChanges(false);
-    showToast('Settings saved!', 'success');
-    updateTranslateButtonState(settings);
-    updateAllSectionStatuses(settings);
-
-    updateConnectionStatusUI({ status: 'checking', message: 'Checking...' });
-    setRefreshButtonSpinning(true);
-    try {
-      const status = await checkServerConnection(settings.serverUrl);
-      updateConnectionStatusUI(status);
-      autoCollapseSectionsOnSuccess(status, settings);
-    } finally {
-      setRefreshButtonSpinning(false);
-    }
-  } catch (error) {
-    showToast('Failed to save: ' + error.message, 'error');
-  } finally {
-    setButtonLoading('saveBtn', false);
-  }
-}
 
 async function handleTranslate() {
-  const settings = getFormSettings();
-  REQUIRED_FIELDS.forEach(clearFieldError);
+  const settings = await loadSettings();
+  const targetLanguage = document.getElementById('targetLanguage').value;
+  const translateBtn = document.getElementById('translateBtn');
 
-  const { isValid, errors } = validateSettings(settings);
-  if (!isValid) {
-    let firstField = null;
-    errors.forEach((msg, fieldId) => {
-      highlightInvalidField(fieldId, msg);
-      if (!firstField) firstField = fieldId;
-    });
-    document.getElementById(firstField)?.focus();
-    showToast('Configure required settings first', 'error');
+  if (!validateUrl(settings.serverUrl)) {
+    showToast('Configure server URL in Settings', 'error');
+    openSettingsModal();
     return;
   }
 
-  setButtonLoading('translateBtn', true);
+  setButtonLoading(translateBtn, true);
+
   try {
+    // Save target language preference
+    await saveSettings({ targetLanguage });
+    await updateRecentLanguages(targetLanguage);
+    
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab) {
       showToast('No active tab found', 'error');
@@ -459,26 +553,27 @@ async function handleTranslate() {
   } catch (error) {
     showToast('Failed: ' + error.message, 'error');
   } finally {
-    setButtonLoading('translateBtn', false);
+    setButtonLoading(translateBtn, false);
   }
 }
 
 // ============================================================================
-// INIT
+// INITIALIZATION
 // ============================================================================
 
 async function initializePopup() {
   let settings;
   try {
     settings = await loadSettings();
-    populateForm(settings);
-    setLastSavedSettings(settings);
-    updateTranslateButtonState(settings);
   } catch {
     settings = DEFAULT_SETTINGS;
-    setLastSavedSettings(settings);
-    updateTranslateButtonState(settings);
   }
+
+  // Populate form fields
+  document.getElementById('serverUrl').value = settings.serverUrl;
+  document.getElementById('model').value = settings.model;
+  document.getElementById('targetLanguage').value = settings.targetLanguage;
+  document.getElementById('textTargetLang').value = settings.textTargetLang || DEFAULT_SETTINGS.textTargetLang;
 
   // Tab navigation
   document.querySelectorAll('.tab-btn').forEach(btn => {
@@ -488,18 +583,28 @@ async function initializePopup() {
   // Restore active tab
   if (settings.activeTab) switchTab(settings.activeTab);
 
-  // Page tab events
-  document.getElementById('saveBtn').addEventListener('click', handleSave);
-  document.getElementById('translateBtn').addEventListener('click', handleTranslate);
-  document.getElementById('refreshBtn')?.addEventListener('click', handleRefreshConnection);
-
-  ['serverUrl', 'model'].forEach(id => {
-    document.getElementById(id)?.addEventListener('input', handleInputChange);
+  // Settings modal
+  document.getElementById('settingsBtn')?.addEventListener('click', openSettingsModal);
+  document.getElementById('closeSettingsBtn')?.addEventListener('click', closeSettingsModal);
+  document.getElementById('testConnectionBtn')?.addEventListener('click', handleTestConnection);
+  document.getElementById('saveSettingsBtn')?.addEventListener('click', handleSaveSettings);
+  
+  // Close modal on overlay click
+  document.getElementById('settingsModal')?.addEventListener('click', (e) => {
+    if (e.target.id === 'settingsModal') closeSettingsModal();
   });
-  document.getElementById('targetLanguage')?.addEventListener('change', handleInputChange);
+  
+  // Close modal on Escape
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeSettingsModal();
+  });
 
-  document.querySelectorAll('.section-header[data-section]').forEach(header => {
-    header.addEventListener('click', () => toggleSection(header.dataset.section));
+  // Page tab events
+  document.getElementById('translateBtn')?.addEventListener('click', handleTranslate);
+  document.getElementById('targetLanguage')?.addEventListener('change', (e) => {
+    updateRecentLanguages(e.target.value).then(recent => {
+      renderQuickLanguageButtons('pageQuickLangs', e.target.value, recent, handlePageQuickLangSelect);
+    });
   });
 
   // Text tab events
@@ -510,31 +615,39 @@ async function initializePopup() {
   document.getElementById('textTranslateBtn')?.addEventListener('click', handleTextTranslate);
   document.getElementById('clearSourceBtn')?.addEventListener('click', handleClearSource);
   document.getElementById('copyResultBtn')?.addEventListener('click', handleCopyResult);
-
-  // Ctrl+Enter to translate
-  document.getElementById('sourceText')?.addEventListener('keydown', (e) => {
-    if (e.ctrlKey && e.key === 'Enter') handleTextTranslate();
+  document.getElementById('textTargetLang')?.addEventListener('change', (e) => {
+    updateRecentLanguages(e.target.value).then(recent => {
+      renderQuickLanguageButtons('textQuickLangs', e.target.value, recent, handleTextQuickLangSelect);
+    });
   });
+
+  // Keyboard shortcuts
+  document.getElementById('sourceText')?.addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+      e.preventDefault();
+      handleTextTranslate();
+    }
+  });
+
+  // History tab events
+  document.getElementById('clearHistoryBtn')?.addEventListener('click', clearHistory);
 
   // Restore text tab state
   restoreTextTabState();
-
-  updateAllSectionStatuses(settings);
-  restoreCollapsedState();
   updateCharCount();
 
-  // Check connection
+  // Render quick language buttons
+  const recentLangs = settings.recentLanguages || DEFAULT_SETTINGS.recentLanguages;
+  renderQuickLanguageButtons('pageQuickLangs', settings.targetLanguage, recentLangs, handlePageQuickLangSelect);
+  renderQuickLanguageButtons('textQuickLangs', settings.textTargetLang, recentLangs, handleTextQuickLangSelect);
+
+  // Check connection status
   updateConnectionStatusUI({ status: 'checking', message: 'Checking...' });
-  setRefreshButtonSpinning(true);
-  try {
-    const status = await checkServerConnection(settings.serverUrl);
-    updateConnectionStatusUI(status);
-    autoCollapseSectionsOnSuccess(status, settings);
-  } finally {
-    setRefreshButtonSpinning(false);
-  }
+  const status = await checkServerConnection(settings.serverUrl);
+  updateConnectionStatusUI(status);
 }
 
+// Start
 if (typeof chrome !== 'undefined' && chrome.storage) {
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', initializePopup);
@@ -542,17 +655,3 @@ if (typeof chrome !== 'undefined' && chrome.storage) {
     initializePopup();
   }
 }
-
-// Export for testing
-export {
-  validateUrl, validateSettings, showToast, dismissToast, setButtonLoading,
-  highlightInvalidField, clearFieldError, checkServerConnection, updateConnectionStatusUI,
-  setRefreshButtonSpinning, handleRefreshConnection, updateTranslateButtonState,
-  markUnsavedChanges, hasUnsavedChanges, setLastSavedSettings, handleInputChange,
-  getFormSettings, populateForm, loadSettings, saveSettings, handleSave, handleTranslate,
-  toggleSection, setSectionCollapsed, updateSectionStatus, updateAllSectionStatuses,
-  autoCollapseSectionsOnSuccess, saveCollapsedState, restoreCollapsedState,
-  switchTab, handleTextTranslate, handleClearSource, handleCopyResult, updateCharCount,
-  saveTextTabState, restoreTextTabState,
-  DEFAULT_SETTINGS, REQUIRED_FIELDS, CONNECTION_TIMEOUT, MAX_TEXT_LENGTH
-};

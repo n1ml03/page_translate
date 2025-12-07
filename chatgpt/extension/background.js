@@ -14,10 +14,87 @@ const DEFAULT_SETTINGS = {
   proxyUrl: 'http://localhost:8000/proxy/translate',
   targetEndpoint: '',
   username: '',
-  password: '',
+  encryptedPassword: '',
   model: '41-mini',
   targetLanguage: 'English'
 };
+
+// ============================================================================
+// CRYPTO MODULE (Embedded for Service Worker compatibility)
+// ============================================================================
+
+const CryptoModule = (() => {
+  const SALT = 'page-translator-v1';
+  const ITERATIONS = 100000;
+  const KEY_LENGTH = 256;
+
+  async function getDeviceKey() {
+    return new Promise((resolve) => {
+      chrome.storage.local.get({ _deviceKey: null }, async (result) => {
+        if (result._deviceKey) {
+          resolve(result._deviceKey);
+        } else {
+          const array = new Uint8Array(32);
+          crypto.getRandomValues(array);
+          const key = Array.from(array, b => b.toString(16).padStart(2, '0')).join('');
+          await chrome.storage.local.set({ _deviceKey: key });
+          resolve(key);
+        }
+      });
+    });
+  }
+
+  async function deriveKey(deviceKey) {
+    const encoder = new TextEncoder();
+    const keyMaterial = await crypto.subtle.importKey(
+      'raw',
+      encoder.encode(deviceKey),
+      'PBKDF2',
+      false,
+      ['deriveKey']
+    );
+
+    return crypto.subtle.deriveKey(
+      {
+        name: 'PBKDF2',
+        salt: encoder.encode(SALT),
+        iterations: ITERATIONS,
+        hash: 'SHA-256'
+      },
+      keyMaterial,
+      { name: 'AES-GCM', length: KEY_LENGTH },
+      false,
+      ['encrypt', 'decrypt']
+    );
+  }
+
+  async function decrypt(encryptedBase64) {
+    if (!encryptedBase64) return '';
+    
+    try {
+      const deviceKey = await getDeviceKey();
+      const key = await deriveKey(deviceKey);
+      
+      const combined = Uint8Array.from(atob(encryptedBase64), c => c.charCodeAt(0));
+      const iv = combined.slice(0, 12);
+      const encrypted = combined.slice(12);
+
+      const decrypted = await crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv },
+        key,
+        encrypted
+      );
+
+      const decoder = new TextDecoder();
+      return decoder.decode(decrypted);
+    } catch (error) {
+      console.error('[Crypto] Decryption failed:', error);
+      return '';
+    }
+  }
+
+  return { decrypt };
+})();
 
 // ============================================================================
 // UTILITIES
@@ -35,10 +112,27 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function getSettings() {
+async function getSettings() {
   return new Promise((resolve, reject) => {
-    chrome.storage.local.get(DEFAULT_SETTINGS, (result) => {
-      chrome.runtime.lastError ? reject(chrome.runtime.lastError) : resolve(result);
+    chrome.storage.local.get(DEFAULT_SETTINGS, async (result) => {
+      if (chrome.runtime.lastError) {
+        reject(chrome.runtime.lastError);
+        return;
+      }
+      
+      // Decrypt password
+      let password = '';
+      if (result.encryptedPassword) {
+        password = await CryptoModule.decrypt(result.encryptedPassword);
+      } else if (result.password) {
+        // Legacy: plain text password (will be migrated on next save)
+        password = result.password;
+      }
+      
+      resolve({
+        ...result,
+        password
+      });
     });
   });
 }

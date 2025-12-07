@@ -1,23 +1,27 @@
 /**
  * InlineTranslator - Inline translation feature for Chrome extensions
  * Uses Shadow DOM for style isolation
+ * Features: Quick language toggle, translation history sync, better loading feedback
  */
 class InlineTranslator {
-  // Maximum characters allowed for translation
   static MAX_TEXT_LENGTH = 1000;
   
   constructor(options = {}) {
     this.translateFn = options.translateFn || this._mockTranslate.bind(this);
     this.languages = options.languages || [
-      { code: 'ja', name: 'Japanese (日本語)' },
-      { code: 'en', name: 'English' },
-      { code: 'zh-CN', name: 'Chinese Simplified (简体中文)' },
-      { code: 'zh-TW', name: 'Chinese Traditional (繁體中文)' },
-      { code: 'ko', name: 'Korean (한국어)' },
-      { code: 'vi', name: 'Vietnamese (Tiếng Việt)' },
+      { code: 'ja', name: 'Japanese', native: '日本語' },
+      { code: 'en', name: 'English', native: 'English' },
+      { code: 'zh-CN', name: 'Chinese Simplified', native: '简体中文' },
+      { code: 'zh-TW', name: 'Chinese Traditional', native: '繁體中文' },
+      { code: 'ko', name: 'Korean', native: '한국어' },
+      { code: 'vi', name: 'Vietnamese', native: 'Tiếng Việt' },
     ];
     this.defaultLang = options.defaultLang || 'ja';
     this.iconUrl = options.iconUrl || null;
+    this.onHistoryAdd = options.onHistoryAdd || null;
+    
+    // Recent languages for quick toggle (synced with popup)
+    this.recentLanguages = options.recentLanguages || ['ja', 'en', 'zh-CN'];
     
     this.hostElement = null;
     this.shadowRoot = null;
@@ -27,27 +31,27 @@ class InlineTranslator {
     this.selectionRect = null;
     this.currentLang = this.defaultLang;
     this.isTranslating = false;
-    
-    // Store the selection range for inline replacement
     this.selectionRange = null;
-    
-    // AbortController for cancelling stale requests
     this.abortController = null;
+    this.translationStartTime = null;
     
-    // Bound event handlers for proper cleanup
+    // Bound event handlers
     this._boundHandleMouseUp = this._handleMouseUp.bind(this);
     this._boundHandleClickOutside = this._handleClickOutside.bind(this);
     this._boundHandleKeyDown = this._handleKeyDown.bind(this);
     this._boundHandleScroll = this._debounce(this._handleScroll.bind(this), 100);
     this._boundHandleRevertClick = this._handleRevertClick.bind(this);
-    
-    // Track panel-specific listeners for cleanup
     this._panelListeners = [];
+  }
+
+  // Update recent languages (called from content.js when syncing with popup)
+  updateRecentLanguages(languages) {
+    this.recentLanguages = languages;
   }
 
 
   // ============================================================================
-  // STYLES - Responsive design with max-width instead of fixed width
+  // STYLES - With quick language buttons and progress indicator
   // ============================================================================
 
   static getStyles() {
@@ -61,11 +65,11 @@ class InlineTranslator {
       
       .it-icon {
         position: fixed;
-        width: 24px;
-        height: 24px;
+        width: 28px;
+        height: 28px;
         background: transparent;
         border: none;
-        border-radius: 4px;
+        border-radius: 6px;
         cursor: pointer;
         display: flex;
         align-items: center;
@@ -73,7 +77,14 @@ class InlineTranslator {
         z-index: 2147483647;
         transition: transform 0.15s ease, opacity 0.15s ease;
         padding: 0;
-        opacity: 0.85;
+        opacity: 0.9;
+        animation: it-iconPulse 0.3s ease-out;
+      }
+      
+      @keyframes it-iconPulse {
+        0% { transform: scale(0.8); opacity: 0; }
+        50% { transform: scale(1.1); }
+        100% { transform: scale(1); opacity: 0.9; }
       }
       
       .it-icon:hover {
@@ -82,20 +93,19 @@ class InlineTranslator {
       }
       
       .it-icon svg {
-        width: 20px;
-        height: 20px;
+        width: 22px;
+        height: 22px;
         fill: #4285f4;
-        filter: drop-shadow(0 1px 2px rgba(0,0,0,0.2));
+        filter: drop-shadow(0 1px 3px rgba(0,0,0,0.25));
       }
       
       .it-icon img {
-        width: 24px;
-        height: 24px;
+        width: 28px;
+        height: 28px;
         object-fit: contain;
-        filter: drop-shadow(0 1px 2px rgba(0,0,0,0.2));
+        filter: drop-shadow(0 1px 3px rgba(0,0,0,0.25));
       }
       
-      /* Responsive panel: larger default, optimized for big screens */
       .it-panel {
         position: fixed;
         width: calc(100vw - 30px);
@@ -109,19 +119,8 @@ class InlineTranslator {
         animation: it-fadeIn 0.2s ease;
       }
       
-      /* Large screen optimization (>1200px) */
-      @media (min-width: 1200px) {
-        .it-panel {
-          max-width: 600px;
-        }
-      }
-      
-      /* Extra large screens (>1600px) */
-      @media (min-width: 1600px) {
-        .it-panel {
-          max-width: 680px;
-        }
-      }
+      @media (min-width: 1200px) { .it-panel { max-width: 600px; } }
+      @media (min-width: 1600px) { .it-panel { max-width: 680px; } }
       
       @keyframes it-fadeIn {
         from { opacity: 0; transform: translateY(-8px); }
@@ -158,7 +157,6 @@ class InlineTranslator {
       }
       
       .it-close-btn:hover { background: rgba(255, 255, 255, 0.3); }
-      .it-close-btn:focus { outline: 2px solid white; outline-offset: 2px; }
       .it-close-btn svg { width: 14px; height: 14px; fill: white; }
       
       .it-panel-body {
@@ -168,15 +166,44 @@ class InlineTranslator {
         gap: 10px;
       }
       
-      @media (min-width: 1200px) {
-        .it-panel-body {
-          padding: 16px 20px;
-          gap: 12px;
-        }
+      /* Quick Language Toggle */
+      .it-quick-langs {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+      }
+      
+      .it-quick-lang-btn {
+        padding: 4px 10px;
+        font-size: 12px;
+        font-weight: 500;
+        color: #4285f4;
+        background: rgba(66, 133, 244, 0.1);
+        border: 1px solid rgba(66, 133, 244, 0.3);
+        border-radius: 4px;
+        cursor: pointer;
+        transition: all 0.15s ease;
+      }
+      
+      .it-quick-lang-btn:hover {
+        background: rgba(66, 133, 244, 0.2);
+        border-color: #4285f4;
+      }
+      
+      .it-quick-lang-btn.active {
+        background: #4285f4;
+        color: white;
+        border-color: #4285f4;
+      }
+      
+      .it-lang-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
       }
       
       .it-lang-select {
-        width: 100%;
+        flex: 1;
         padding: 8px 10px;
         font-size: 13px;
         border: 1px solid #e0e0e0;
@@ -184,14 +211,13 @@ class InlineTranslator {
         background: #f8f9fa;
         cursor: pointer;
         outline: none;
-        transition: border-color 0.15s ease;
         appearance: none;
         background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24'%3E%3Cpath fill='%23666' d='M7 10l5 5 5-5z'/%3E%3C/svg%3E");
         background-repeat: no-repeat;
         background-position: right 10px center;
       }
       
-      .it-lang-select:focus { border-color: #4285f4; outline: 2px solid #4285f433; }
+      .it-lang-select:focus { border-color: #4285f4; }
       
       .it-text-section { margin-top: 0; }
       
@@ -225,13 +251,16 @@ class InlineTranslator {
         background: #e8f5e9;
         border-color: #c8e6c9;
         color: #2e7d32;
+        position: relative;
       }
       
       .it-text-box.it-loading {
         display: flex;
+        flex-direction: column;
         align-items: center;
         justify-content: center;
         color: #888;
+        min-height: 80px;
       }
       
       .it-text-box.it-error {
@@ -240,20 +269,44 @@ class InlineTranslator {
         color: #c5221f;
       }
       
-      /* Larger text boxes on big screens */
-      @media (min-width: 1200px) {
-        .it-text-box {
-          min-height: 80px;
-          max-height: 180px;
-          font-size: 15px;
-        }
+      /* Progress Indicator */
+      .it-progress-container {
+        width: 100%;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 8px;
       }
       
-      @media (min-width: 1600px) {
-        .it-text-box {
-          min-height: 100px;
-          max-height: 240px;
-        }
+      .it-progress-bar {
+        width: 80%;
+        height: 4px;
+        background: #e0e0e0;
+        border-radius: 2px;
+        overflow: hidden;
+      }
+      
+      .it-progress-fill {
+        height: 100%;
+        background: linear-gradient(90deg, #4285f4, #34a853);
+        border-radius: 2px;
+        transition: width 0.3s ease;
+        animation: it-progressPulse 1.5s ease-in-out infinite;
+      }
+      
+      @keyframes it-progressPulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.7; }
+      }
+      
+      .it-progress-text {
+        font-size: 12px;
+        color: #666;
+      }
+      
+      .it-elapsed-time {
+        font-size: 11px;
+        color: #999;
       }
       
       .it-warning {
@@ -262,20 +315,7 @@ class InlineTranslator {
         padding: 4px 8px;
         background: #fff3e0;
         border-radius: 4px;
-        margin-bottom: 4px;
       }
-      
-      .it-spinner {
-        width: 20px;
-        height: 20px;
-        border: 2px solid #e0e0e0;
-        border-top-color: #4285f4;
-        border-radius: 50%;
-        animation: it-spin 0.8s linear infinite;
-        margin-right: 8px;
-      }
-      
-      @keyframes it-spin { to { transform: rotate(360deg); } }
       
       .it-btn-row {
         display: flex;
@@ -297,7 +337,6 @@ class InlineTranslator {
       }
       
       .it-copy-btn:hover, .it-retry-btn:hover, .it-replace-btn:hover { opacity: 0.9; }
-      .it-copy-btn:focus, .it-retry-btn:focus, .it-replace-btn:focus { outline: 2px solid #4285f4; outline-offset: 2px; }
       .it-copy-btn:disabled, .it-retry-btn:disabled, .it-replace-btn:disabled { opacity: 0.5; cursor: not-allowed; }
       .it-copy-btn.it-copied, .it-replace-btn.it-replaced { background: #34a853; }
       
@@ -307,19 +346,22 @@ class InlineTranslator {
         padding: 8px 16px;
       }
       
-      .it-retry-btn:hover { background: #d32f2f; }
+      /* Keyboard hint */
+      .it-keyboard-hint {
+        font-size: 10px;
+        color: #999;
+        text-align: center;
+        margin-top: 4px;
+      }
       
-      /* Screen reader only */
-      .sr-only {
-        position: absolute;
-        width: 1px;
-        height: 1px;
-        padding: 0;
-        margin: -1px;
-        overflow: hidden;
-        clip: rect(0, 0, 0, 0);
-        white-space: nowrap;
-        border: 0;
+      .it-kbd {
+        display: inline-block;
+        padding: 1px 4px;
+        background: #f0f0f0;
+        border: 1px solid #ddd;
+        border-radius: 3px;
+        font-family: monospace;
+        font-size: 10px;
       }
     `;
   }
@@ -350,13 +392,8 @@ class InlineTranslator {
   }
 
   destroy() {
-    // Cancel any pending translation
     this._cancelPendingRequest();
-    
-    // Remove all global listeners
     this._removeListeners();
-    
-    // Clean up panel-specific listeners
     this._cleanupPanelListeners();
     
     if (this.hostElement) {
@@ -379,15 +416,9 @@ class InlineTranslator {
     this.shadowRoot.appendChild(style);
     
     document.body.appendChild(this.hostElement);
-    
-    // Inject styles for replaced text into the main document (not shadow DOM)
-    // This is needed for ::after pseudo-element to work
     this._injectReplacedTextStyles();
   }
 
-  /**
-   * Inject styles for replaced text elements into the main document
-   */
   _injectReplacedTextStyles() {
     if (document.getElementById('inline-translator-replaced-styles')) return;
     
@@ -422,7 +453,6 @@ class InlineTranslator {
         transition: opacity 0.15s ease, transform 0.15s ease !important;
         pointer-events: none !important;
         z-index: 10000 !important;
-        font-family: sans-serif !important;
       }
       .pt-inline-replaced:hover::after {
         opacity: 1 !important;
@@ -452,9 +482,6 @@ class InlineTranslator {
   // EVENT HANDLERS
   // ============================================================================
 
-  /**
-   * Handle Escape key to close panel (A11y)
-   */
   _handleKeyDown(e) {
     if (e.key === 'Escape') {
       if (this.panelElement) {
@@ -466,15 +493,11 @@ class InlineTranslator {
       }
     }
     
-    // Focus trap: Tab key handling within panel
     if (e.key === 'Tab' && this.panelElement) {
       this._handleFocusTrap(e);
     }
   }
 
-  /**
-   * Focus trap implementation for keyboard accessibility
-   */
   _handleFocusTrap(e) {
     const focusableElements = this.panelElement.querySelectorAll(
       'button:not([disabled]), select, [tabindex]:not([tabindex="-1"])'
@@ -494,25 +517,18 @@ class InlineTranslator {
     }
   }
 
-  /**
-   * Handle scroll events to reposition panel (debounced)
-   */
   _handleScroll() {
     if (this.panelElement && this.selectionRect) {
-      // Recalculate position based on current selection
       try {
         const selection = window.getSelection();
         if (selection && selection.rangeCount > 0) {
           const range = selection.getRangeAt(0);
           this.selectionRect = this._getMultiLineRect(range);
-          
           const pos = this._calculatePanelPosition(this.selectionRect, this._getPanelWidth(), 320);
           this.panelElement.style.left = `${pos.left}px`;
           this.panelElement.style.top = `${pos.top}px`;
         }
-      } catch (e) {
-        // Ignore errors from cross-origin iframes
-      }
+      } catch (e) {}
     }
     
     if (this.iconElement && this.selectionRect) {
@@ -526,13 +542,11 @@ class InlineTranslator {
     if (this.hostElement?.contains(e.target) || e.target === this.hostElement) return;
     
     setTimeout(() => {
-      // Wrap in try-catch for iframe safety
       let selection, text;
       try {
         selection = window.getSelection();
         text = selection?.toString().trim();
       } catch (err) {
-        // Cross-origin iframe - silently fail
         return;
       }
       
@@ -545,16 +559,13 @@ class InlineTranslator {
       
       try {
         const range = selection.getRangeAt(0);
-        // Use improved multi-line positioning
         this.selectionRect = this._getMultiLineRect(range);
         this.selectedText = text;
-        // Store the range for inline replacement
         this.selectionRange = range.cloneRange();
         
         this._hidePanel();
         this._showIcon();
       } catch (err) {
-        // Handle edge cases where range is not available
         return;
       }
     }, 10);
@@ -574,46 +585,49 @@ class InlineTranslator {
     }
   }
 
-  /**
-   * Handle click on replaced text to revert to original
-   */
   _handleRevertClick(e) {
     const target = e.target;
-    
-    // Check if clicked element is a replaced text span
     if (!target.classList?.contains('pt-inline-replaced')) return;
     
     const originalText = target.dataset.ptOriginal;
-    if (!originalText) return;
+    const originalHTML = target.dataset.ptOriginalHtml;
     
-    // Prevent triggering other click handlers
+    if (!originalText && !originalHTML) return;
+    
     e.preventDefault();
     e.stopPropagation();
     
-    // Revert to original text - preserve line breaks
     const parent = target.parentNode;
     if (!parent) return;
     
-    // Check if original text has line breaks
-    if (originalText.includes('\n')) {
-      // Create a span to preserve formatting
+    // Prefer restoring original HTML if available (preserves formatting)
+    if (originalHTML) {
+      const tempContainer = document.createElement('div');
+      tempContainer.innerHTML = originalHTML;
+      
+      // Move all children from temp container to a fragment
+      const fragment = document.createDocumentFragment();
+      while (tempContainer.firstChild) {
+        fragment.appendChild(tempContainer.firstChild);
+      }
+      
+      parent.replaceChild(fragment, target);
+    } else if (originalText.includes('\n')) {
       const wrapper = document.createElement('span');
       wrapper.style.whiteSpace = 'pre-wrap';
       this._setTextWithLineBreaks(wrapper, originalText);
       parent.replaceChild(wrapper, target);
     } else {
-      // Simple text node for single-line text
       const textNode = document.createTextNode(originalText);
       parent.replaceChild(textNode, target);
     }
     
-    // Clear any selection that might have been made
     window.getSelection()?.removeAllRanges();
   }
 
 
   // ============================================================================
-  // ICON - Sanitized iconUrl handling
+  // ICON
   // ============================================================================
 
   _showIcon() {
@@ -624,18 +638,11 @@ class InlineTranslator {
     icon.setAttribute('aria-label', 'Translate selection');
     icon.title = 'Translate selection';
     
-    // SECURITY: Use DOM APIs instead of innerHTML for iconUrl
-    if (this.iconUrl) {
+    if (this.iconUrl && this._isValidIconUrl(this.iconUrl)) {
       const img = document.createElement('img');
-      // Sanitize URL - only allow http, https, data, and chrome-extension protocols
-      if (this._isValidIconUrl(this.iconUrl)) {
-        img.setAttribute('src', this.iconUrl);
-        img.setAttribute('alt', 'Translate');
-        icon.appendChild(img);
-      } else {
-        // Fallback to default SVG if URL is invalid
-        this._appendDefaultIcon(icon);
-      }
+      img.setAttribute('src', this.iconUrl);
+      img.setAttribute('alt', 'Translate');
+      icon.appendChild(img);
     } else {
       this._appendDefaultIcon(icon);
     }
@@ -647,7 +654,6 @@ class InlineTranslator {
     };
     
     icon.addEventListener('click', clickHandler);
-    // Track listener for cleanup
     this._panelListeners.push({ element: icon, type: 'click', handler: clickHandler });
     
     const pos = this._calculateIconPosition(this.selectionRect);
@@ -658,9 +664,6 @@ class InlineTranslator {
     this.shadowRoot.appendChild(icon);
   }
 
-  /**
-   * Validate icon URL to prevent XSS
-   */
   _isValidIconUrl(url) {
     try {
       const parsed = new URL(url, window.location.href);
@@ -670,9 +673,6 @@ class InlineTranslator {
     }
   }
 
-  /**
-   * Append default SVG icon using DOM APIs (no innerHTML)
-   */
   _appendDefaultIcon(container) {
     const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     svg.setAttribute('viewBox', '0 0 24 24');
@@ -692,14 +692,13 @@ class InlineTranslator {
   }
 
   // ============================================================================
-  // PANEL - With retry button and proper cleanup
+  // PANEL - With quick language toggle and progress indicator
   // ============================================================================
 
   _showPanel() {
     this._hidePanel();
     this.isTranslating = false;
     
-    // Check text length limit
     const isTextTruncated = this.selectedText.length > InlineTranslator.MAX_TEXT_LENGTH;
     const displayText = isTextTruncated 
       ? this.selectedText.substring(0, InlineTranslator.MAX_TEXT_LENGTH) 
@@ -710,29 +709,21 @@ class InlineTranslator {
     panel.setAttribute('role', 'dialog');
     panel.setAttribute('aria-label', 'Translation panel');
     
-    // Build panel using DOM APIs for security
     this._buildPanelContent(panel, displayText, isTextTruncated);
     
-    // Position panel (use responsive width based on screen size)
-    const pos = this._calculatePanelPosition(this.selectionRect, this._getPanelWidth(), 320);
+    const pos = this._calculatePanelPosition(this.selectionRect, this._getPanelWidth(), 380);
     panel.style.left = `${pos.left}px`;
     panel.style.top = `${pos.top}px`;
     
     this.panelElement = panel;
     this.shadowRoot.appendChild(panel);
     
-    // Set initial focus for accessibility
     const langSelect = panel.querySelector('.it-lang-select');
-    if (langSelect) {
-      langSelect.focus();
-    }
+    if (langSelect) langSelect.focus();
     
     this._fetchTranslation(panel);
   }
 
-  /**
-   * Build panel content using DOM APIs (no innerHTML for dynamic content)
-   */
   _buildPanelContent(panel, displayText, isTextTruncated) {
     // Header
     const header = document.createElement('div');
@@ -746,7 +737,7 @@ class InlineTranslator {
     const closeBtn = document.createElement('button');
     closeBtn.className = 'it-close-btn';
     closeBtn.title = 'Close (Esc)';
-    closeBtn.setAttribute('aria-label', 'Close translation panel');
+    closeBtn.setAttribute('aria-label', 'Close');
     
     const closeSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     closeSvg.setAttribute('viewBox', '0 0 24 24');
@@ -770,12 +761,49 @@ class InlineTranslator {
     if (isTextTruncated) {
       const warning = document.createElement('div');
       warning.className = 'it-warning';
-      warning.setAttribute('role', 'alert');
       warning.textContent = `Text truncated to ${InlineTranslator.MAX_TEXT_LENGTH.toLocaleString()} characters`;
       body.appendChild(warning);
     }
     
-    // Language select
+    // Quick language buttons
+    const quickLangs = document.createElement('div');
+    quickLangs.className = 'it-quick-langs';
+    
+    this.recentLanguages.forEach(langCode => {
+      const lang = this.languages.find(l => l.code === langCode);
+      if (!lang) return;
+      
+      const btn = document.createElement('button');
+      btn.className = 'it-quick-lang-btn';
+      if (langCode === this.currentLang) btn.classList.add('active');
+      btn.textContent = lang.native;
+      btn.title = lang.name;
+      btn.dataset.lang = langCode;
+      
+      const quickLangHandler = () => {
+        this.currentLang = langCode;
+        // Update active state
+        quickLangs.querySelectorAll('.it-quick-lang-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        // Update select
+        const select = panel.querySelector('.it-lang-select');
+        if (select) select.value = langCode;
+        // Re-translate
+        this._fetchTranslation(panel);
+      };
+      
+      btn.addEventListener('click', quickLangHandler);
+      this._panelListeners.push({ element: btn, type: 'click', handler: quickLangHandler });
+      
+      quickLangs.appendChild(btn);
+    });
+    
+    body.appendChild(quickLangs);
+    
+    // Language select row
+    const langRow = document.createElement('div');
+    langRow.className = 'it-lang-row';
+    
     const langSelect = document.createElement('select');
     langSelect.className = 'it-lang-select';
     langSelect.setAttribute('aria-label', 'Target language');
@@ -784,21 +812,24 @@ class InlineTranslator {
       const option = document.createElement('option');
       option.value = lang.code;
       option.textContent = lang.name;
-      if (lang.code === this.currentLang) {
-        option.selected = true;
-      }
+      if (lang.code === this.currentLang) option.selected = true;
       langSelect.appendChild(option);
     });
     
     const langChangeHandler = (e) => {
       e.stopPropagation();
       this.currentLang = e.target.value;
+      // Update quick lang buttons
+      quickLangs.querySelectorAll('.it-quick-lang-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.lang === this.currentLang);
+      });
       this._fetchTranslation(panel);
     };
     langSelect.addEventListener('change', langChangeHandler);
     this._panelListeners.push({ element: langSelect, type: 'change', handler: langChangeHandler });
     
-    body.appendChild(langSelect);
+    langRow.appendChild(langSelect);
+    body.appendChild(langRow);
     
     // Source text section
     const sourceSection = document.createElement('div');
@@ -812,7 +843,6 @@ class InlineTranslator {
     const sourceBox = document.createElement('div');
     sourceBox.className = 'it-text-box it-source';
     sourceBox.style.whiteSpace = 'pre-wrap';
-    // Preserve line breaks in source text display
     this._setTextWithLineBreaks(sourceBox, displayText);
     sourceSection.appendChild(sourceBox);
     
@@ -831,14 +861,29 @@ class InlineTranslator {
     transBox.className = 'it-text-box it-translated it-loading';
     transBox.setAttribute('aria-live', 'polite');
     
-    const spinner = document.createElement('div');
-    spinner.className = 'it-spinner';
-    transBox.appendChild(spinner);
+    // Progress indicator
+    const progressContainer = document.createElement('div');
+    progressContainer.className = 'it-progress-container';
     
-    const loadingText = document.createElement('span');
-    loadingText.textContent = 'Translating...';
-    transBox.appendChild(loadingText);
+    const progressBar = document.createElement('div');
+    progressBar.className = 'it-progress-bar';
+    const progressFill = document.createElement('div');
+    progressFill.className = 'it-progress-fill';
+    progressFill.style.width = '30%';
+    progressBar.appendChild(progressFill);
+    progressContainer.appendChild(progressBar);
     
+    const progressText = document.createElement('span');
+    progressText.className = 'it-progress-text';
+    progressText.textContent = 'Translating...';
+    progressContainer.appendChild(progressText);
+    
+    const elapsedTime = document.createElement('span');
+    elapsedTime.className = 'it-elapsed-time';
+    elapsedTime.textContent = '';
+    progressContainer.appendChild(elapsedTime);
+    
+    transBox.appendChild(progressContainer);
     transSection.appendChild(transBox);
     body.appendChild(transSection);
     
@@ -857,11 +902,10 @@ class InlineTranslator {
     
     btnRow.appendChild(copyBtn);
     
-    // Replace button - replaces original text with translation
     const replaceBtn = document.createElement('button');
     replaceBtn.className = 'it-replace-btn';
     replaceBtn.textContent = 'Replace';
-    replaceBtn.title = 'Replace original text with translation';
+    replaceBtn.title = 'Replace original text';
     replaceBtn.disabled = true;
     
     const replaceHandler = () => this._replaceWithTranslation(panel);
@@ -871,14 +915,17 @@ class InlineTranslator {
     btnRow.appendChild(replaceBtn);
     body.appendChild(btnRow);
     
+    // Keyboard hint
+    const hint = document.createElement('div');
+    hint.className = 'it-keyboard-hint';
+    hint.innerHTML = 'Press <span class="it-kbd">Esc</span> to close';
+    body.appendChild(hint);
+    
     panel.appendChild(body);
   }
 
   _hidePanel() {
-    // Cancel any pending translation request
     this._cancelPendingRequest();
-    
-    // Clean up panel-specific listeners
     this._cleanupPanelListeners();
     
     if (this.panelElement) {
@@ -886,11 +933,9 @@ class InlineTranslator {
       this.panelElement = null;
     }
     this.isTranslating = false;
+    this.translationStartTime = null;
   }
 
-  /**
-   * Cancel pending translation request
-   */
   _cancelPendingRequest() {
     if (this.abortController) {
       this.abortController.abort();
@@ -898,9 +943,6 @@ class InlineTranslator {
     }
   }
 
-  /**
-   * Clean up tracked event listeners
-   */
   _cleanupPanelListeners() {
     this._panelListeners.forEach(({ element, type, handler }) => {
       element.removeEventListener(type, handler);
@@ -910,13 +952,11 @@ class InlineTranslator {
 
 
   // ============================================================================
-  // TRANSLATION - With AbortController and retry functionality
+  // TRANSLATION - With progress tracking
   // ============================================================================
 
   async _fetchTranslation(panel) {
-    // Prevent duplicate requests
     if (this.isTranslating) {
-      // Cancel existing request before starting new one
       this._cancelPendingRequest();
     }
     
@@ -927,22 +967,50 @@ class InlineTranslator {
     
     if (!translatedBox || !copyBtn || !btnRow) return;
     
-    // Remove existing retry button if present
+    // Remove existing retry button
     const existingRetry = btnRow.querySelector('.it-retry-btn');
-    if (existingRetry) {
-      existingRetry.remove();
-    }
+    if (existingRetry) existingRetry.remove();
     
-    // Show loading state
+    // Show loading state with progress
     this.isTranslating = true;
+    this.translationStartTime = Date.now();
     translatedBox.classList.add('it-loading');
     translatedBox.classList.remove('it-error');
     
-    const spinner = document.createElement('div');
-    spinner.className = 'it-spinner';
-    const loadingText = document.createElement('span');
-    loadingText.textContent = 'Translating...';
-    translatedBox.replaceChildren(spinner, loadingText);
+    // Build progress UI
+    const progressContainer = document.createElement('div');
+    progressContainer.className = 'it-progress-container';
+    
+    const progressBar = document.createElement('div');
+    progressBar.className = 'it-progress-bar';
+    const progressFill = document.createElement('div');
+    progressFill.className = 'it-progress-fill';
+    progressFill.style.width = '20%';
+    progressBar.appendChild(progressFill);
+    progressContainer.appendChild(progressBar);
+    
+    const progressText = document.createElement('span');
+    progressText.className = 'it-progress-text';
+    progressText.textContent = 'Translating...';
+    progressContainer.appendChild(progressText);
+    
+    const elapsedTime = document.createElement('span');
+    elapsedTime.className = 'it-elapsed-time';
+    progressContainer.appendChild(elapsedTime);
+    
+    translatedBox.replaceChildren(progressContainer);
+    
+    // Animate progress
+    let progressValue = 20;
+    const progressInterval = setInterval(() => {
+      if (progressValue < 85) {
+        progressValue += Math.random() * 10;
+        progressFill.style.width = `${Math.min(progressValue, 85)}%`;
+      }
+      // Update elapsed time
+      const elapsed = ((Date.now() - this.translationStartTime) / 1000).toFixed(1);
+      elapsedTime.textContent = `${elapsed}s`;
+    }, 300);
     
     copyBtn.disabled = true;
     copyBtn.textContent = 'Copy';
@@ -954,11 +1022,9 @@ class InlineTranslator {
       replaceBtn.classList.remove('it-replaced');
     }
     
-    // Create new AbortController for this request
     this.abortController = new AbortController();
     const signal = this.abortController.signal;
     
-    // Truncate text if needed
     const textToTranslate = this.selectedText.length > InlineTranslator.MAX_TEXT_LENGTH
       ? this.selectedText.substring(0, InlineTranslator.MAX_TEXT_LENGTH)
       : this.selectedText;
@@ -966,27 +1032,37 @@ class InlineTranslator {
     try {
       const translation = await this.translateFn(textToTranslate, this.currentLang, signal);
       
-      // Check if panel was closed during translation
+      clearInterval(progressInterval);
+      
       if (!this.panelElement || signal.aborted) return;
       
-      translatedBox.classList.remove('it-loading');
-      translatedBox.style.whiteSpace = 'pre-wrap';
-      this._setTextWithLineBreaks(translatedBox, translation);
-      translatedBox.dataset.translation = translation;
-      copyBtn.disabled = false;
-      if (replaceBtn) replaceBtn.disabled = false;
-    } catch (err) {
-      // Ignore abort errors (user changed language or closed panel)
-      if (err.name === 'AbortError') return;
+      // Complete progress
+      progressFill.style.width = '100%';
       
-      // Check if panel was closed during translation
+      setTimeout(() => {
+        translatedBox.classList.remove('it-loading');
+        translatedBox.style.whiteSpace = 'pre-wrap';
+        this._setTextWithLineBreaks(translatedBox, translation);
+        translatedBox.dataset.translation = translation;
+        copyBtn.disabled = false;
+        if (replaceBtn) replaceBtn.disabled = false;
+        
+        // Add to history if callback provided
+        if (this.onHistoryAdd) {
+          this.onHistoryAdd(textToTranslate, translation, this.currentLang);
+        }
+      }, 150);
+      
+    } catch (err) {
+      clearInterval(progressInterval);
+      
+      if (err.name === 'AbortError') return;
       if (!this.panelElement) return;
       
       translatedBox.classList.remove('it-loading');
       translatedBox.classList.add('it-error');
       translatedBox.textContent = `Error: ${err.message}`;
       
-      // Add retry button
       this._addRetryButton(panel, btnRow);
     } finally {
       this.isTranslating = false;
@@ -994,14 +1070,10 @@ class InlineTranslator {
     }
   }
 
-  /**
-   * Add retry button after translation failure
-   */
   _addRetryButton(panel, btnRow) {
     const retryBtn = document.createElement('button');
     retryBtn.className = 'it-retry-btn';
     retryBtn.textContent = 'Retry';
-    retryBtn.setAttribute('aria-label', 'Retry translation');
     
     const retryHandler = () => {
       retryBtn.remove();
@@ -1014,9 +1086,10 @@ class InlineTranslator {
     retryBtn.focus();
   }
 
-  /**
-   * Copy translation with HTTPS check and fallback
-   */
+  // ============================================================================
+  // COPY & REPLACE
+  // ============================================================================
+
   _copyTranslation(panel) {
     const translatedBox = panel.querySelector('.it-translated');
     const copyBtn = panel.querySelector('.it-copy-btn');
@@ -1024,26 +1097,17 @@ class InlineTranslator {
     
     if (!translation) return;
     
-    // Check if clipboard API is available (requires HTTPS or localhost)
-    const isSecureContext = window.isSecureContext;
-    
-    if (isSecureContext && navigator.clipboard?.writeText) {
+    if (window.isSecureContext && navigator.clipboard?.writeText) {
       navigator.clipboard.writeText(translation)
         .then(() => this._showCopySuccess(copyBtn))
         .catch(() => this._fallbackCopy(translation, copyBtn));
     } else {
-      // Fallback for non-secure contexts
       this._fallbackCopy(translation, copyBtn);
     }
   }
 
-  /**
-   * Fallback copy method for non-secure contexts
-   * Uses ClipboardItem API with blob as alternative approach
-   */
   async _fallbackCopy(text, copyBtn) {
     try {
-      // Try using ClipboardItem API (works in more contexts)
       if (typeof ClipboardItem !== 'undefined' && navigator.clipboard?.write) {
         const blob = new Blob([text], { type: 'text/plain' });
         const item = new ClipboardItem({ 'text/plain': blob });
@@ -1051,29 +1115,22 @@ class InlineTranslator {
         this._showCopySuccess(copyBtn);
         return;
       }
-
-      // Final fallback: show text in a prompt for manual copy
       this._showManualCopyDialog(text, copyBtn);
-    } catch (err) {
-      // Show manual copy dialog as last resort
+    } catch {
       this._showManualCopyDialog(text, copyBtn);
     }
   }
 
-  /**
-   * Show a dialog for manual text copying when clipboard APIs fail
-   */
   _showManualCopyDialog(text, copyBtn) {
-    // Create a simple modal with selectable text
     const overlay = document.createElement('div');
     overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:2147483647;display:flex;align-items:center;justify-content:center;';
 
     const dialog = document.createElement('div');
     dialog.style.cssText = 'background:#fff;padding:16px;border-radius:8px;max-width:400px;width:90%;box-shadow:0 4px 20px rgba(0,0,0,0.3);';
     dialog.innerHTML = `
-      <p style="margin:0 0 8px;font-size:14px;color:#333;">Select and copy the text below:</p>
+      <p style="margin:0 0 8px;font-size:14px;color:#333;">Select and copy:</p>
       <textarea readonly style="width:100%;height:80px;padding:8px;border:1px solid #ddd;border-radius:4px;font-size:13px;resize:none;">${text.replace(/</g, '&lt;')}</textarea>
-      <button style="margin-top:8px;padding:8px 16px;background:#4285f4;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:13px;">Close</button>
+      <button style="margin-top:8px;padding:8px 16px;background:#4285f4;color:#fff;border:none;border-radius:4px;cursor:pointer;">Close</button>
     `;
 
     const textarea = dialog.querySelector('textarea');
@@ -1089,14 +1146,9 @@ class InlineTranslator {
     textarea.select();
 
     copyBtn.textContent = 'Copy manually';
-    setTimeout(() => {
-      if (copyBtn) copyBtn.textContent = 'Copy';
-    }, 2000);
+    setTimeout(() => { if (copyBtn) copyBtn.textContent = 'Copy'; }, 2000);
   }
 
-  /**
-   * Show copy success feedback
-   */
   _showCopySuccess(copyBtn) {
     if (!copyBtn) return;
     copyBtn.textContent = 'Copied!';
@@ -1109,9 +1161,6 @@ class InlineTranslator {
     }, 1500);
   }
 
-  /**
-   * Replace the original selected text with the translation
-   */
   _replaceWithTranslation(panel) {
     const translatedBox = panel.querySelector('.it-translated');
     const replaceBtn = panel.querySelector('.it-replace-btn');
@@ -1120,70 +1169,38 @@ class InlineTranslator {
     if (!translation || !this.selectionRange) return;
     
     try {
-      // Check if the range is still valid and in the document
       if (!this.selectionRange.commonAncestorContainer || 
           !document.contains(this.selectionRange.commonAncestorContainer)) {
         this._showReplaceError(replaceBtn, 'Selection lost');
         return;
       }
       
-      // Check if we're in an editable context (input/textarea/contenteditable)
       const container = this.selectionRange.commonAncestorContainer;
       const parentElement = container.nodeType === Node.TEXT_NODE 
         ? container.parentElement 
         : container;
       
-      // For contenteditable elements, use InputEvent for modern browsers
       if (parentElement?.isContentEditable) {
         const selection = window.getSelection();
         selection.removeAllRanges();
         selection.addRange(this.selectionRange);
         
-        // Use insertText via InputEvent (modern approach with undo support)
-        const inputEvent = new InputEvent('beforeinput', {
-          inputType: 'insertText',
-          data: translation,
-          bubbles: true,
-          cancelable: true
-        });
-        
-        // If beforeinput is supported and not cancelled, manually insert
-        if (!parentElement.dispatchEvent(inputEvent)) {
-          // Event was cancelled, do nothing
-          return;
-        }
-        
-        // Delete selected content and insert translation
         this.selectionRange.deleteContents();
         const textNode = document.createTextNode(translation);
         this.selectionRange.insertNode(textNode);
         
-        // Dispatch input event for consistency
         parentElement.dispatchEvent(new InputEvent('input', {
           inputType: 'insertText',
           data: translation,
           bubbles: true
         }));
       } else {
-        // Check if selection spans multiple block elements
-        const isMultiBlock = this._isMultiBlockSelection(this.selectionRange);
-        
-        if (isMultiBlock) {
-          // For multi-block selections, replace text in each text node proportionally
-          this._replaceMultiBlockSelection(translation);
-        } else {
-          // For single block/inline selections, use simple replacement
-          this._replaceSingleSelection(translation);
-        }
-        
-        // Clear the selection
+        // Use format-preserving replacement algorithm (similar to content.js)
+        this._replaceWithFormatPreservation(translation);
         window.getSelection()?.removeAllRanges();
       }
       
-      // Show success feedback
       this._showReplaceSuccess(replaceBtn);
-      
-      // Close the panel after a short delay
       setTimeout(() => this._hidePanel(), 800);
       
     } catch (err) {
@@ -1192,133 +1209,285 @@ class InlineTranslator {
     }
   }
 
-  /**
-   * Check if selection spans multiple block-level elements
-   */
-  _isMultiBlockSelection(range) {
+  // ============================================================================
+  // FORMAT-PRESERVING REPLACEMENT ALGORITHM
+  // Adapted from content.js page translator for better CSS/HTML preservation
+  // ============================================================================
+
+  static INLINE_TAGS = new Set(['B', 'I', 'U', 'STRONG', 'EM', 'SPAN', 'A', 'FONT', 'SMALL', 'BIG', 'SUB', 'SUP', 'BR', 'IMG', 'CODE', 'MARK', 'DEL', 'INS', 'S', 'ABBR', 'CITE', 'DFN', 'KBD', 'Q', 'SAMP', 'VAR', 'TIME', 'DATA', 'RUBY', 'RT', 'RP', 'BDI', 'BDO', 'WBR']);
+  static BLOCK_TAGS = new Set(['P', 'DIV', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'LI', 'TD', 'TH', 'BLOCKQUOTE', 'ARTICLE', 'SECTION', 'HEADER', 'FOOTER', 'NAV', 'ASIDE', 'MAIN', 'FIGURE', 'FIGCAPTION', 'DD', 'DT', 'ADDRESS', 'PRE']);
+
+  _replaceWithFormatPreservation(translation) {
+    const range = this.selectionRange;
     const container = range.commonAncestorContainer;
     
-    // If the container is a text node, it's single block
-    if (container.nodeType === Node.TEXT_NODE) {
-      return false;
+    // Analyze selection structure
+    const selectionInfo = this._analyzeSelection(range);
+    
+    if (selectionInfo.type === 'singleTextNode') {
+      // Simple case: selection within a single text node
+      this._replaceSingleTextNode(range, translation, selectionInfo);
+    } else if (selectionInfo.type === 'inlineOnly') {
+      // Selection spans inline elements only (e.g., <b>text</b><i>more</i>)
+      this._replaceInlineSelection(range, translation, selectionInfo);
+    } else if (selectionInfo.type === 'singleBlock') {
+      // Selection within a single block element with inline content
+      this._replaceBlockInlineContent(range, translation, selectionInfo);
+    } else {
+      // Multi-block selection - use simplified approach
+      this._replaceMultiBlockPreserving(range, translation, selectionInfo);
     }
-    
-    // Check if start and end are in different block elements
-    const startBlock = this._getBlockParent(range.startContainer);
-    const endBlock = this._getBlockParent(range.endContainer);
-    
-    return startBlock !== endBlock;
   }
 
-  /**
-   * Get the nearest block-level parent element
-   */
+  _analyzeSelection(range) {
+    const container = range.commonAncestorContainer;
+    const startContainer = range.startContainer;
+    const endContainer = range.endContainer;
+    
+    // Single text node selection
+    if (startContainer === endContainer && startContainer.nodeType === Node.TEXT_NODE) {
+      return {
+        type: 'singleTextNode',
+        textNode: startContainer,
+        parentElement: startContainer.parentElement
+      };
+    }
+    
+    // Get the common ancestor element
+    const ancestorElement = container.nodeType === Node.TEXT_NODE 
+      ? container.parentElement 
+      : container;
+    
+    // Check if selection is within a single block
+    const startBlock = this._getBlockParent(startContainer);
+    const endBlock = this._getBlockParent(endContainer);
+    
+    if (startBlock === endBlock) {
+      // Check if the block has only inline content
+      if (this._hasOnlyInlineContent(startBlock)) {
+        return {
+          type: 'singleBlock',
+          blockElement: startBlock,
+          originalHTML: this._getSelectedHTML(range),
+          computedStyles: this._captureComputedStyles(startBlock)
+        };
+      }
+      return {
+        type: 'inlineOnly',
+        ancestorElement,
+        originalHTML: this._getSelectedHTML(range),
+        computedStyles: this._captureInlineStyles(range)
+      };
+    }
+    
+    // Multi-block selection
+    return {
+      type: 'multiBlock',
+      startBlock,
+      endBlock,
+      originalHTML: this._getSelectedHTML(range),
+      blocks: this._getBlocksInRange(range)
+    };
+  }
+
   _getBlockParent(node) {
-    const blockTags = new Set(['P', 'DIV', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'LI', 'TD', 'TH', 'BLOCKQUOTE', 'ARTICLE', 'SECTION']);
     let current = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
     
     while (current && current !== document.body) {
-      if (blockTags.has(current.tagName)) {
-        return current;
-      }
+      if (InlineTranslator.BLOCK_TAGS.has(current.tagName)) return current;
       current = current.parentElement;
     }
     return document.body;
   }
 
-  /**
-   * Replace text in a single block/inline selection
-   */
-  _replaceSingleSelection(translation) {
-    const wrapper = document.createElement('span');
-    wrapper.className = 'pt-inline-replaced';
-    wrapper.style.whiteSpace = 'pre-wrap';
-    wrapper.dataset.ptOriginal = this.selectedText;
-    wrapper.title = 'Click to revert to original';
-    
-    // Preserve line breaks by converting \n to <br>
-    this._setTextWithLineBreaks(wrapper, translation);
-    
-    // Delete the selected content and insert the translation
-    this.selectionRange.deleteContents();
-    this.selectionRange.insertNode(wrapper);
-  }
-  
-  /**
-   * Set text content while preserving line breaks
-   */
-  _setTextWithLineBreaks(element, text) {
-    element.innerHTML = '';
-    const lines = text.split('\n');
-    lines.forEach((line, index) => {
-      if (index > 0) {
-        element.appendChild(document.createElement('br'));
+  _hasOnlyInlineContent(element) {
+    for (const child of element.childNodes) {
+      if (child.nodeType === Node.TEXT_NODE) continue;
+      if (child.nodeType === Node.ELEMENT_NODE) {
+        const tag = child.tagName;
+        if (InlineTranslator.BLOCK_TAGS.has(tag)) return false;
+        if (!InlineTranslator.INLINE_TAGS.has(tag) && !this._hasOnlyInlineContent(child)) return false;
       }
-      if (line) {
-        element.appendChild(document.createTextNode(line));
-      }
-    });
+    }
+    return true;
   }
 
-  /**
-   * Replace text across multiple block elements while preserving structure
-   * Puts full translation in first text node, clears others
-   */
-  _replaceMultiBlockSelection(translation) {
-    // Collect all text nodes in the selection
-    const textNodes = this._getTextNodesInRange(this.selectionRange);
+  _getSelectedHTML(range) {
+    const fragment = range.cloneContents();
+    const div = document.createElement('div');
+    div.appendChild(fragment);
+    return div.innerHTML;
+  }
+
+  _captureComputedStyles(element) {
+    const computed = window.getComputedStyle(element);
+    return {
+      fontFamily: computed.fontFamily,
+      fontSize: computed.fontSize,
+      fontWeight: computed.fontWeight,
+      fontStyle: computed.fontStyle,
+      color: computed.color,
+      textDecoration: computed.textDecoration,
+      lineHeight: computed.lineHeight,
+      letterSpacing: computed.letterSpacing,
+      textTransform: computed.textTransform,
+      whiteSpace: computed.whiteSpace
+    };
+  }
+
+  _captureInlineStyles(range) {
+    // Capture styles from the first text node's parent
+    const startElement = range.startContainer.nodeType === Node.TEXT_NODE
+      ? range.startContainer.parentElement
+      : range.startContainer;
+    return startElement ? this._captureComputedStyles(startElement) : {};
+  }
+
+  _getBlocksInRange(range) {
+    const blocks = [];
+    const walker = document.createTreeWalker(
+      range.commonAncestorContainer,
+      NodeFilter.SHOW_ELEMENT,
+      {
+        acceptNode: (node) => {
+          if (!InlineTranslator.BLOCK_TAGS.has(node.tagName)) return NodeFilter.FILTER_SKIP;
+          const nodeRange = document.createRange();
+          nodeRange.selectNodeContents(node);
+          if (range.compareBoundaryPoints(Range.START_TO_END, nodeRange) > 0 &&
+              range.compareBoundaryPoints(Range.END_TO_START, nodeRange) < 0) {
+            return NodeFilter.FILTER_ACCEPT;
+          }
+          return NodeFilter.FILTER_SKIP;
+        }
+      }
+    );
     
-    if (textNodes.length === 0) return;
+    let node;
+    while ((node = walker.nextNode())) {
+      blocks.push(node);
+    }
+    return blocks;
+  }
+
+  // ============================================================================
+  // REPLACEMENT METHODS
+  // ============================================================================
+
+  _replaceSingleTextNode(range, translation, info) {
+    const textNode = info.textNode;
+    const parent = info.parentElement;
     
-    // Handle the first text node - put the full translation here
-    const firstNode = textNodes[0];
-    const startOffset = firstNode.node === this.selectionRange.startContainer 
-      ? this.selectionRange.startOffset 
-      : 0;
+    if (!parent) {
+      // Fallback: simple replacement
+      range.deleteContents();
+      range.insertNode(document.createTextNode(translation));
+      return;
+    }
     
-    // Create wrapper for the translation
+    const beforeText = textNode.textContent.substring(0, range.startOffset);
+    const afterText = textNode.textContent.substring(range.endOffset);
+    
+    // Create wrapper that preserves parent's inline styling context
     const wrapper = document.createElement('span');
     wrapper.className = 'pt-inline-replaced';
-    wrapper.style.whiteSpace = 'pre-wrap';
     wrapper.dataset.ptOriginal = this.selectedText;
-    wrapper.title = 'Click to revert to original';
+    wrapper.title = 'Click to revert';
     
-    // Preserve line breaks
+    // Copy relevant inline styles from parent
+    this._copyInlineStyles(parent, wrapper);
+    
+    // Set translation text with line break handling
     this._setTextWithLineBreaks(wrapper, translation);
     
-    // Split the first text node and insert wrapper
+    // Build replacement structure
+    const fragment = document.createDocumentFragment();
+    if (beforeText) fragment.appendChild(document.createTextNode(beforeText));
+    fragment.appendChild(wrapper);
+    if (afterText) fragment.appendChild(document.createTextNode(afterText));
+    
+    parent.replaceChild(fragment, textNode);
+  }
+
+  _replaceInlineSelection(range, translation, info) {
+    const wrapper = document.createElement('span');
+    wrapper.className = 'pt-inline-replaced';
+    wrapper.dataset.ptOriginal = this.selectedText;
+    wrapper.dataset.ptOriginalHtml = info.originalHTML;
+    wrapper.title = 'Click to revert';
+    
+    // Apply captured styles
+    if (info.computedStyles) {
+      this._applyComputedStyles(wrapper, info.computedStyles);
+    }
+    
+    this._setTextWithLineBreaks(wrapper, translation);
+    
+    range.deleteContents();
+    range.insertNode(wrapper);
+  }
+
+  _replaceBlockInlineContent(range, translation, info) {
+    const wrapper = document.createElement('span');
+    wrapper.className = 'pt-inline-replaced';
+    wrapper.dataset.ptOriginal = this.selectedText;
+    wrapper.dataset.ptOriginalHtml = info.originalHTML;
+    wrapper.title = 'Click to revert';
+    
+    // Preserve the block's text styling
+    if (info.computedStyles) {
+      this._applyComputedStyles(wrapper, info.computedStyles);
+    }
+    
+    this._setTextWithLineBreaks(wrapper, translation);
+    
+    range.deleteContents();
+    range.insertNode(wrapper);
+  }
+
+  _replaceMultiBlockPreserving(range, translation, info) {
+    // For multi-block, we need to be more careful
+    // Strategy: Replace content in first block, remove content from subsequent blocks
+    
+    const textNodes = this._getTextNodesInRange(range);
+    if (textNodes.length === 0) {
+      // Fallback
+      range.deleteContents();
+      const wrapper = this._createReplacementWrapper(translation, info.originalHTML);
+      range.insertNode(wrapper);
+      return;
+    }
+    
+    const firstNode = textNodes[0];
+    const startOffset = firstNode.node === range.startContainer ? range.startOffset : 0;
+    
+    // Create wrapper with original HTML stored for revert
+    const wrapper = this._createReplacementWrapper(translation, info.originalHTML);
+    
     const beforeText = firstNode.node.textContent.substring(0, startOffset);
     
-    // Process nodes in reverse order (to avoid index shifting issues)
+    // Process nodes in reverse order
     for (let i = textNodes.length - 1; i >= 0; i--) {
-      const { node, isPartial } = textNodes[i];
+      const { node } = textNodes[i];
       
       if (i === 0) {
-        // First node: keep text before selection, add translation wrapper
         const parent = node.parentNode;
         if (!parent) continue;
         
         if (beforeText) {
-          const beforeNode = document.createTextNode(beforeText);
-          parent.insertBefore(beforeNode, node);
+          parent.insertBefore(document.createTextNode(beforeText), node);
         }
         parent.insertBefore(wrapper, node);
         
-        // Remove the original text node
-        if (node === this.selectionRange.startContainer && node === this.selectionRange.endContainer) {
-          // Selection is within single text node but crosses elements (shouldn't happen here)
-          const afterText = node.textContent.substring(this.selectionRange.endOffset);
+        if (node === range.startContainer && node === range.endContainer) {
+          const afterText = node.textContent.substring(range.endOffset);
           if (afterText) {
-            const afterNode = document.createTextNode(afterText);
-            parent.insertBefore(afterNode, node);
+            parent.insertBefore(document.createTextNode(afterText), node);
           }
         }
         parent.removeChild(node);
       } else if (i === textNodes.length - 1) {
-        // Last node: keep text after selection, remove selected part
-        const endOffset = node === this.selectionRange.endContainer 
-          ? this.selectionRange.endOffset 
-          : node.textContent.length;
+        const endOffset = node === range.endContainer 
+          ? range.endOffset : node.textContent.length;
         const afterText = node.textContent.substring(endOffset);
         
         if (afterText) {
@@ -1327,27 +1496,88 @@ class InlineTranslator {
           node.parentNode?.removeChild(node);
         }
       } else {
-        // Middle nodes: remove entirely
         node.parentNode?.removeChild(node);
       }
     }
   }
 
-  /**
-   * Get all text nodes within a range
-   */
+  _createReplacementWrapper(translation, originalHTML) {
+    const wrapper = document.createElement('span');
+    wrapper.className = 'pt-inline-replaced';
+    wrapper.dataset.ptOriginal = this.selectedText;
+    if (originalHTML) {
+      wrapper.dataset.ptOriginalHtml = originalHTML;
+    }
+    wrapper.title = 'Click to revert';
+    wrapper.style.whiteSpace = 'pre-wrap';
+    this._setTextWithLineBreaks(wrapper, translation);
+    return wrapper;
+  }
+
+  _copyInlineStyles(source, target) {
+    const computed = window.getComputedStyle(source);
+    
+    // Only copy text-related styles that affect appearance
+    const stylesToCopy = ['font-family', 'font-size', 'font-weight', 'font-style', 
+                          'color', 'text-decoration', 'letter-spacing', 'text-transform'];
+    
+    stylesToCopy.forEach(prop => {
+      const value = computed.getPropertyValue(prop);
+      if (value && value !== 'normal' && value !== 'none') {
+        // Don't override if it's a default value
+        const defaultCheck = document.createElement('span');
+        document.body.appendChild(defaultCheck);
+        const defaultValue = window.getComputedStyle(defaultCheck).getPropertyValue(prop);
+        document.body.removeChild(defaultCheck);
+        
+        if (value !== defaultValue) {
+          target.style.setProperty(prop, value);
+        }
+      }
+    });
+  }
+
+  _applyComputedStyles(element, styles) {
+    if (styles.fontWeight && styles.fontWeight !== 'normal' && styles.fontWeight !== '400') {
+      element.style.fontWeight = styles.fontWeight;
+    }
+    if (styles.fontStyle && styles.fontStyle !== 'normal') {
+      element.style.fontStyle = styles.fontStyle;
+    }
+    if (styles.textDecoration && styles.textDecoration !== 'none') {
+      element.style.textDecoration = styles.textDecoration;
+    }
+    if (styles.textTransform && styles.textTransform !== 'none') {
+      element.style.textTransform = styles.textTransform;
+    }
+  }
+
+  _setTextWithLineBreaks(element, text) {
+    element.innerHTML = '';
+    const lines = text.split('\n');
+    lines.forEach((line, index) => {
+      if (index > 0) element.appendChild(document.createElement('br'));
+      if (line) element.appendChild(document.createTextNode(line));
+    });
+  }
+
   _getTextNodesInRange(range) {
     const textNodes = [];
+    const container = range.commonAncestorContainer;
+    
+    // Handle case where container is a text node
+    if (container.nodeType === Node.TEXT_NODE) {
+      return [{ node: container, isPartial: true }];
+    }
+    
     const walker = document.createTreeWalker(
-      range.commonAncestorContainer,
+      container,
       NodeFilter.SHOW_TEXT,
       {
         acceptNode: (node) => {
-          // Check if this text node is within the range
           const nodeRange = document.createRange();
           nodeRange.selectNodeContents(node);
           
-          // Check if ranges intersect
           const startsBeforeEnd = range.compareBoundaryPoints(Range.START_TO_END, nodeRange) >= 0;
           const endsAfterStart = range.compareBoundaryPoints(Range.END_TO_START, nodeRange) <= 0;
           
@@ -1368,9 +1598,6 @@ class InlineTranslator {
     return textNodes;
   }
 
-  /**
-   * Show replace success feedback
-   */
   _showReplaceSuccess(replaceBtn) {
     if (!replaceBtn) return;
     replaceBtn.textContent = 'Replaced!';
@@ -1378,39 +1605,23 @@ class InlineTranslator {
     replaceBtn.disabled = true;
   }
 
-  /**
-   * Show replace error feedback
-   */
   _showReplaceError(replaceBtn, message) {
     if (!replaceBtn) return;
     replaceBtn.textContent = message;
-    setTimeout(() => {
-      if (replaceBtn) {
-        replaceBtn.textContent = 'Replace';
-      }
-    }, 1500);
+    setTimeout(() => { if (replaceBtn) replaceBtn.textContent = 'Replace'; }, 1500);
   }
 
+
   // ============================================================================
-  // POSITIONING - Improved multi-line support
+  // POSITIONING
   // ============================================================================
 
-  /**
-   * Get bounding rect for multi-line selections
-   * Uses getClientRects() for better accuracy across multiple lines
-   */
   _getMultiLineRect(range) {
     const rects = range.getClientRects();
     
-    if (rects.length === 0) {
-      return range.getBoundingClientRect();
-    }
+    if (rects.length === 0) return range.getBoundingClientRect();
+    if (rects.length === 1) return rects[0];
     
-    if (rects.length === 1) {
-      return rects[0];
-    }
-    
-    // For multi-line selections, calculate encompassing rect
     let left = Infinity, top = Infinity, right = -Infinity, bottom = -Infinity;
     
     for (const rect of rects) {
@@ -1421,49 +1632,32 @@ class InlineTranslator {
       bottom = Math.max(bottom, rect.bottom);
     }
     
-    // Return a DOMRect-like object
-    return {
-      left,
-      top,
-      right,
-      bottom,
-      width: right - left,
-      height: bottom - top,
-      x: left,
-      y: top
-    };
+    return { left, top, right, bottom, width: right - left, height: bottom - top, x: left, y: top };
   }
 
   _calculateIconPosition(rect) {
-    const iconSize = 24;
+    const iconSize = 28;
     const gap = 8;
     const padding = 10;
     
-    // Position icon to the right of selection end
     let left = rect.right + gap;
     let top = rect.top + (rect.height - iconSize) / 2;
     
-    // If no room on right, try left of selection
     if (left + iconSize > window.innerWidth - padding) {
       left = rect.left - iconSize - gap;
     }
     
-    // If still no room, position above selection center
     if (left < padding) {
       left = rect.left + rect.width / 2 - iconSize / 2;
       top = rect.top - iconSize - gap;
     }
     
-    // Clamp to viewport
     left = Math.max(padding, Math.min(left, window.innerWidth - iconSize - padding));
     top = Math.max(padding, Math.min(top, window.innerHeight - iconSize - padding));
     
     return { left, top };
   }
 
-  /**
-   * Get responsive panel width based on screen size
-   */
   _getPanelWidth() {
     const viewW = window.innerWidth;
     if (viewW >= 1600) return 680;
@@ -1477,31 +1671,25 @@ class InlineTranslator {
     const viewW = window.innerWidth;
     const viewH = window.innerHeight;
     
-    // Responsive width calculation
     const actualPanelWidth = Math.min(panelWidth, viewW - 30);
-    
-    // Max bounds to ensure panel is always fully visible
     const maxLeft = viewW - actualPanelWidth - padding;
     const maxTop = viewH - panelHeight - padding;
     
-    // Center horizontally relative to selection
     let left = rect.left + rect.width / 2 - actualPanelWidth / 2;
     left = Math.max(padding, Math.min(left, maxLeft));
     
-    // Vertical: prefer above selection, fallback to below, then top of viewport
     const spaceAbove = rect.top - padding - gap;
     const spaceBelow = viewH - rect.bottom - padding - gap;
     
     let top;
     if (spaceAbove >= panelHeight) {
-      top = rect.top - panelHeight - gap; // Above selection
+      top = rect.top - panelHeight - gap;
     } else if (spaceBelow >= panelHeight) {
-      top = rect.bottom + gap; // Below selection
+      top = rect.bottom + gap;
     } else {
-      top = padding; // Top of viewport
+      top = padding;
     }
     
-    // Final clamp to ensure fully visible
     top = Math.max(padding, Math.min(top, maxTop));
     
     return { left, top };
@@ -1511,9 +1699,6 @@ class InlineTranslator {
   // UTILITIES
   // ============================================================================
 
-  /**
-   * Debounce utility for scroll handler
-   */
   _debounce(fn, delay) {
     let timeoutId;
     return (...args) => {
@@ -1523,7 +1708,7 @@ class InlineTranslator {
   }
 }
 
-// Export for use in content.js
+// Export
 if (typeof window !== 'undefined') {
   window.InlineTranslator = InlineTranslator;
 }

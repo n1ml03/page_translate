@@ -1,38 +1,108 @@
 """
 Page Translator Middleware.
 FastAPI server that proxies translation requests to internal LLM API with streaming support.
+Security features: CORS restriction, Auth failure rate limiting, Request validation.
+Performance: Async HTTP client (httpx), connection pooling, load balancer ready.
 """
 
 import asyncio
 import base64
 import hashlib
 import json
+import os
 import re
 import socket
 import time
+import uuid
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Dict, List, Optional
 
-import requests
-import urllib3
+import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
 
-app = FastAPI(title="Page Translator Middleware")
+# Cache Configuration
+CACHE_MAX_SIZE = int(os.environ.get("CACHE_MAX_SIZE", "5000"))
+CACHE_TTL = int(os.environ.get("CACHE_TTL", "3600"))
 
-# Configuration
-CACHE_MAX_SIZE = 2000
-CACHE_TTL = 3600
-HTTP_TIMEOUT = 120
-MAX_RETRIES = 2
-RETRY_DELAY = 0.5
+# HTTP Client Configuration - Optimized for high concurrency
+HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "120"))
+MAX_CONNECTIONS = int(os.environ.get("MAX_CONNECTIONS", "100"))
+MAX_KEEPALIVE = int(os.environ.get("MAX_KEEPALIVE", "50"))
+CONNECT_TIMEOUT = int(os.environ.get("CONNECT_TIMEOUT", "10"))
 
-http_executor = ThreadPoolExecutor(max_workers=10)
+# Rate Limiting Configuration
+RATE_LIMIT_RPM = int(os.environ.get("RATE_LIMIT_RPM", "120"))
+RATE_LIMIT_BURST = int(os.environ.get("RATE_LIMIT_BURST", "20"))
+
+# Security Configuration
+AUTH_FAILURE_MAX_ATTEMPTS = int(os.environ.get("AUTH_FAILURE_MAX_ATTEMPTS", "10"))
+AUTH_FAILURE_LOCKOUT_SECONDS = int(
+    os.environ.get("AUTH_FAILURE_LOCKOUT_SECONDS", "300")
+)
+AUTH_FAILURE_WINDOW_SECONDS = int(os.environ.get("AUTH_FAILURE_WINDOW_SECONDS", "60"))
+
+# Instance Configuration (for load balancer)
+INSTANCE_ID = os.environ.get("INSTANCE_ID", str(uuid.uuid4())[:8])
+
+# CORS Configuration
+ALLOWED_ORIGINS = os.environ.get(
+    "ALLOWED_ORIGINS",
+    "chrome-extension://*,moz-extension://*,http://localhost:*,http://127.0.0.1:*,http://192.168.*:*,http://10.*:*,http://172.16.*:*,http://172.17.*:*,http://172.18.*:*,http://172.19.*:*,http://172.20.*:*,http://172.21.*:*,http://172.22.*:*,http://172.23.*:*,http://172.24.*:*,http://172.25.*:*,http://172.26.*:*,http://172.27.*:*,http://172.28.*:*,http://172.29.*:*,http://172.30.*:*,http://172.31.*:*",
+).split(",")
+
+# Global async HTTP client (initialized on startup)
+http_client: Optional[httpx.AsyncClient] = None
+
+
+# ============================================================================
+# ASYNC HTTP CLIENT LIFECYCLE
+# ============================================================================
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage async HTTP client lifecycle."""
+    global http_client
+
+    # Create connection pool with optimized settings
+    limits = httpx.Limits(
+        max_connections=MAX_CONNECTIONS,
+        max_keepalive_connections=MAX_KEEPALIVE,
+        keepalive_expiry=30.0,
+    )
+    timeout = httpx.Timeout(
+        timeout=HTTP_TIMEOUT,
+        connect=CONNECT_TIMEOUT,
+    )
+
+    http_client = httpx.AsyncClient(
+        limits=limits,
+        timeout=timeout,
+        verify=False,  # Skip SSL verification for internal APIs
+        http2=True,  # Enable HTTP/2 for better performance
+    )
+
+    print(
+        f"[Instance {INSTANCE_ID}] HTTP client initialized with {MAX_CONNECTIONS} max connections"
+    )
+
+    yield
+
+    # Cleanup on shutdown
+    if http_client:
+        await http_client.aclose()
+        print(f"[Instance {INSTANCE_ID}] HTTP client closed")
+
+
+app = FastAPI(title="Page Translator Middleware", lifespan=lifespan)
 
 
 # ============================================================================
@@ -46,6 +116,8 @@ class TranslationCache:
         self.ttl = ttl
         self._cache: OrderedDict = OrderedDict()
         self._lock = asyncio.Lock()
+        self._hits = 0
+        self._misses = 0
 
     def _key(self, texts: List[str], lang: str, model: str) -> str:
         data = json.dumps({"t": texts, "l": lang, "m": model}, sort_keys=True)
@@ -58,8 +130,10 @@ class TranslationCache:
                 entry = self._cache[key]
                 if time.time() - entry["ts"] < self.ttl:
                     self._cache.move_to_end(key)
+                    self._hits += 1
                     return entry["data"]
                 del self._cache[key]
+            self._misses += 1
         return None
 
     async def set(
@@ -74,19 +148,27 @@ class TranslationCache:
 
     async def stats(self) -> Dict:
         async with self._lock:
-            return {"size": len(self._cache), "max_size": self.max_size}
+            total = self._hits + self._misses
+            hit_rate = (self._hits / total * 100) if total > 0 else 0
+            return {
+                "size": len(self._cache),
+                "max_size": self.max_size,
+                "hits": self._hits,
+                "misses": self._misses,
+                "hit_rate": f"{hit_rate:.1f}%",
+            }
 
 
 cache = TranslationCache()
 
 
 # ============================================================================
-# RATE LIMITER
+# RATE LIMITER (Per-client token bucket)
 # ============================================================================
 
 
 class RateLimiter:
-    def __init__(self, rpm: int = 60, burst: int = 10):
+    def __init__(self, rpm: int = RATE_LIMIT_RPM, burst: int = RATE_LIMIT_BURST):
         self.rate = rpm / 60.0
         self.burst = burst
         self._tokens: Dict[str, float] = {}
@@ -111,48 +193,294 @@ class RateLimiter:
                 return True, 0
             return False, (1 - self._tokens[client]) / self.rate
 
+    async def cleanup_old_entries(self, max_age: float = 3600):
+        """Remove stale entries to prevent memory growth."""
+        async with self._lock:
+            now = time.time()
+            stale = [k for k, v in self._last.items() if now - v > max_age]
+            for k in stale:
+                self._tokens.pop(k, None)
+                self._last.pop(k, None)
+
 
 limiter = RateLimiter()
+
+
+# ============================================================================
+# AUTH FAILURE RATE LIMITER
+# ============================================================================
+
+
+class AuthFailureLimiter:
+    """Tracks authentication failures per client IP. Locks out after too many failures."""
+
+    def __init__(
+        self,
+        max_attempts: int = AUTH_FAILURE_MAX_ATTEMPTS,
+        lockout_seconds: int = AUTH_FAILURE_LOCKOUT_SECONDS,
+        window_seconds: int = AUTH_FAILURE_WINDOW_SECONDS,
+    ):
+        self.max_attempts = max_attempts
+        self.lockout_seconds = lockout_seconds
+        self.window_seconds = window_seconds
+        self._failures: Dict[str, List[float]] = {}
+        self._lockouts: Dict[str, float] = {}
+        self._lock = asyncio.Lock()
+
+    async def is_locked_out(self, client: str) -> tuple[bool, float]:
+        async with self._lock:
+            if client in self._lockouts:
+                remaining = self._lockouts[client] - time.time()
+                if remaining > 0:
+                    return True, remaining
+                del self._lockouts[client]
+                self._failures.pop(client, None)
+            return False, 0
+
+    async def record_failure(self, client: str) -> tuple[bool, int]:
+        async with self._lock:
+            now = time.time()
+            if client not in self._failures:
+                self._failures[client] = []
+            self._failures[client] = [
+                ts for ts in self._failures[client] if now - ts < self.window_seconds
+            ]
+            self._failures[client].append(now)
+            failure_count = len(self._failures[client])
+            if failure_count >= self.max_attempts:
+                self._lockouts[client] = now + self.lockout_seconds
+                return True, 0
+            return False, self.max_attempts - failure_count
+
+    async def record_success(self, client: str):
+        async with self._lock:
+            self._failures.pop(client, None)
+            self._lockouts.pop(client, None)
+
+    async def get_stats(self) -> Dict:
+        async with self._lock:
+            return {
+                "active_failures": len(self._failures),
+                "locked_out_clients": len(self._lockouts),
+            }
+
+
+auth_limiter = AuthFailureLimiter()
 
 
 # ============================================================================
 # TRANSLATION VALIDATION
 # ============================================================================
 
-# Common English words to detect untranslated text
 ENGLISH_COMMON_WORDS = {
-    "the", "a", "an", "this", "that", "these", "those", "my", "your", "his",
-    "her", "its", "our", "their", "some", "any", "no", "every", "each", "all",
-    "i", "you", "he", "she", "it", "we", "they", "me", "him", "them", "us",
-    "who", "what", "which", "whom", "whose",
-    "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
-    "do", "does", "did", "will", "would", "could", "should", "may", "might",
-    "must", "can", "shall", "get", "got", "make", "made", "go", "went", "come",
-    "came", "take", "took", "see", "saw", "know", "knew", "think", "thought",
-    "in", "on", "at", "to", "for", "of", "with", "by", "from", "up", "down",
-    "out", "into", "over", "under", "about", "after", "before", "between",
-    "and", "or", "but", "if", "when", "where", "while", "because", "although",
-    "than", "then", "so", "as", "not", "just", "only", "also", "even", "still",
-    "click", "here", "more", "view", "read", "next", "back", "home", "page",
-    "link", "button", "menu", "search", "login", "logout", "sign", "submit",
-    "cancel", "save", "delete", "edit", "add", "remove", "close", "open",
-    "settings", "profile", "account", "help", "contact", "about", "privacy",
-    "terms", "loading", "error", "success", "warning", "info", "message",
+    "the",
+    "a",
+    "an",
+    "this",
+    "that",
+    "these",
+    "those",
+    "my",
+    "your",
+    "his",
+    "her",
+    "its",
+    "our",
+    "their",
+    "some",
+    "any",
+    "no",
+    "every",
+    "each",
+    "all",
+    "i",
+    "you",
+    "he",
+    "she",
+    "it",
+    "we",
+    "they",
+    "me",
+    "him",
+    "them",
+    "us",
+    "who",
+    "what",
+    "which",
+    "whom",
+    "whose",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "being",
+    "have",
+    "has",
+    "had",
+    "do",
+    "does",
+    "did",
+    "will",
+    "would",
+    "could",
+    "should",
+    "may",
+    "might",
+    "must",
+    "can",
+    "shall",
+    "get",
+    "got",
+    "make",
+    "made",
+    "go",
+    "went",
+    "come",
+    "came",
+    "take",
+    "took",
+    "see",
+    "saw",
+    "know",
+    "knew",
+    "think",
+    "thought",
+    "in",
+    "on",
+    "at",
+    "to",
+    "for",
+    "of",
+    "with",
+    "by",
+    "from",
+    "up",
+    "down",
+    "out",
+    "into",
+    "over",
+    "under",
+    "about",
+    "after",
+    "before",
+    "between",
+    "and",
+    "or",
+    "but",
+    "if",
+    "when",
+    "where",
+    "while",
+    "because",
+    "although",
+    "than",
+    "then",
+    "so",
+    "as",
+    "not",
+    "just",
+    "only",
+    "also",
+    "even",
+    "still",
+    "click",
+    "here",
+    "more",
+    "view",
+    "read",
+    "next",
+    "back",
+    "home",
+    "page",
+    "link",
+    "button",
+    "menu",
+    "search",
+    "login",
+    "logout",
+    "sign",
+    "submit",
+    "cancel",
+    "save",
+    "delete",
+    "edit",
+    "add",
+    "remove",
+    "close",
+    "open",
+    "settings",
+    "profile",
+    "account",
+    "help",
+    "contact",
+    "about",
+    "privacy",
+    "terms",
+    "loading",
+    "error",
+    "success",
+    "warning",
+    "info",
+    "message",
 }
 
 ENGLISH_WORD_PATTERN = re.compile(r"\b[a-zA-Z]+\b")
 ASCII_LETTER_PATTERN = re.compile(r"[a-zA-Z]")
 
 NON_LATIN_LANGS = {
-    "japanese", "chinese", "korean", "thai", "vietnamese", "arabic", "hebrew",
-    "hindi", "russian", "greek", "persian", "bengali", "tamil", "telugu",
-    "marathi", "gujarati", "kannada", "malayalam", "punjabi", "urdu",
-    "tiếng việt", "日本語", "中文", "简体中文", "繁體中文", "한국어", "ไทย",
-    "العربية", "עברית", "हिन्दी", "русский", "ελληνικά", "فارسی",
+    "japanese",
+    "chinese",
+    "korean",
+    "thai",
+    "vietnamese",
+    "arabic",
+    "hebrew",
+    "hindi",
+    "russian",
+    "greek",
+    "persian",
+    "bengali",
+    "tamil",
+    "telugu",
+    "marathi",
+    "gujarati",
+    "kannada",
+    "malayalam",
+    "punjabi",
+    "urdu",
+    "tiếng việt",
+    "日本語",
+    "中文",
+    "简体中文",
+    "繁體中文",
+    "한국어",
+    "ไทย",
+    "العربية",
+    "עברית",
+    "हिन्दी",
+    "русский",
+    "ελληνικά",
+    "فارسی",
 }
 
 HTML_TAG_PATTERN = re.compile(r"<(/?)(\w+)([^>]*)>", re.IGNORECASE)
-HTML_SELF_CLOSING_TAGS = {"br", "hr", "img", "input", "meta", "link", "area", "base", "col", "embed", "source", "track", "wbr"}
+HTML_SELF_CLOSING_TAGS = {
+    "br",
+    "hr",
+    "img",
+    "input",
+    "meta",
+    "link",
+    "area",
+    "base",
+    "col",
+    "embed",
+    "source",
+    "track",
+    "wbr",
+}
 
 
 def strip_html_tags(text: str) -> str:
@@ -276,7 +604,9 @@ def detect_residual_tags(original: str, translated: str) -> bool:
     return False
 
 
-def validate_translation(original: str, translated: str, target_lang: str) -> tuple[bool, str]:
+def validate_translation(
+    original: str, translated: str, target_lang: str
+) -> tuple[bool, str]:
     if not translated:
         return False, "empty_translation"
     if detect_untranslated(original, translated, target_lang):
@@ -359,9 +689,14 @@ def categorize_error(
     if status_code == 429:
         return "RATE_LIMIT_EXCEEDED", f"Rate limit exceeded. {error_detail}"
     if status_code in (502, 503):
-        is_html = "<html" in response_text.lower() or "<!doctype" in response_text.lower()
+        is_html = (
+            "<html" in response_text.lower() or "<!doctype" in response_text.lower()
+        )
         if is_html:
-            return "PROXY_HTML_ERROR", f"Proxy returned HTML error. {response_text[:200]}"
+            return (
+                "PROXY_HTML_ERROR",
+                f"Proxy returned HTML error. {response_text[:200]}",
+            )
         return "GATEWAY_ERROR", f"Gateway error: {error_detail}"
     if status_code == 504:
         return "GATEWAY_TIMEOUT", "Gateway timeout."
@@ -421,23 +756,41 @@ def get_lan_ip() -> str:
     except socket.error:
         pass
 
-    raise RuntimeError("Could not detect a valid LAN IP address.")
+    return "0.0.0.0"
 
 
-def get_retry_prompt(incomplete_texts: List[str], target_lang: str, issues: List[str]) -> str:
+def get_retry_prompt(
+    incomplete_texts: List[str], target_lang: str, issues: List[str]
+) -> str:
     issue_instructions = []
     if "untranslated" in issues:
-        issue_instructions.append("- Translate ALL text content completely to " + target_lang)
-        issue_instructions.append("- Do NOT leave any source language words untranslated")
-        issue_instructions.append("- Common words like 'the', 'and', 'click', 'here' MUST be translated")
+        issue_instructions.append(
+            "- Translate ALL text content completely to " + target_lang
+        )
+        issue_instructions.append(
+            "- Do NOT leave any source language words untranslated"
+        )
+        issue_instructions.append(
+            "- Common words like 'the', 'and', 'click', 'here' MUST be translated"
+        )
     if "residual_tags" in issues:
-        issue_instructions.append("- Preserve HTML tag structure exactly as in original")
-        issue_instructions.append("- Ensure all opening tags have matching closing tags")
+        issue_instructions.append(
+            "- Preserve HTML tag structure exactly as in original"
+        )
+        issue_instructions.append(
+            "- Ensure all opening tags have matching closing tags"
+        )
         issue_instructions.append("- Do NOT duplicate, remove, or break HTML tags")
     if "empty_translation" in issues:
-        issue_instructions.append("- Provide actual translated content, not empty strings")
+        issue_instructions.append(
+            "- Provide actual translated content, not empty strings"
+        )
 
-    instructions = "\n".join(issue_instructions) if issue_instructions else "- Translate completely and preserve HTML structure"
+    instructions = (
+        "\n".join(issue_instructions)
+        if issue_instructions
+        else "- Translate completely and preserve HTML structure"
+    )
 
     return f"""Previous translations had issues. Please fix and translate these texts to {target_lang}.
 
@@ -526,10 +879,11 @@ class StreamingJSONArrayParser:
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=r"^(chrome-extension|moz-extension)://.*$|^http://(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2[0-9]|3[0-1])\.\d+\.\d+)(:\d+)?(/.*)?$",
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-Request-ID"],
 )
 
 
@@ -550,20 +904,50 @@ class TranslateRequest(BaseModel):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    """Health check endpoint for load balancer."""
+    return {
+        "status": "ok",
+        "instance_id": INSTANCE_ID,
+        "http_client_ready": http_client is not None,
+    }
+
+
+@app.get("/ready")
+async def ready():
+    """Readiness check - returns 503 if not ready to serve traffic."""
+    if http_client is None:
+        raise HTTPException(status_code=503, detail="HTTP client not initialized")
+    return {"status": "ready", "instance_id": INSTANCE_ID}
 
 
 @app.get("/stats")
 async def stats():
-    return {"status": "ok", "cache": await cache.stats()}
+    """Detailed stats for monitoring."""
+    return {
+        "status": "ok",
+        "instance_id": INSTANCE_ID,
+        "cache": await cache.stats(),
+        "auth": await auth_limiter.get_stats(),
+        "config": {
+            "max_connections": MAX_CONNECTIONS,
+            "rate_limit_rpm": RATE_LIMIT_RPM,
+            "cache_max_size": CACHE_MAX_SIZE,
+        },
+    }
+
+
+# ============================================================================
+# STREAMING TRANSLATION (Async)
+# ============================================================================
 
 
 async def stream_translations(
     request: TranslateRequest,
     texts_to_translate: Optional[List[str]],
     target_language: str,
+    client_id: str = "unknown",
 ) -> AsyncGenerator[str, None]:
-    """Stream translations as Server-Sent Events."""
+    """Stream translations as Server-Sent Events using async httpx."""
     headers = {
         "Authorization": generate_basic_auth_header(request.username, request.password),
         "Content-Type": "application/json",
@@ -575,78 +959,111 @@ async def stream_translations(
         "stream": True,
     }
 
+    if http_client is None:
+        yield f"data: {json.dumps({'error': {'type': 'SERVER_ERROR', 'message': 'HTTP client not initialized'}})}\n\n"
+        return
+
     try:
-        loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            http_executor,
-            lambda: requests.post(
-                request.target_endpoint,
-                json=payload,
-                headers=headers,
-                verify=False,
-                timeout=HTTP_TIMEOUT,
-                stream=True,
-            ),
-        )
+        async with http_client.stream(
+            "POST",
+            request.target_endpoint,
+            json=payload,
+            headers=headers,
+        ) as response:
+            if response.status_code != 200:
+                response_text = await response.aread()
+                error_type, error_message = categorize_error(
+                    response.status_code, response_text.decode(), request.model
+                )
 
-        if not response.ok:
-            error_type, error_message = categorize_error(
-                response.status_code, response.text, request.model
-            )
-            yield f"data: {json.dumps({'error': {'type': error_type, 'message': error_message}})}\n\n"
-            return
+                if response.status_code in (401, 403):
+                    is_locked, attempts_left = await auth_limiter.record_failure(
+                        client_id
+                    )
+                    if is_locked:
+                        error_message = (
+                            "Too many failed attempts. Account temporarily locked."
+                        )
+                    elif attempts_left > 0:
+                        error_message = (
+                            f"{error_message} ({attempts_left} attempts remaining)"
+                        )
 
-        parser = StreamingJSONArrayParser()
-        all_translations = []
+                yield f"data: {json.dumps({'error': {'type': error_type, 'message': error_message}})}\n\n"
+                return
 
-        for line in response.iter_lines(decode_unicode=True):
-            if not line:
-                continue
+            await auth_limiter.record_success(client_id)
 
-            if line.startswith("data: "):
-                line = line[6:]
+            parser = StreamingJSONArrayParser()
+            all_translations = []
 
-            if line == "[DONE]":
-                break
+            async for line in response.aiter_lines():
+                if not line:
+                    continue
 
-            try:
-                chunk_data = json.loads(line)
-                content = ""
+                if line.startswith("data: "):
+                    line = line[6:]
 
-                if "choices" in chunk_data:
-                    delta = chunk_data["choices"][0].get("delta", {})
-                    content = delta.get("content", "")
-                elif "content" in chunk_data:
-                    content = chunk_data["content"]
+                if line == "[DONE]":
+                    break
 
-                if content:
-                    items = parser.feed(content)
-                    for item in items:
-                        all_translations.append(item)
-                        yield f"data: {json.dumps({'index': len(all_translations) - 1, 'translation': item})}\n\n"
+                try:
+                    chunk_data = json.loads(line)
+                    content = ""
 
-            except json.JSONDecodeError:
-                continue
+                    if "choices" in chunk_data:
+                        delta = chunk_data["choices"][0].get("delta", {})
+                        content = delta.get("content", "")
+                    elif "content" in chunk_data:
+                        content = chunk_data["content"]
 
-        if texts_to_translate and len(all_translations) == len(texts_to_translate):
-            await cache.set(
-                texts_to_translate, target_language, request.model, all_translations
-            )
+                    if content:
+                        items = parser.feed(content)
+                        for item in items:
+                            all_translations.append(item)
+                            yield f"data: {json.dumps({'index': len(all_translations) - 1, 'translation': item})}\n\n"
 
-        yield f"data: {json.dumps({'done': True, 'total': len(all_translations)})}\n\n"
+                except json.JSONDecodeError:
+                    continue
 
-    except requests.exceptions.ConnectionError:
+            if texts_to_translate and len(all_translations) == len(texts_to_translate):
+                await cache.set(
+                    texts_to_translate, target_language, request.model, all_translations
+                )
+
+            yield f"data: {json.dumps({'done': True, 'total': len(all_translations)})}\n\n"
+
+    except httpx.ConnectError:
         yield f"data: {json.dumps({'error': {'type': 'CONNECTION_ERROR', 'message': 'Failed to connect to target API'}})}\n\n"
-    except requests.exceptions.Timeout:
+    except httpx.TimeoutException:
         yield f"data: {json.dumps({'error': {'type': 'TIMEOUT', 'message': 'Target API timeout'}})}\n\n"
     except Exception as e:
         yield f"data: {json.dumps({'error': {'type': 'UNKNOWN_ERROR', 'message': str(e)}})}\n\n"
+
+
+# ============================================================================
+# MAIN TRANSLATE ENDPOINT
+# ============================================================================
 
 
 @app.post("/proxy/translate")
 async def translate(request: TranslateRequest, req: Request):
     client_id = req.client.host if req.client else "unknown"
 
+    # Check auth lockout
+    is_locked, remaining = await auth_limiter.is_locked_out(client_id)
+    if is_locked:
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": {
+                    "type": "AUTH_LOCKED_OUT",
+                    "message": f"Too many failed attempts. Try again in {int(remaining)}s",
+                }
+            },
+        )
+
+    # Check rate limit
     allowed, wait = await limiter.acquire(client_id)
     if not allowed:
         return JSONResponse(
@@ -662,10 +1079,12 @@ async def translate(request: TranslateRequest, req: Request):
     texts_to_translate = extract_texts(request.messages)
     target_language = extract_target_language(request.messages)
 
+    # Check cache
     if texts_to_translate:
         cached = await cache.get(texts_to_translate, target_language, request.model)
         if cached:
             if request.stream:
+
                 async def stream_cached():
                     for i, item in enumerate(cached):
                         yield f"data: {json.dumps({'index': i, 'translation': item, 'cached': True})}\n\n"
@@ -678,6 +1097,7 @@ async def translate(request: TranslateRequest, req: Request):
                         "Cache-Control": "no-cache",
                         "Connection": "keep-alive",
                         "X-Accel-Buffering": "no",
+                        "X-Instance-ID": INSTANCE_ID,
                     },
                 )
             else:
@@ -694,21 +1114,38 @@ async def translate(request: TranslateRequest, req: Request):
                         ],
                         "model": request.model,
                         "cached": True,
-                    }
+                    },
+                    headers={"X-Instance-ID": INSTANCE_ID},
                 )
 
+    # Streaming request
     if request.stream:
         return StreamingResponse(
-            stream_translations(request, texts_to_translate, target_language),
+            stream_translations(
+                request, texts_to_translate, target_language, client_id
+            ),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
                 "X-Accel-Buffering": "no",
+                "X-Instance-ID": INSTANCE_ID,
             },
         )
 
-    # Non-streaming request with validation and retry
+    # Non-streaming request
+    return await handle_non_streaming_request(
+        request, texts_to_translate, target_language, client_id
+    )
+
+
+async def handle_non_streaming_request(
+    request: TranslateRequest,
+    texts_to_translate: Optional[List[str]],
+    target_language: str,
+    client_id: str,
+) -> JSONResponse:
+    """Handle non-streaming translation request with async httpx."""
     headers = {
         "Authorization": generate_basic_auth_header(request.username, request.password),
         "Content-Type": "application/json",
@@ -719,23 +1156,32 @@ async def translate(request: TranslateRequest, req: Request):
         "temperature": request.temperature,
     }
 
+    if http_client is None:
+        raise HTTPException(status_code=503, detail="HTTP client not initialized")
+
     try:
-        loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            http_executor,
-            lambda: requests.post(
-                request.target_endpoint,
-                json=payload,
-                headers=headers,
-                verify=False,
-                timeout=HTTP_TIMEOUT,
-            ),
+        response = await http_client.post(
+            request.target_endpoint,
+            json=payload,
+            headers=headers,
         )
 
-        if not response.ok:
+        if response.status_code != 200:
             error_type, error_message = categorize_error(
                 response.status_code, response.text, request.model
             )
+
+            if response.status_code in (401, 403):
+                is_locked, attempts_left = await auth_limiter.record_failure(client_id)
+                if is_locked:
+                    error_message = (
+                        "Too many failed attempts. Account temporarily locked."
+                    )
+                elif attempts_left > 0:
+                    error_message = (
+                        f"{error_message} ({attempts_left} attempts remaining)"
+                    )
+
             return JSONResponse(
                 content={
                     "error": {
@@ -745,24 +1191,27 @@ async def translate(request: TranslateRequest, req: Request):
                     }
                 },
                 status_code=response.status_code,
+                headers={"X-Instance-ID": INSTANCE_ID},
             )
+
+        await auth_limiter.record_success(client_id)
 
         try:
             json_response = response.json()
 
-            # Validate translations and retry if incomplete
+            # Validate and retry incomplete translations
             if texts_to_translate and "choices" in json_response:
                 try:
                     content = json_response["choices"][0]["message"]["content"]
                     translations = json.loads(content)
-                    if isinstance(translations, list) and len(translations) == len(texts_to_translate):
-                        # Check for incomplete translations
+                    if isinstance(translations, list) and len(translations) == len(
+                        texts_to_translate
+                    ):
                         incomplete_idx = get_incomplete_indices(
                             texts_to_translate, translations, target_language
                         )
 
                         if incomplete_idx:
-                            # Collect issues for better retry prompt
                             incomplete_texts = []
                             issues = set()
                             for i in incomplete_idx:
@@ -774,12 +1223,17 @@ async def translate(request: TranslateRequest, req: Request):
                                 )
                                 issues.add(reason)
 
-                            # Retry with focused prompt
                             retry_messages = [
-                                {"role": "system", "content": get_retry_prompt(
-                                    incomplete_texts, target_language, list(issues)
-                                )},
-                                {"role": "user", "content": json.dumps(incomplete_texts)}
+                                {
+                                    "role": "system",
+                                    "content": get_retry_prompt(
+                                        incomplete_texts, target_language, list(issues)
+                                    ),
+                                },
+                                {
+                                    "role": "user",
+                                    "content": json.dumps(incomplete_texts),
+                                },
                             ]
                             retry_payload = {
                                 "model": request.model,
@@ -787,30 +1241,29 @@ async def translate(request: TranslateRequest, req: Request):
                                 "temperature": request.temperature,
                             }
 
-                            retry_response = await loop.run_in_executor(
-                                http_executor,
-                                lambda: requests.post(
-                                    request.target_endpoint,
-                                    json=retry_payload,
-                                    headers=headers,
-                                    verify=False,
-                                    timeout=HTTP_TIMEOUT,
-                                ),
+                            assert http_client is not None  # Already checked above
+                            retry_response = await http_client.post(
+                                request.target_endpoint,
+                                json=retry_payload,
+                                headers=headers,
                             )
 
-                            if retry_response.ok:
+                            if retry_response.status_code == 200:
                                 try:
                                     retry_json = retry_response.json()
-                                    retry_content = retry_json["choices"][0]["message"]["content"]
+                                    retry_content = retry_json["choices"][0]["message"][
+                                        "content"
+                                    ]
                                     retry_translations = json.loads(retry_content)
                                     if len(retry_translations) == len(incomplete_idx):
                                         for i, idx in enumerate(incomplete_idx):
                                             translations[idx] = retry_translations[i]
-                                        json_response["choices"][0]["message"]["content"] = json.dumps(translations)
+                                        json_response["choices"][0]["message"][
+                                            "content"
+                                        ] = json.dumps(translations)
                                 except (json.JSONDecodeError, KeyError, IndexError):
                                     pass
 
-                        # Cache valid result
                         await cache.set(
                             texts_to_translate,
                             target_language,
@@ -821,19 +1274,24 @@ async def translate(request: TranslateRequest, req: Request):
                     pass
 
             json_response["cached"] = False
-            return JSONResponse(content=json_response, status_code=response.status_code)
+            return JSONResponse(
+                content=json_response,
+                status_code=response.status_code,
+                headers={"X-Instance-ID": INSTANCE_ID},
+            )
 
-        except requests.exceptions.JSONDecodeError:
-            is_html = "<html" in response.text.lower() or "<!doctype" in response.text.lower()
+        except json.JSONDecodeError:
+            is_html = (
+                "<html" in response.text.lower() or "<!doctype" in response.text.lower()
+            )
             error_type = "PROXY_HTML_RESPONSE" if is_html else "INVALID_JSON_RESPONSE"
             raise HTTPException(
                 status_code=502, detail=f"{error_type}: Response is not valid JSON"
             )
 
-    except requests.exceptions.ConnectionError:
+    except httpx.ConnectError:
         raise HTTPException(status_code=502, detail="Failed to connect to target API")
-
-    except requests.exceptions.Timeout:
+    except httpx.TimeoutException:
         raise HTTPException(status_code=504, detail="Target API timeout")
 
 
@@ -842,9 +1300,39 @@ async def translate(request: TranslateRequest, req: Request):
 # ============================================================================
 
 if __name__ == "__main__":
+    import argparse
+
     import uvicorn
 
-    ip = get_lan_ip()
-    port = 8000
-    print(f"Server: http://{ip}:{port}")
-    uvicorn.run(app, host=ip, port=port)
+    parser = argparse.ArgumentParser(description="Page Translator Middleware")
+    parser.add_argument(
+        "--host", default=None, help="Host to bind (default: auto-detect LAN IP)"
+    )
+    parser.add_argument(
+        "--port", type=int, default=8000, help="Port to bind (default: 8000)"
+    )
+    parser.add_argument(
+        "--workers", type=int, default=1, help="Number of worker processes (default: 1)"
+    )
+    args = parser.parse_args()
+
+    host = args.host or get_lan_ip()
+
+    print(f"=" * 60)
+    print(f"Page Translator Middleware")
+    print(f"=" * 60)
+    print(f"Instance ID: {INSTANCE_ID}")
+    print(f"Server: http://{host}:{args.port}")
+    print(f"Workers: {args.workers}")
+    print(f"Max Connections: {MAX_CONNECTIONS}")
+    print(f"Rate Limit: {RATE_LIMIT_RPM} req/min per client")
+    print(f"Cache Size: {CACHE_MAX_SIZE} entries")
+    print(f"=" * 60)
+
+    uvicorn.run(
+        "server:app",
+        host=host,
+        port=args.port,
+        workers=args.workers,
+        access_log=True,
+    )

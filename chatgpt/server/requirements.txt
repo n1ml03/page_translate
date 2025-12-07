@@ -1,4 +1,4 @@
 fastapi
-uvicorn
-requests
+uvicorn[standard]
+httpx[http2]
 pydantic

@@ -126,27 +126,161 @@ limiter = RateLimiter()
 # Common English words to detect untranslated text (expanded list)
 ENGLISH_COMMON_WORDS = {
     # Articles & determiners
-    "the", "a", "an", "this", "that", "these", "those", "my", "your", "his",
-    "her", "its", "our", "their", "some", "any", "no", "every", "each", "all",
+    "the",
+    "a",
+    "an",
+    "this",
+    "that",
+    "these",
+    "those",
+    "my",
+    "your",
+    "his",
+    "her",
+    "its",
+    "our",
+    "their",
+    "some",
+    "any",
+    "no",
+    "every",
+    "each",
+    "all",
     # Pronouns
-    "i", "you", "he", "she", "it", "we", "they", "me", "him", "them", "us",
-    "who", "what", "which", "whom", "whose",
+    "i",
+    "you",
+    "he",
+    "she",
+    "it",
+    "we",
+    "they",
+    "me",
+    "him",
+    "them",
+    "us",
+    "who",
+    "what",
+    "which",
+    "whom",
+    "whose",
     # Verbs (common)
-    "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
-    "do", "does", "did", "will", "would", "could", "should", "may", "might",
-    "must", "can", "shall", "get", "got", "make", "made", "go", "went", "come",
-    "came", "take", "took", "see", "saw", "know", "knew", "think", "thought",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "being",
+    "have",
+    "has",
+    "had",
+    "do",
+    "does",
+    "did",
+    "will",
+    "would",
+    "could",
+    "should",
+    "may",
+    "might",
+    "must",
+    "can",
+    "shall",
+    "get",
+    "got",
+    "make",
+    "made",
+    "go",
+    "went",
+    "come",
+    "came",
+    "take",
+    "took",
+    "see",
+    "saw",
+    "know",
+    "knew",
+    "think",
+    "thought",
     # Prepositions & conjunctions
-    "in", "on", "at", "to", "for", "of", "with", "by", "from", "up", "down",
-    "out", "into", "over", "under", "about", "after", "before", "between",
-    "and", "or", "but", "if", "when", "where", "while", "because", "although",
-    "than", "then", "so", "as", "not", "just", "only", "also", "even", "still",
+    "in",
+    "on",
+    "at",
+    "to",
+    "for",
+    "of",
+    "with",
+    "by",
+    "from",
+    "up",
+    "down",
+    "out",
+    "into",
+    "over",
+    "under",
+    "about",
+    "after",
+    "before",
+    "between",
+    "and",
+    "or",
+    "but",
+    "if",
+    "when",
+    "where",
+    "while",
+    "because",
+    "although",
+    "than",
+    "then",
+    "so",
+    "as",
+    "not",
+    "just",
+    "only",
+    "also",
+    "even",
+    "still",
     # Common nouns & UI terms
-    "click", "here", "more", "view", "read", "next", "back", "home", "page",
-    "link", "button", "menu", "search", "login", "logout", "sign", "submit",
-    "cancel", "save", "delete", "edit", "add", "remove", "close", "open",
-    "settings", "profile", "account", "help", "contact", "about", "privacy",
-    "terms", "loading", "error", "success", "warning", "info", "message",
+    "click",
+    "here",
+    "more",
+    "view",
+    "read",
+    "next",
+    "back",
+    "home",
+    "page",
+    "link",
+    "button",
+    "menu",
+    "search",
+    "login",
+    "logout",
+    "sign",
+    "submit",
+    "cancel",
+    "save",
+    "delete",
+    "edit",
+    "add",
+    "remove",
+    "close",
+    "open",
+    "settings",
+    "profile",
+    "account",
+    "help",
+    "contact",
+    "about",
+    "privacy",
+    "terms",
+    "loading",
+    "error",
+    "success",
+    "warning",
+    "info",
+    "message",
 }
 
 ENGLISH_WORD_PATTERN = re.compile(r"\b[a-zA-Z]+\b")
@@ -156,16 +290,58 @@ ASCII_LETTER_PATTERN = re.compile(r"[a-zA-Z]")
 
 # Non-Latin target languages that should have minimal English
 NON_LATIN_LANGS = {
-    "japanese", "chinese", "korean", "thai", "vietnamese", "arabic", "hebrew",
-    "hindi", "russian", "greek", "persian", "bengali", "tamil", "telugu",
-    "marathi", "gujarati", "kannada", "malayalam", "punjabi", "urdu",
-    "tiếng việt", "日本語", "中文", "简体中文", "繁體中文", "한국어", "ไทย",
-    "العربية", "עברית", "हिन्दी", "русский", "ελληνικά", "فارسی",
+    "japanese",
+    "chinese",
+    "korean",
+    "thai",
+    "vietnamese",
+    "arabic",
+    "hebrew",
+    "hindi",
+    "russian",
+    "greek",
+    "persian",
+    "bengali",
+    "tamil",
+    "telugu",
+    "marathi",
+    "gujarati",
+    "kannada",
+    "malayalam",
+    "punjabi",
+    "urdu",
+    "tiếng việt",
+    "日本語",
+    "中文",
+    "简体中文",
+    "繁體中文",
+    "한국어",
+    "ไทย",
+    "العربية",
+    "עברית",
+    "हिन्दी",
+    "русский",
+    "ελληνικά",
+    "فارسی",
 }
 
 # HTML tag pattern for extraction and validation
 HTML_TAG_PATTERN = re.compile(r"<(/?)(\w+)([^>]*)>", re.IGNORECASE)
-HTML_SELF_CLOSING_TAGS = {"br", "hr", "img", "input", "meta", "link", "area", "base", "col", "embed", "source", "track", "wbr"}
+HTML_SELF_CLOSING_TAGS = {
+    "br",
+    "hr",
+    "img",
+    "input",
+    "meta",
+    "link",
+    "area",
+    "base",
+    "col",
+    "embed",
+    "source",
+    "track",
+    "wbr",
+}
 
 
 def strip_html_tags(text: str) -> str:
@@ -324,7 +500,9 @@ def detect_residual_tags(original: str, translated: str) -> bool:
     return False
 
 
-def validate_translation(original: str, translated: str, target_lang: str) -> tuple[bool, str]:
+def validate_translation(
+    original: str, translated: str, target_lang: str
+) -> tuple[bool, str]:
     """
     Comprehensive validation of a translation.
     Returns (is_valid, reason).
@@ -461,21 +639,39 @@ Output ({target_lang}): Translate as complete phrase, keep tags around correspon
 Return ONLY the JSON array."""
 
 
-def get_retry_prompt(incomplete_texts: List[str], target_lang: str, issues: List[str]) -> str:
+def get_retry_prompt(
+    incomplete_texts: List[str], target_lang: str, issues: List[str]
+) -> str:
     """Generate prompt for retrying incomplete translations."""
     issue_instructions = []
     if "untranslated" in issues:
-        issue_instructions.append("- Translate ALL text content completely to " + target_lang)
-        issue_instructions.append("- Do NOT leave any source language words untranslated")
-        issue_instructions.append("- Common words like 'the', 'and', 'click', 'here' MUST be translated")
+        issue_instructions.append(
+            "- Translate ALL text content completely to " + target_lang
+        )
+        issue_instructions.append(
+            "- Do NOT leave any source language words untranslated"
+        )
+        issue_instructions.append(
+            "- Common words like 'the', 'and', 'click', 'here' MUST be translated"
+        )
     if "residual_tags" in issues:
-        issue_instructions.append("- Preserve HTML tag structure exactly as in original")
-        issue_instructions.append("- Ensure all opening tags have matching closing tags")
+        issue_instructions.append(
+            "- Preserve HTML tag structure exactly as in original"
+        )
+        issue_instructions.append(
+            "- Ensure all opening tags have matching closing tags"
+        )
         issue_instructions.append("- Do NOT duplicate, remove, or break HTML tags")
     if "empty_translation" in issues:
-        issue_instructions.append("- Provide actual translated content, not empty strings")
+        issue_instructions.append(
+            "- Provide actual translated content, not empty strings"
+        )
 
-    instructions = "\n".join(issue_instructions) if issue_instructions else "- Translate completely and preserve HTML structure"
+    instructions = (
+        "\n".join(issue_instructions)
+        if issue_instructions
+        else "- Translate completely and preserve HTML structure"
+    )
 
     return f"""Previous translations had issues. Please fix and translate these texts to {target_lang}.
 
@@ -750,7 +946,11 @@ async def translate(request: TranslateRequest, req: Request):
         # Non-streaming request (original behavior)
         expected_len = len(texts_to_translate) if texts_to_translate else None
         response_text, success, usage = await call_gemini(
-            request.model, contents, config, expected_len, validate_json=request.html_aware
+            request.model,
+            contents,
+            config,
+            expected_len,
+            validate_json=request.html_aware,
         )
 
         # Validate translations for completeness
@@ -828,7 +1028,9 @@ async def translate(request: TranslateRequest, req: Request):
                 "usage": (
                     {
                         "prompt_tokens": getattr(usage, "prompt_token_count", 0),
-                        "completion_tokens": getattr(usage, "candidates_token_count", 0),
+                        "completion_tokens": getattr(
+                            usage, "candidates_token_count", 0
+                        ),
                         "total_tokens": getattr(usage, "total_token_count", 0),
                     }
                     if usage

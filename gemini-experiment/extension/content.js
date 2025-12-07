@@ -7,38 +7,26 @@
   // ============================================================================
 
   function enableRightClick() {
-    // Override oncontextmenu handlers
     document.oncontextmenu = null;
     if (document.body) document.body.oncontextmenu = null;
     if (document.documentElement) document.documentElement.oncontextmenu = null;
 
-    // Events to unblock
-    const blockedEvents = [
-      'contextmenu', // Right click
-      'dragstart',   // Drag and drop
-      'selectstart', // Highlight text
-      'copy',        // Copy
-      'cut',         // Cut
-      'paste'        // Paste
-    ];
+    const blockedEvents = ['contextmenu', 'dragstart', 'selectstart', 'copy', 'cut', 'paste'];
 
     blockedEvents.forEach(event => {
       document.addEventListener(event, e => e.stopPropagation(), true);
     });
 
-    // Block future listeners for these events
     const origAddEventListener = EventTarget.prototype.addEventListener;
     EventTarget.prototype.addEventListener = function(type, listener, options) {
       if (blockedEvents.includes(type)) return;
       return origAddEventListener.call(this, type, listener, options);
     };
 
-    // Prevent mousedown from blocking right-click
     document.addEventListener('mousedown', e => {
       if (e.button === 2) e.stopPropagation();
     }, true);
 
-    // Re-enable text selection
     const style = document.createElement('style');
     style.textContent = '* { -webkit-user-select: text !important; user-select: text !important; }';
     (document.head || document.documentElement).appendChild(style);
@@ -62,6 +50,21 @@
   const MAX_BATCH_ITEMS = 100;
   const MAX_BATCH_CHARS = 5000;
 
+
+  // Language code mapping (inline translator uses short codes, popup uses full names)
+  const LANG_CODE_MAP = {
+    'ja': 'Japanese',
+    'en': 'English',
+    'zh-CN': 'Chinese (Simplified)',
+    'zh-TW': 'Chinese (Traditional)',
+    'ko': 'Korean',
+    'vi': 'Vietnamese'
+  };
+
+  const LANG_NAME_TO_CODE = Object.fromEntries(
+    Object.entries(LANG_CODE_MAP).map(([k, v]) => [v, k])
+  );
+
   const processedNodes = new WeakSet();
   const translationCache = new Map();
   let pendingMutationNodes = [], mutationDebounceTimer = null;
@@ -74,7 +77,6 @@
     if (document.getElementById('page-translator-styles')) return;
     const style = document.createElement('style');
     style.id = 'page-translator-styles';
-    // Styles matching inline-translator.js theme (#4285f4 Google blue, #34a853 Google green)
     style.textContent = `
       .pt-translated, .pt-translated-block, .pt-inline-replaced { cursor: help !important; }
       .pt-translated:hover, .pt-translated-block:hover { background-color: rgba(66, 133, 244, 0.08) !important; border-radius: 2px !important; }
@@ -88,7 +90,6 @@
       #page-translator-tooltip .pt-tooltip-label { font-size: 11px !important; font-weight: 600 !important; color: white !important; text-transform: uppercase !important; letter-spacing: 0.5px !important; }
       #page-translator-tooltip .pt-copy-btn { display: flex !important; align-items: center !important; justify-content: center !important; width: 24px !important; height: 24px !important; padding: 0 !important; margin: -4px -6px -4px 8px !important; background: rgba(255, 255, 255, 0.2) !important; border: none !important; border-radius: 50% !important; cursor: pointer !important; color: white !important; transition: background-color 0.15s ease !important; }
       #page-translator-tooltip .pt-copy-btn:hover { background: rgba(255, 255, 255, 0.3) !important; }
-      #page-translator-tooltip .pt-copy-btn:focus { outline: 2px solid white !important; outline-offset: 2px !important; }
       #page-translator-tooltip .pt-copy-btn.copied { background: rgba(255, 255, 255, 0.4) !important; }
       #page-translator-tooltip .pt-copy-btn svg { width: 12px !important; height: 12px !important; fill: currentColor !important; }
       #page-translator-tooltip .pt-tooltip-text { display: block !important; color: #333 !important; padding: 10px 14px !important; }
@@ -372,7 +373,6 @@
   async function processNodes(nodes) {
     if (!nodes.length) return;
 
-    // Separate cached vs uncached
     const uncachedNodes = [];
     for (const nodeInfo of nodes) {
       const cached = getCached(nodeInfo.content);
@@ -380,7 +380,6 @@
     }
     if (!uncachedNodes.length) return;
 
-    // Get unique texts and batch them
     const seen = new Set(), uniqueTexts = [];
     for (const n of uncachedNodes) {
       if (!seen.has(n.content)) { seen.add(n.content); uniqueTexts.push(n.content); }
@@ -405,14 +404,12 @@
     let errors = 0, translatedCount = 0;
     const totalTexts = uniqueTexts.length;
 
-    // Map text content to node indices
     const textToNodeIndices = new Map();
     uncachedNodes.forEach((n, idx) => {
       if (!textToNodeIndices.has(n.content)) textToNodeIndices.set(n.content, []);
       textToNodeIndices.get(n.content).push(idx);
     });
 
-    // Process batches with streaming
     for (let batchIdx = 0; batchIdx < batches.length; batchIdx += CONCURRENCY) {
       const batchPromises = [];
       for (let j = 0; j < CONCURRENCY && batchIdx + j < batches.length; j++) {
@@ -480,7 +477,6 @@
     observeMutations();
   }
 
-  // Listen for message from popup/background to start translation
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message.action === 'translate') {
       translatePage().then(() => sendResponse({ success: true })).catch(err => sendResponse({ success: false, error: err.message }));
@@ -488,19 +484,86 @@
     }
   });
 
+
   // ============================================================================
-  // INLINE TRANSLATOR (Selection-based translation)
+  // INLINE TRANSLATOR (Selection-based translation with settings sync)
   // ============================================================================
 
-  function initInlineTranslator() {
+  let inlineTranslator = null;
+
+  // Load settings from storage and convert language names to codes
+  async function loadInlineSettings() {
+    return new Promise(resolve => {
+      chrome.storage.local.get({
+        recentLanguages: ['Japanese', 'English', 'Chinese (Simplified)'],
+        textTargetLang: 'English'
+      }, result => {
+        // Convert full language names to short codes for inline translator
+        const recentCodes = result.recentLanguages
+          .map(name => LANG_NAME_TO_CODE[name] || name)
+          .filter(code => code);
+        const defaultLang = LANG_NAME_TO_CODE[result.textTargetLang] || 'en';
+        resolve({ recentLanguages: recentCodes, defaultLang });
+      });
+    });
+  }
+
+  // Add translation to history (synced with popup)
+  async function addToInlineHistory(sourceText, translatedText, targetLangCode) {
+    const targetLangName = LANG_CODE_MAP[targetLangCode] || targetLangCode;
+    
+    return new Promise(resolve => {
+      chrome.storage.local.get({ translationHistory: [] }, result => {
+        const history = result.translationHistory || [];
+        
+        const entry = {
+          id: Date.now(),
+          source: sourceText.substring(0, 200),
+          translation: translatedText.substring(0, 200),
+          targetLang: targetLangName,
+          timestamp: new Date().toISOString()
+        };
+        
+        const newHistory = [entry, ...history].slice(0, 20);
+        chrome.storage.local.set({ translationHistory: newHistory }, resolve);
+      });
+    });
+  }
+
+  // Update recent languages (synced with popup)
+  async function updateInlineRecentLanguages(langCode) {
+    const langName = LANG_CODE_MAP[langCode] || langCode;
+    
+    return new Promise(resolve => {
+      chrome.storage.local.get({ recentLanguages: [] }, result => {
+        let recent = result.recentLanguages || [];
+        recent = [langName, ...recent.filter(l => l !== langName)].slice(0, 4);
+        chrome.storage.local.set({ recentLanguages: recent }, () => {
+          // Also update inline translator's recent languages
+          if (inlineTranslator) {
+            const recentCodes = recent.map(name => LANG_NAME_TO_CODE[name] || name);
+            inlineTranslator.updateRecentLanguages(recentCodes);
+          }
+          resolve(recent);
+        });
+      });
+    });
+  }
+
+  async function initInlineTranslator() {
     if (typeof InlineTranslator === 'undefined') {
       console.warn('[PageTranslator] InlineTranslator not loaded');
       return;
     }
 
-    const inlineTranslator = new InlineTranslator({
-      // Use the same streaming translation API as page translation with abort support
+    // Load synced settings
+    const settings = await loadInlineSettings();
+
+    inlineTranslator = new InlineTranslator({
       translateFn: async (text, lang, signal) => {
+        // Update recent languages when translating
+        await updateInlineRecentLanguages(lang);
+        
         return new Promise((resolve, reject) => {
           if (signal?.aborted) {
             reject(new DOMException('Aborted', 'AbortError'));
@@ -548,23 +611,35 @@
             }
           });
 
-          // Send single text for translation with target language and preserveFormat flag
           port.postMessage({ type: 'translate', batch: [text], targetLang: lang, preserveFormat: true });
         });
       },
-      defaultLang: 'en',
+      defaultLang: settings.defaultLang,
+      recentLanguages: settings.recentLanguages,
       languages: [
-        { code: 'ja', name: 'Japanese (日本語)' },
-        { code: 'en', name: 'English' },
-        { code: 'zh-CN', name: 'Chinese Simplified (简体中文)' },
-        { code: 'zh-TW', name: 'Chinese Traditional (繁體中文)' },
-        { code: 'ko', name: 'Korean (한국어)' },
-        { code: 'vi', name: 'Vietnamese (Tiếng Việt)' },
+        { code: 'ja', name: 'Japanese', native: '日本語' },
+        { code: 'en', name: 'English', native: 'English' },
+        { code: 'zh-CN', name: 'Chinese Simplified', native: '简体中文' },
+        { code: 'zh-TW', name: 'Chinese Traditional', native: '繁體中文' },
+        { code: 'ko', name: 'Korean', native: '한국어' },
+        { code: 'vi', name: 'Vietnamese', native: 'Tiếng Việt' },
       ],
-      iconUrl: chrome.runtime?.getURL ? chrome.runtime.getURL('images/icon16.png') : null
+      iconUrl: chrome.runtime?.getURL ? chrome.runtime.getURL('images/icon16.png') : null,
+      onHistoryAdd: addToInlineHistory
     });
 
     inlineTranslator.init();
+
+    // Listen for storage changes to sync settings
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== 'local' || !inlineTranslator) return;
+      
+      if (changes.recentLanguages) {
+        const recentCodes = (changes.recentLanguages.newValue || [])
+          .map(name => LANG_NAME_TO_CODE[name] || name);
+        inlineTranslator.updateRecentLanguages(recentCodes);
+      }
+    });
   }
 
   // Initialize inline translator when DOM is ready

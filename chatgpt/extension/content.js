@@ -50,6 +50,20 @@
   const MAX_BATCH_ITEMS = 100;
   const MAX_BATCH_CHARS = 5000;
 
+  // Language code mapping (inline translator uses short codes, popup uses full names)
+  const LANG_CODE_MAP = {
+    'ja': 'Japanese',
+    'en': 'English',
+    'zh-CN': 'Chinese (Simplified)',
+    'zh-TW': 'Chinese (Traditional)',
+    'ko': 'Korean',
+    'vi': 'Vietnamese'
+  };
+
+  const LANG_NAME_TO_CODE = Object.fromEntries(
+    Object.entries(LANG_CODE_MAP).map(([k, v]) => [v, k])
+  );
+
   const processedNodes = new WeakSet();
   const translationCache = new Map();
   let pendingMutationNodes = [], mutationDebounceTimer = null;
@@ -75,7 +89,6 @@
       #page-translator-tooltip .pt-tooltip-label { font-size: 11px !important; font-weight: 600 !important; color: white !important; text-transform: uppercase !important; letter-spacing: 0.5px !important; }
       #page-translator-tooltip .pt-copy-btn { display: flex !important; align-items: center !important; justify-content: center !important; width: 24px !important; height: 24px !important; padding: 0 !important; margin: -4px -6px -4px 8px !important; background: rgba(255, 255, 255, 0.2) !important; border: none !important; border-radius: 50% !important; cursor: pointer !important; color: white !important; transition: background-color 0.15s ease !important; }
       #page-translator-tooltip .pt-copy-btn:hover { background: rgba(255, 255, 255, 0.3) !important; }
-      #page-translator-tooltip .pt-copy-btn:focus { outline: 2px solid white !important; outline-offset: 2px !important; }
       #page-translator-tooltip .pt-copy-btn.copied { background: rgba(255, 255, 255, 0.4) !important; }
       #page-translator-tooltip .pt-copy-btn svg { width: 12px !important; height: 12px !important; fill: currentColor !important; }
       #page-translator-tooltip .pt-tooltip-text { display: block !important; color: #333 !important; padding: 10px 14px !important; }
@@ -222,6 +235,7 @@
     el.style.opacity = '0';
     setTimeout(() => el.remove(), 300);
   }
+
 
   // ============================================================================
   // DOM EXTRACTION
@@ -452,33 +466,103 @@
   }
 
   // ============================================================================
-  // INLINE TRANSLATOR INITIALIZATION
+  // MAIN
+  // ============================================================================
+
+  async function translatePage() {
+    injectTranslationStyles();
+    setupTooltipListeners();
+    await processNodes(extractTextNodes());
+    observeMutations();
+  }
+
+  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message.action === 'translate') {
+      translatePage().then(() => sendResponse({ success: true })).catch(err => sendResponse({ success: false, error: err.message }));
+      return true;
+    }
+  });
+
+
+  // ============================================================================
+  // INLINE TRANSLATOR (Selection-based translation with settings sync)
   // ============================================================================
 
   let inlineTranslator = null;
 
-  function initInlineTranslator() {
-    if (inlineTranslator) return;
-    if (typeof window.InlineTranslator === 'undefined') {
+  // Load settings from storage and convert language names to codes
+  async function loadInlineSettings() {
+    return new Promise(resolve => {
+      chrome.storage.local.get({
+        recentLanguages: ['Japanese', 'English', 'Vietnamese'],
+        textTargetLang: 'English'
+      }, result => {
+        // Convert full language names to short codes for inline translator
+        const recentCodes = result.recentLanguages
+          .map(name => LANG_NAME_TO_CODE[name] || name)
+          .filter(code => code);
+        const defaultLang = LANG_NAME_TO_CODE[result.textTargetLang] || 'en';
+        resolve({ recentLanguages: recentCodes, defaultLang });
+      });
+    });
+  }
+
+  // Add translation to history (synced with popup)
+  async function addToInlineHistory(sourceText, translatedText, targetLangCode) {
+    const targetLangName = LANG_CODE_MAP[targetLangCode] || targetLangCode;
+    
+    return new Promise(resolve => {
+      chrome.storage.local.get({ translationHistory: [] }, result => {
+        const history = result.translationHistory || [];
+        
+        const entry = {
+          id: Date.now(),
+          source: sourceText.substring(0, 200),
+          translation: translatedText.substring(0, 200),
+          targetLang: targetLangName,
+          timestamp: new Date().toISOString()
+        };
+        
+        const newHistory = [entry, ...history].slice(0, 20);
+        chrome.storage.local.set({ translationHistory: newHistory }, resolve);
+      });
+    });
+  }
+
+  // Update recent languages (synced with popup)
+  async function updateInlineRecentLanguages(langCode) {
+    const langName = LANG_CODE_MAP[langCode] || langCode;
+    
+    return new Promise(resolve => {
+      chrome.storage.local.get({ recentLanguages: [] }, result => {
+        let recent = result.recentLanguages || [];
+        recent = [langName, ...recent.filter(l => l !== langName)].slice(0, 4);
+        chrome.storage.local.set({ recentLanguages: recent }, () => {
+          // Also update inline translator's recent languages
+          if (inlineTranslator) {
+            const recentCodes = recent.map(name => LANG_NAME_TO_CODE[name] || name);
+            inlineTranslator.updateRecentLanguages(recentCodes);
+          }
+          resolve(recent);
+        });
+      });
+    });
+  }
+
+  async function initInlineTranslator() {
+    if (typeof InlineTranslator === 'undefined') {
       console.warn('[PageTranslator] InlineTranslator not loaded');
       return;
     }
 
-    const iconUrl = chrome.runtime.getURL('images/icon48.png');
+    // Load synced settings
+    const settings = await loadInlineSettings();
 
-    inlineTranslator = new window.InlineTranslator({
-      iconUrl,
-      defaultLang: 'en',
-      languages: [
-        { code: 'ja', name: 'Japanese (日本語)' },
-        { code: 'en', name: 'English' },
-        { code: 'zh-CN', name: 'Chinese Simplified (简体中文)' },
-        { code: 'zh-TW', name: 'Chinese Traditional (繁體中文)' },
-        { code: 'ko', name: 'Korean (한국어)' },
-        { code: 'vi', name: 'Vietnamese (Tiếng Việt)' },
-      ],
-      // Use the same streaming translation API as page translation with abort support
+    inlineTranslator = new InlineTranslator({
       translateFn: async (text, lang, signal) => {
+        // Update recent languages when translating
+        await updateInlineRecentLanguages(lang);
+        
         return new Promise((resolve, reject) => {
           if (signal?.aborted) {
             reject(new DOMException('Aborted', 'AbortError'));
@@ -526,37 +610,41 @@
             }
           });
 
-          // Send single text for translation with target language and preserveFormat flag
           port.postMessage({ type: 'translate', batch: [text], targetLang: lang, preserveFormat: true });
         });
-      }
+      },
+      defaultLang: settings.defaultLang,
+      recentLanguages: settings.recentLanguages,
+      languages: [
+        { code: 'ja', name: 'Japanese', native: '日本語' },
+        { code: 'en', name: 'English', native: 'English' },
+        { code: 'zh-CN', name: 'Chinese Simplified', native: '简体中文' },
+        { code: 'zh-TW', name: 'Chinese Traditional', native: '繁體中文' },
+        { code: 'ko', name: 'Korean', native: '한국어' },
+        { code: 'vi', name: 'Vietnamese', native: 'Tiếng Việt' },
+      ],
+      iconUrl: chrome.runtime?.getURL ? chrome.runtime.getURL('images/icon16.png') : null,
+      onHistoryAdd: addToInlineHistory
     });
 
     inlineTranslator.init();
-    console.log('[PageTranslator] Inline translator initialized');
+
+    // Listen for storage changes to sync settings
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== 'local' || !inlineTranslator) return;
+      
+      if (changes.recentLanguages) {
+        const recentCodes = (changes.recentLanguages.newValue || [])
+          .map(name => LANG_NAME_TO_CODE[name] || name);
+        inlineTranslator.updateRecentLanguages(recentCodes);
+      }
+    });
   }
 
+  // Initialize inline translator when DOM is ready
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', initInlineTranslator);
   } else {
     initInlineTranslator();
   }
-
-  // ============================================================================
-  // MAIN
-  // ============================================================================
-
-  async function translatePage() {
-    injectTranslationStyles();
-    setupTooltipListeners();
-    await processNodes(extractTextNodes());
-    observeMutations();
-  }
-
-  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-    if (message.action === 'translate') {
-      translatePage().then(() => sendResponse({ success: true })).catch(err => sendResponse({ success: false, error: err.message }));
-      return true;
-    }
-  });
 })();
