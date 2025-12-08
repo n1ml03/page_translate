@@ -482,6 +482,30 @@
       translatePage().then(() => sendResponse({ success: true })).catch(err => sendResponse({ success: false, error: err.message }));
       return true;
     }
+    if (message.action === 'getSelectedText') {
+      const selection = window.getSelection();
+      const text = selection?.toString().trim() || '';
+      sendResponse({ text });
+      return true;
+    }
+  });
+
+  // ============================================================================
+  // COPY EVENT LISTENER - Store copied text for popup
+  // ============================================================================
+
+  document.addEventListener('copy', () => {
+    setTimeout(() => {
+      const selection = window.getSelection();
+      const text = selection?.toString().trim();
+      if (text) {
+        // Store the copied text in storage for the popup to access
+        chrome.storage.local.set({ 
+          lastCopiedText: text,
+          lastCopiedTimestamp: Date.now()
+        });
+      }
+    }, 10);
   });
 
 

@@ -574,7 +574,7 @@ class InlineTranslator {
         this.selectionRange.insertNode(document.createTextNode(trans));
         parent.dispatchEvent(new InputEvent('input', { inputType: 'insertText', data: trans, bubbles: true }));
       } else {
-        this._replacePreserving(trans);
+        this._replaceWithFormatPreservation(trans);
         window.getSelection()?.removeAllRanges();
       }
 
@@ -589,39 +589,197 @@ class InlineTranslator {
     }
   }
 
-  _replacePreserving(trans) {
+  // ============================================================================
+  // FORMAT-PRESERVING REPLACEMENT ALGORITHM
+  // ============================================================================
+
+  _replaceWithFormatPreservation(translation) {
     const range = this.selectionRange;
-    const start = range.startContainer;
-    const end = range.endContainer;
+    const selectionInfo = this._analyzeSelection(range);
 
-    if (start === end && start.nodeType === Node.TEXT_NODE) {
-      const parent = start.parentElement;
-      if (!parent) { range.deleteContents(); range.insertNode(document.createTextNode(trans)); return; }
-
-      const before = start.textContent.substring(0, range.startOffset);
-      const after = start.textContent.substring(range.endOffset);
-
-      const wrapper = document.createElement('span');
-      wrapper.className = 'pt-inline-replaced';
-      wrapper.dataset.ptOriginal = this.selectedText;
-      wrapper.title = 'Click to revert';
-      this._setTextLines(wrapper, trans);
-
-      const frag = document.createDocumentFragment();
-      if (before) frag.appendChild(document.createTextNode(before));
-      frag.appendChild(wrapper);
-      if (after) frag.appendChild(document.createTextNode(after));
-      parent.replaceChild(frag, start);
+    if (selectionInfo.type === 'singleTextNode') {
+      this._replaceSingleTextNode(range, translation, selectionInfo);
+    } else if (selectionInfo.type === 'inlineOnly') {
+      this._replaceInlineSelection(range, translation, selectionInfo);
+    } else if (selectionInfo.type === 'singleBlock') {
+      this._replaceBlockInlineContent(range, translation, selectionInfo);
     } else {
-      range.deleteContents();
-      const wrapper = document.createElement('span');
-      wrapper.className = 'pt-inline-replaced';
-      wrapper.dataset.ptOriginal = this.selectedText;
-      wrapper.title = 'Click to revert';
-      wrapper.style.whiteSpace = 'pre-wrap';
-      this._setTextLines(wrapper, trans);
-      range.insertNode(wrapper);
+      this._replaceMultiBlockPreserving(range, translation, selectionInfo);
     }
+  }
+
+  _analyzeSelection(range) {
+    const startContainer = range.startContainer;
+    const endContainer = range.endContainer;
+
+    if (startContainer === endContainer && startContainer.nodeType === Node.TEXT_NODE) {
+      return { type: 'singleTextNode', textNode: startContainer, parentElement: startContainer.parentElement };
+    }
+
+    const ancestorElement = range.commonAncestorContainer.nodeType === Node.TEXT_NODE
+      ? range.commonAncestorContainer.parentElement
+      : range.commonAncestorContainer;
+
+    const startBlock = this._getBlockParent(startContainer);
+    const endBlock = this._getBlockParent(endContainer);
+
+    if (startBlock === endBlock) {
+      if (this._hasOnlyInlineContent(startBlock)) {
+        return { type: 'singleBlock', blockElement: startBlock, originalHTML: this._getSelectedHTML(range) };
+      }
+      return { type: 'inlineOnly', ancestorElement, originalHTML: this._getSelectedHTML(range) };
+    }
+
+    return { type: 'multiBlock', startBlock, endBlock, originalHTML: this._getSelectedHTML(range) };
+  }
+
+  _getBlockParent(node) {
+    let current = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+    while (current && current !== document.body) {
+      if (InlineTranslator.BLOCK_TAGS.has(current.tagName)) return current;
+      current = current.parentElement;
+    }
+    return document.body;
+  }
+
+  _hasOnlyInlineContent(element) {
+    for (const child of element.childNodes) {
+      if (child.nodeType === Node.TEXT_NODE) continue;
+      if (child.nodeType === Node.ELEMENT_NODE) {
+        if (InlineTranslator.BLOCK_TAGS.has(child.tagName)) return false;
+        if (!InlineTranslator.INLINE_TAGS.has(child.tagName) && !this._hasOnlyInlineContent(child)) return false;
+      }
+    }
+    return true;
+  }
+
+  _getSelectedHTML(range) {
+    const fragment = range.cloneContents();
+    const div = document.createElement('div');
+    div.appendChild(fragment);
+    return div.innerHTML;
+  }
+
+  _replaceSingleTextNode(range, translation, info) {
+    const textNode = info.textNode;
+    const parent = info.parentElement;
+
+    if (!parent) {
+      range.deleteContents();
+      range.insertNode(document.createTextNode(translation));
+      return;
+    }
+
+    const beforeText = textNode.textContent.substring(0, range.startOffset);
+    const afterText = textNode.textContent.substring(range.endOffset);
+
+    const wrapper = document.createElement('span');
+    wrapper.className = 'pt-inline-replaced';
+    wrapper.dataset.ptOriginal = this.selectedText;
+    wrapper.title = 'Click to revert';
+    this._setTextLines(wrapper, translation);
+
+    const fragment = document.createDocumentFragment();
+    if (beforeText) fragment.appendChild(document.createTextNode(beforeText));
+    fragment.appendChild(wrapper);
+    if (afterText) fragment.appendChild(document.createTextNode(afterText));
+    parent.replaceChild(fragment, textNode);
+  }
+
+  _replaceInlineSelection(range, translation, info) {
+    const wrapper = document.createElement('span');
+    wrapper.className = 'pt-inline-replaced';
+    wrapper.dataset.ptOriginal = this.selectedText;
+    wrapper.dataset.ptOriginalHtml = info.originalHTML;
+    wrapper.title = 'Click to revert';
+    this._setTextLines(wrapper, translation);
+    range.deleteContents();
+    range.insertNode(wrapper);
+  }
+
+  _replaceBlockInlineContent(range, translation, info) {
+    const wrapper = document.createElement('span');
+    wrapper.className = 'pt-inline-replaced';
+    wrapper.dataset.ptOriginal = this.selectedText;
+    wrapper.dataset.ptOriginalHtml = info.originalHTML;
+    wrapper.title = 'Click to revert';
+    this._setTextLines(wrapper, translation);
+    range.deleteContents();
+    range.insertNode(wrapper);
+  }
+
+  _replaceMultiBlockPreserving(range, translation, info) {
+    const textNodes = this._getTextNodesInRange(range);
+    if (textNodes.length === 0) {
+      range.deleteContents();
+      const wrapper = this._createReplacementWrapper(translation, info.originalHTML);
+      range.insertNode(wrapper);
+      return;
+    }
+
+    const firstNode = textNodes[0];
+    const startOffset = firstNode.node === range.startContainer ? range.startOffset : 0;
+    const wrapper = this._createReplacementWrapper(translation, info.originalHTML);
+    const beforeText = firstNode.node.textContent.substring(0, startOffset);
+
+    for (let i = textNodes.length - 1; i >= 0; i--) {
+      const { node } = textNodes[i];
+      if (i === 0) {
+        const parent = node.parentNode;
+        if (!parent) continue;
+        if (beforeText) parent.insertBefore(document.createTextNode(beforeText), node);
+        parent.insertBefore(wrapper, node);
+        if (node === range.startContainer && node === range.endContainer) {
+          const afterText = node.textContent.substring(range.endOffset);
+          if (afterText) parent.insertBefore(document.createTextNode(afterText), node);
+        }
+        parent.removeChild(node);
+      } else if (i === textNodes.length - 1) {
+        const endOffset = node === range.endContainer ? range.endOffset : node.textContent.length;
+        const afterText = node.textContent.substring(endOffset);
+        if (afterText) node.textContent = afterText;
+        else node.parentNode?.removeChild(node);
+      } else {
+        node.parentNode?.removeChild(node);
+      }
+    }
+  }
+
+  _createReplacementWrapper(translation, originalHTML) {
+    const wrapper = document.createElement('span');
+    wrapper.className = 'pt-inline-replaced';
+    wrapper.dataset.ptOriginal = this.selectedText;
+    if (originalHTML) wrapper.dataset.ptOriginalHtml = originalHTML;
+    wrapper.title = 'Click to revert';
+    wrapper.style.whiteSpace = 'pre-wrap';
+    this._setTextLines(wrapper, translation);
+    return wrapper;
+  }
+
+  _getTextNodesInRange(range) {
+    const textNodes = [];
+    const container = range.commonAncestorContainer;
+
+    if (container.nodeType === Node.TEXT_NODE) {
+      return [{ node: container, isPartial: true }];
+    }
+
+    const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
+      acceptNode: (node) => {
+        const nodeRange = document.createRange();
+        nodeRange.selectNodeContents(node);
+        const startsBeforeEnd = range.compareBoundaryPoints(Range.START_TO_END, nodeRange) >= 0;
+        const endsAfterStart = range.compareBoundaryPoints(Range.END_TO_START, nodeRange) <= 0;
+        if (startsBeforeEnd && endsAfterStart && node.textContent.trim()) return NodeFilter.FILTER_ACCEPT;
+        return NodeFilter.FILTER_REJECT;
+      }
+    });
+
+    let node;
+    while ((node = walker.nextNode())) {
+      textNodes.push({ node, isPartial: node === range.startContainer || node === range.endContainer });
+    }
+    return textNodes;
   }
 
   // ============================================================================

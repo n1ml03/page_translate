@@ -587,7 +587,81 @@ button { position: relative; }
   background: var(--border-color);
 }
 
-.clear-btn, .copy-btn {
+/* Divider with swap button */
+.divider-with-swap {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0 var(--space-2);
+}
+
+.divider-line {
+  flex: 1;
+  height: 1px;
+  background: var(--border-color);
+}
+
+.swap-btn {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 50%;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+  flex-shrink: 0;
+}
+
+.swap-btn:hover {
+  background: var(--bg-primary);
+  color: var(--color-primary);
+  border-color: var(--color-primary);
+  transform: rotate(180deg);
+}
+
+.swap-btn:active {
+  transform: rotate(180deg) scale(0.95);
+}
+
+.swap-btn svg {
+  width: 16px;
+  height: 16px;
+}
+
+/* Source text action buttons */
+.source-actions {
+  position: absolute;
+  top: var(--space-2);
+  right: var(--space-2);
+  display: flex;
+  gap: var(--space-1);
+  opacity: 0;
+  transition: opacity var(--transition-fast);
+}
+
+.text-area-wrapper:hover .source-actions,
+.source-actions:focus-within { opacity: 1; }
+
+.action-btn {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.action-btn:hover { background: var(--bg-primary); color: var(--color-primary); border-color: var(--color-primary); }
+.action-btn:active { transform: scale(0.95); }
+.action-btn svg { width: 14px; height: 14px; }
+.action-btn.pasted { background: var(--bg-success); color: var(--color-success); border-color: var(--border-success); }
+
+.copy-btn {
   position: absolute;
   top: var(--space-2);
   right: var(--space-2);
@@ -598,19 +672,40 @@ button { position: relative; }
   border: 1px solid var(--border-color);
   border-radius: var(--radius-sm);
   color: var(--text-secondary);
-  font-size: 16px;
-  line-height: 1;
   opacity: 0;
   transition: opacity var(--transition-fast), background var(--transition-fast);
 }
 
-.text-area-wrapper:hover .clear-btn,
 .text-area-wrapper:hover .copy-btn,
-.clear-btn:focus, .copy-btn:focus { opacity: 1; }
-.clear-btn:hover, .copy-btn:hover { background: var(--bg-primary); color: var(--color-primary); }
+.copy-btn:focus { opacity: 1; }
+.copy-btn:hover { background: var(--bg-primary); color: var(--color-primary); }
 
 .copy-btn svg { width: 14px; height: 14px; }
 .copy-btn.copied { background: var(--bg-success); color: var(--color-success); border-color: var(--border-success); }
+
+/* Auto-translate toggle */
+.auto-translate-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  margin-left: auto;
+  cursor: pointer;
+  user-select: none;
+}
+
+.auto-translate-toggle input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  cursor: pointer;
+  accent-color: var(--color-primary);
+}
+
+.auto-translate-toggle .toggle-label {
+  font-size: var(--font-size-xs);
+  color: var(--text-secondary);
+  font-weight: var(--font-weight-medium);
+}
 
 .translator-footer {
   display: flex;

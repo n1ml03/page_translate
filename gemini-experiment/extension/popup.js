@@ -11,7 +11,8 @@ const DEFAULT_SETTINGS = {
   activeTab: 'page',
   textTargetLang: 'English',
   recentLanguages: ['Japanese', 'English', 'Vietnamese'],
-  translationHistory: []
+  translationHistory: [],
+  autoTranslate: false
 };
 
 const LANGUAGES = [
@@ -477,6 +478,176 @@ function handleClearSource() {
   saveTextTabState();
 }
 
+// ============================================================================
+// CLIPBOARD FEATURES
+// ============================================================================
+
+let lastClipboardText = '';
+let clipboardCheckInterval = null;
+
+async function readClipboard() {
+  try {
+    if (navigator.clipboard?.readText) {
+      return await navigator.clipboard.readText();
+    }
+  } catch (e) {
+    console.log('Clipboard API failed:', e.message);
+  }
+  return null;
+}
+
+async function handlePasteFromClipboard() {
+  const pasteBtn = document.getElementById('pasteBtn');
+  const sourceTextEl = document.getElementById('sourceText');
+
+  if (!sourceTextEl) return;
+
+  // First try to get recently copied text from storage (from content script)
+  let text = null;
+  try {
+    const stored = await new Promise((resolve) => {
+      chrome.storage.local.get(
+        ['lastCopiedText', 'lastCopiedTimestamp'],
+        resolve
+      );
+    });
+    const isRecent =
+      stored.lastCopiedTimestamp &&
+      Date.now() - stored.lastCopiedTimestamp < 60000;
+    if (isRecent && stored.lastCopiedText) {
+      text = stored.lastCopiedText;
+      // Clear after use
+      chrome.storage.local.remove(['lastCopiedText', 'lastCopiedTimestamp']);
+    }
+  } catch (e) {
+    console.log('Storage read failed:', e);
+  }
+
+  // Fallback to clipboard API
+  if (!text) {
+    text = await readClipboard();
+  }
+
+  if (text && text.trim()) {
+    sourceTextEl.value = text.trim();
+    updateCharCount();
+    saveTextTabState();
+
+    // Visual feedback
+    pasteBtn?.classList.add('pasted');
+    setTimeout(() => pasteBtn?.classList.remove('pasted'), 1000);
+
+    // Auto-translate if enabled
+    const autoTranslate = document.getElementById('autoTranslateToggle')?.checked;
+    if (autoTranslate) {
+      handleTextTranslate();
+    }
+
+    showToast('Pasted from clipboard', 'success');
+  } else {
+    showToast('Clipboard is empty or inaccessible', 'info');
+  }
+}
+
+async function checkClipboardForNewText() {
+  // First check if there's recently copied text from the page
+  const stored = await new Promise(resolve => {
+    chrome.storage.local.get(['lastCopiedText', 'lastCopiedTimestamp'], resolve);
+  });
+  
+  // Use stored text if it was copied within the last 30 seconds
+  const isRecent = stored.lastCopiedTimestamp && (Date.now() - stored.lastCopiedTimestamp < 30000);
+  let text = isRecent ? stored.lastCopiedText : null;
+  
+  // Fallback to clipboard API
+  if (!text) {
+    text = await readClipboard();
+  }
+  
+  if (!text || text === lastClipboardText) return;
+  
+  lastClipboardText = text;
+  const sourceTextEl = document.getElementById('sourceText');
+  
+  // Only auto-fill if source is empty and we're on the text tab
+  if (sourceTextEl && !sourceTextEl.value.trim()) {
+    const activeTab = document.querySelector('.tab-btn.active')?.dataset.tab;
+    if (activeTab === 'text') {
+      sourceTextEl.value = text.trim();
+      updateCharCount();
+      saveTextTabState();
+      
+      // Show notification that text was auto-filled
+      showToast('Clipboard text loaded', 'info');
+      
+      // Auto-translate if enabled
+      const autoTranslate = document.getElementById('autoTranslateToggle')?.checked;
+      if (autoTranslate && text.trim()) {
+        handleTextTranslate();
+      }
+    }
+  }
+  
+  // Clear the stored copied text after using it
+  if (isRecent) {
+    chrome.storage.local.remove(['lastCopiedText', 'lastCopiedTimestamp']);
+  }
+}
+
+function startClipboardMonitoring() {
+  // Check clipboard on popup open
+  checkClipboardForNewText();
+  
+  // Periodically check for clipboard changes (every 1.5s)
+  clipboardCheckInterval = setInterval(checkClipboardForNewText, 1500);
+}
+
+function stopClipboardMonitoring() {
+  if (clipboardCheckInterval) {
+    clearInterval(clipboardCheckInterval);
+    clipboardCheckInterval = null;
+  }
+}
+
+async function handleAutoTranslateToggle(e) {
+  const enabled = e.target.checked;
+  await saveSettings({ autoTranslate: enabled });
+  
+  if (enabled) {
+    showToast('Auto-translate enabled', 'success');
+    // If there's text in source, translate it
+    const sourceText = document.getElementById('sourceText')?.value.trim();
+    if (sourceText) {
+      handleTextTranslate();
+    }
+  }
+}
+
+function handleSwapTexts() {
+  const sourceTextEl = document.getElementById('sourceText');
+  const translatedTextEl = document.getElementById('translatedText');
+  
+  if (!sourceTextEl || !translatedTextEl) return;
+  
+  const sourceText = sourceTextEl.value;
+  const translatedText = translatedTextEl.innerText;
+  
+  // Only swap if there's translated text
+  if (!translatedText.trim()) {
+    showToast('No translation to swap', 'info');
+    return;
+  }
+  
+  // Swap the texts
+  sourceTextEl.value = translatedText;
+  translatedTextEl.innerText = sourceText;
+  
+  updateCharCount();
+  saveTextTabState();
+  
+  // showToast('Texts swapped', 'success');
+}
+
 async function handleCopyResult() {
   const translatedText = document.getElementById('translatedText');
   const copyBtn = document.getElementById('copyResultBtn');
@@ -615,11 +786,20 @@ async function initializePopup() {
   document.getElementById('textTranslateBtn')?.addEventListener('click', handleTextTranslate);
   document.getElementById('clearSourceBtn')?.addEventListener('click', handleClearSource);
   document.getElementById('copyResultBtn')?.addEventListener('click', handleCopyResult);
+  document.getElementById('pasteBtn')?.addEventListener('click', handlePasteFromClipboard);
+  document.getElementById('swapBtn')?.addEventListener('click', handleSwapTexts);
   document.getElementById('textTargetLang')?.addEventListener('change', (e) => {
     updateRecentLanguages(e.target.value).then(recent => {
       renderQuickLanguageButtons('textQuickLangs', e.target.value, recent, handleTextQuickLangSelect);
     });
   });
+  
+  // Auto-translate toggle
+  const autoTranslateToggle = document.getElementById('autoTranslateToggle');
+  if (autoTranslateToggle) {
+    autoTranslateToggle.checked = settings.autoTranslate || false;
+    autoTranslateToggle.addEventListener('change', handleAutoTranslateToggle);
+  }
 
   // Keyboard shortcuts
   document.getElementById('sourceText')?.addEventListener('keydown', (e) => {
@@ -645,6 +825,12 @@ async function initializePopup() {
   updateConnectionStatusUI({ status: 'checking', message: 'Checking...' });
   const status = await checkServerConnection(settings.serverUrl);
   updateConnectionStatusUI(status);
+  
+  // Start clipboard monitoring for Text tab
+  startClipboardMonitoring();
+  
+  // Stop monitoring when popup closes
+  window.addEventListener('unload', stopClipboardMonitoring);
 }
 
 // Start

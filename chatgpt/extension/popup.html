@@ -127,13 +127,39 @@
           </select>
           <!-- Quick Language Toggle -->
           <div id="textQuickLangs" class="quick-lang-buttons compact"></div>
+          <!-- Auto-translate toggle -->
+          <label class="auto-translate-toggle" title="Auto-translate when pasting">
+            <input type="checkbox" id="autoTranslateToggle" />
+            <span class="toggle-label">Auto</span>
+          </label>
         </div>
         <div class="translator-body">
           <div class="text-area-wrapper">
-            <textarea id="sourceText" placeholder="Enter text to translate..."></textarea>
-            <button type="button" id="clearSourceBtn" class="clear-btn" aria-label="Clear text" title="Clear">×</button>
+            <textarea id="sourceText" placeholder="Enter text to translate or paste from clipboard..."></textarea>
+            <div class="source-actions">
+              <button type="button" id="pasteBtn" class="action-btn" aria-label="Paste from clipboard" title="Paste (Ctrl+V)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path>
+                  <rect x="8" y="2" width="8" height="4" rx="1" ry="1"></rect>
+                </svg>
+              </button>
+              <button type="button" id="clearSourceBtn" class="action-btn" aria-label="Clear text" title="Clear">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <line x1="18" y1="6" x2="6" y2="18"></line>
+                  <line x1="6" y1="6" x2="18" y2="18"></line>
+                </svg>
+              </button>
+            </div>
           </div>
-          <div class="divider"></div>
+          <div class="divider-with-swap">
+            <div class="divider-line"></div>
+            <button type="button" id="swapBtn" class="swap-btn" aria-label="Swap source and translation" title="Swap texts">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M7 16V4M7 4L3 8M7 4l4 4M17 8v12M17 20l4-4M17 20l-4-4"></path>
+              </svg>
+            </button>
+            <div class="divider-line"></div>
+          </div>
           <div class="text-area-wrapper output">
             <div id="translatedText" class="translated-output"></div>
             <!-- Progress indicator -->
