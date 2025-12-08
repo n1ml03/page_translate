@@ -11,7 +11,7 @@ const ERROR_TYPES = {
 };
 
 const DEFAULT_SETTINGS = {
-  serverUrl: 'http://192.168.0.100:8001/proxy/translate',
+  serverUrl: 'http://192.168.0.101:8001/proxy/translate',
   model: 'gemini-2.0-flash',
   targetLanguage: 'English'
 };
