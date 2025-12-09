@@ -1,12 +1,12 @@
 {
   "manifest_version": 3,
-  "name": "Page Translator",
+  "name": "Translator",
   "version": "1.2.0",
   "description": "Translate web pages using custom LLM API",
   "permissions": ["storage", "activeTab", "scripting", "sidePanel"],
   "host_permissions": ["<all_urls>"],
   "action": {
-    "default_title": "Page Translator",
+    "default_title": "Translator",
     "default_icon": {
       "16": "images/icon16.png",
       "48": "images/icon48.png",

@@ -1,3 +1,5 @@
+// Content script for Chrome extension
+
 (function() {
   if (window.pageTranslatorRunning) return;
   window.pageTranslatorRunning = true;

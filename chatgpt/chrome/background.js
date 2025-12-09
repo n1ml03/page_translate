@@ -3,12 +3,17 @@ importScripts('crypto.js');
 
 const DEFAULT_SETTINGS = {
   proxyUrl: 'http://localhost:8000/proxy/translate',
-  targetEndpoint: 'https://llm.api.local/chatapp/api/41_mini',
   username: '',
   encryptedPassword: '',
-  model: '41-mini',
+  model: '41_nano',
   targetLanguage: 'English'
 };
+
+// Hardcoded base endpoint URL - model will be appended automatically
+const BASE_ENDPOINT = 'https://llm.api.local/chatapp/api';
+
+// Construct full endpoint URL from model
+const getFullEndpoint = (model) => `${BASE_ENDPOINT}/${model || DEFAULT_SETTINGS.model}`;
 
 // Language code to full name mapping (fallback for short codes)
 const LANG_MAP = {
@@ -61,8 +66,11 @@ Rules:
 4. Do NOT output Markdown code blocks.
 5. Do NOT add any conversational text.`;
 
+  // Construct full endpoint from model
+  const fullEndpoint = getFullEndpoint(settings.model);
+
   return {
-    target_endpoint: settings.targetEndpoint,
+    target_endpoint: fullEndpoint,
     username: settings.username,
     password: settings.password,
     model: settings.model,
@@ -75,8 +83,11 @@ Rules:
 }
 
 function buildInlinePayload(text, settings) {
+  // Construct full endpoint from model
+  const fullEndpoint = getFullEndpoint(settings.model);
+
   return {
-    target_endpoint: settings.targetEndpoint,
+    target_endpoint: fullEndpoint,
     username: settings.username,
     password: settings.password,
     model: settings.model,
@@ -215,7 +226,6 @@ const activePorts = new Map();
 async function handleStreaming(request, port, portId) {
   try {
     const settings = await getSettings();
-    if (!settings.targetEndpoint) throw new Error('Target endpoint not configured');
     if (!settings.username || !settings.password) throw new Error('Credentials not configured');
     // Convert language code to full name for AI prompt
     if (request.targetLang) settings.targetLanguage = getLanguageName(request.targetLang);
@@ -247,7 +257,6 @@ async function handleStreaming(request, port, portId) {
 async function handleTranslation(request) {
   try {
     const settings = await getSettings();
-    if (!settings.targetEndpoint) throw new Error('Target endpoint not configured');
     if (!settings.username || !settings.password) throw new Error('Credentials not configured');
     return { translations: await sendRequest(request.batch, settings) };
   } catch (e) {
@@ -258,7 +267,6 @@ async function handleTranslation(request) {
 async function handleInline(request) {
   try {
     const settings = await getSettings();
-    if (!settings.targetEndpoint) throw new Error('Configure target endpoint in settings');
     if (!settings.username || !settings.password) throw new Error('Configure credentials in settings');
     
     const lang = request.targetLanguage || settings.targetLanguage;

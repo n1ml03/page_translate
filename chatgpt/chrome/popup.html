@@ -3,12 +3,12 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Page Translator</title>
+    <title>Translator</title>
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
     <header class="header">
-      <h1>Page Translator</h1>
+      <h1>Translator</h1>
       <div class="header-actions">
         <div class="connection-status">
           <div id="statusIndicator" class="status-indicator unconfigured">
@@ -37,8 +37,15 @@
             <input type="text" id="proxyUrl" placeholder="http://192.168.0.101:8000/proxy/translate" />
           </div>
           <div class="form-group">
-            <label for="targetEndpoint">Target Endpoint</label>
-            <input type="text" id="targetEndpoint" placeholder="https://your-llm-api.local/endpoint" />
+            <label for="model">Default Model</label>
+            <select id="model">
+              <option value="41_nano">41_nano</option>
+              <option value="41_mini">41_mini</option>
+              <option value="41">41</option>
+              <option value="51_nano">51_nano</option>
+              <option value="51_mini">51_mini</option>
+              <option value="51">51</option>
+            </select>
           </div>
           <div class="form-group">
             <label for="username">Username</label>
@@ -59,10 +66,6 @@
                 </svg>
               </button>
             </div>
-          </div>
-          <div class="form-group">
-            <label for="model">Default Model</label>
-            <input type="text" id="model" placeholder="41-mini" />
           </div>
           <div class="connection-test">
             <button type="button" id="testConnectionBtn" class="btn-secondary">

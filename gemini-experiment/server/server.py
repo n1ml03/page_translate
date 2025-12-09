@@ -104,8 +104,6 @@ class RateLimiter:
 limiter = RateLimiter()
 
 
-
-
 # ============================================================================
 # STREAMING JSON PARSER
 # ============================================================================
@@ -113,7 +111,7 @@ limiter = RateLimiter()
 
 class StreamingJSONParser:
     """Simple streaming JSON array parser."""
-    
+
     def __init__(self):
         self.buffer = ""
         self.in_array = False
@@ -178,8 +176,6 @@ RULES:
 5. Return ONLY valid JSON array, no markdown blocks.
 6. Escape quotes properly in JSON strings.
 Return ONLY the JSON array."""
-
-
 
 
 # ============================================================================
@@ -266,7 +262,7 @@ async def call_gemini_streaming(
             final_usage = chunk.usage_metadata
         if chunk.text:
             yield chunk.text, None
-    
+
     # Yield final usage after stream completes
     if final_usage:
         yield "", final_usage
@@ -318,7 +314,7 @@ async def stream_translations(
         parser = StreamingJSONParser()
         all_translations = []
         final_usage = None
-        
+
         async for chunk_text, usage in call_gemini_streaming(
             request.model, contents, config, instance_id
         ):
@@ -328,11 +324,11 @@ async def stream_translations(
                 for item in parser.feed(chunk_text):
                     all_translations.append(item)
                     yield f"data: {json.dumps({'index': len(all_translations) - 1, 'translation': item})}\n\n"
-        
+
         # Log token summary once at the end
         if final_usage:
             log_tokens(instance_id, final_usage)
-        
+
         if texts and len(all_translations) == len(texts):
             await cache.set(
                 texts,
@@ -501,7 +497,9 @@ async def translate(request: TranslateRequest, req: Request):
         if success and texts_to_translate and request.target_language and response_text:
             try:
                 translations = json.loads(response_text)
-                if isinstance(translations, list) and len(translations) == len(texts_to_translate):
+                if isinstance(translations, list) and len(translations) == len(
+                    texts_to_translate
+                ):
                     await cache.set(
                         texts_to_translate,
                         request.target_language,
@@ -512,7 +510,11 @@ async def translate(request: TranslateRequest, req: Request):
                 pass
 
         duration_ms = (time.time() - start_time) * 1000
-        log_response(instance_id, len(texts_to_translate) if texts_to_translate else 1, duration_ms)
+        log_response(
+            instance_id,
+            len(texts_to_translate) if texts_to_translate else 1,
+            duration_ms,
+        )
 
         return JSONResponse(
             content={

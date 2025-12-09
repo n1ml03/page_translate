@@ -1,11 +1,10 @@
-// Popup Script - Page Translator with Settings, History & Quick Language Toggle
+// Popup Script - Translator with Settings, History & Quick Language Toggle
 
 const DEFAULT_SETTINGS = {
   proxyUrl: 'http://localhost:8000/proxy/translate',
-  targetEndpoint: 'https://llm.api.local/chatapp/api/41_mini',
   username: '',
   encryptedPassword: '',
-  model: '41-mini',
+  model: '41_nano',
   targetLanguage: 'English',
   activeTab: 'page',
   textTargetLang: 'English',
@@ -13,6 +12,12 @@ const DEFAULT_SETTINGS = {
   translationHistory: [],
   autoTranslate: false
 };
+
+// Hardcoded base endpoint URL - model will be appended automatically
+const BASE_ENDPOINT = 'https://llm.api.local/chatapp/api';
+
+// Construct full endpoint URL from base URL and model
+const getFullEndpoint = (model) => `${BASE_ENDPOINT}/${model || DEFAULT_SETTINGS.model}`;
 
 const LANGUAGES = [
   { code: 'Japanese', name: 'Japanese' },
@@ -111,8 +116,6 @@ function validateSettings(s) {
   const errors = new Map();
   if (!s.proxyUrl?.trim()) errors.set('proxyUrl', 'Proxy URL required');
   else if (!isValidUrl(s.proxyUrl)) errors.set('proxyUrl', 'Invalid URL');
-  if (!s.targetEndpoint?.trim()) errors.set('targetEndpoint', 'Target Endpoint required');
-  else if (!isValidUrl(s.targetEndpoint)) errors.set('targetEndpoint', 'Invalid URL');
   if (!s.username?.trim()) errors.set('username', 'Username required');
   if (!s.password?.trim() && !s.encryptedPassword?.trim()) errors.set('password', 'Password required');
   return { isValid: errors.size === 0, errors };
@@ -222,13 +225,16 @@ async function verifyConnection(settings = null) {
     const ctrl = new AbortController();
     setTimeout(() => ctrl.abort(), VERIFY_TIMEOUT);
     
+    // Construct full endpoint from model
+    const fullEndpoint = getFullEndpoint(settings.model);
+    
     // Send a minimal test request to verify credentials
     const res = await fetch(settings.proxyUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       signal: ctrl.signal,
       body: JSON.stringify({
-        target_endpoint: settings.targetEndpoint,
+        target_endpoint: fullEndpoint,
         username: settings.username,
         password: settings.password,
         model: settings.model || DEFAULT_SETTINGS.model,
@@ -292,7 +298,6 @@ async function testConnection() {
   // Get current form values for testing
   const testSettings = {
     proxyUrl: document.getElementById('proxyUrl').value,
-    targetEndpoint: document.getElementById('targetEndpoint').value,
     username: document.getElementById('username').value,
     password: document.getElementById('password').value,
     model: document.getElementById('model').value
@@ -307,7 +312,6 @@ async function testConnection() {
 async function saveSettingsHandler() {
   const settings = {
     proxyUrl: document.getElementById('proxyUrl').value,
-    targetEndpoint: document.getElementById('targetEndpoint').value,
     username: document.getElementById('username').value,
     password: document.getElementById('password').value,
     model: document.getElementById('model').value
@@ -989,11 +993,14 @@ async function translateText() {
   outEl.innerText = '';
 
   try {
+    // Construct full endpoint from model
+    const fullEndpoint = getFullEndpoint(settings.model);
+    
     const res = await fetch(settings.proxyUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        target_endpoint: settings.targetEndpoint,
+        target_endpoint: fullEndpoint,
         username: settings.username,
         password: settings.password,
         model: settings.model || DEFAULT_SETTINGS.model,
@@ -1230,7 +1237,6 @@ async function init() {
   try { settings = await loadCredentials(); } catch { settings = DEFAULT_SETTINGS; }
 
   document.getElementById('proxyUrl').value = settings.proxyUrl;
-  document.getElementById('targetEndpoint').value = settings.targetEndpoint;
   document.getElementById('username').value = settings.username;
   document.getElementById('password').value = settings.password || '';
   document.getElementById('model').value = settings.model;

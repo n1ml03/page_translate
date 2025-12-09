@@ -1,3 +1,5 @@
+// Content script for Edge extension
+
 (function() {
   if (window.pageTranslatorRunning) return;
   window.pageTranslatorRunning = true;

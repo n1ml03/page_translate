@@ -1,12 +1,6 @@
 """
-Page Translator Middleware - High Concurrency Optimized
+Translator Middleware - High Concurrency Optimized
 FastAPI server proxying translation requests to LLM API with streaming support.
-
-Optimizations for high concurrency:
-- Request deduplication (coalescing identical in-flight requests)
-- Efficient async locking with timeouts
-- Connection pooling with higher limits
-- Graceful degradation under load
 """
 
 import asyncio
@@ -32,10 +26,14 @@ from pydantic import BaseModel, Field
 # CONFIGURATION
 # ============================================================================
 
-CACHE_MAX_SIZE = int(os.environ.get("CACHE_MAX_SIZE", "10000"))  # Increased for high traffic
+CACHE_MAX_SIZE = int(
+    os.environ.get("CACHE_MAX_SIZE", "10000")
+)  # Increased for high traffic
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "3600"))
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "120"))
-MAX_CONNECTIONS = int(os.environ.get("MAX_CONNECTIONS", "500"))  # Increased for concurrency
+MAX_CONNECTIONS = int(
+    os.environ.get("MAX_CONNECTIONS", "500")
+)  # Increased for concurrency
 MAX_KEEPALIVE = int(os.environ.get("MAX_KEEPALIVE", "100"))  # Increased
 CONNECT_TIMEOUT = int(os.environ.get("CONNECT_TIMEOUT", "10"))
 RATE_LIMIT_RPM = int(os.environ.get("RATE_LIMIT_RPM", "120"))
@@ -46,7 +44,9 @@ AUTH_WINDOW_SEC = int(os.environ.get("AUTH_FAILURE_WINDOW_SECONDS", "60"))
 INSTANCE_ID = os.environ.get("INSTANCE_ID", str(uuid.uuid4())[:8])
 DEDUP_ENABLED = os.environ.get("DEDUP_ENABLED", "true").lower() == "true"
 LOCK_TIMEOUT = float(os.environ.get("LOCK_TIMEOUT", "5.0"))  # Max wait for lock
-MAX_CONCURRENT_API_CALLS = int(os.environ.get("MAX_CONCURRENT_API_CALLS", "50"))  # Limit upstream pressure
+MAX_CONCURRENT_API_CALLS = int(
+    os.environ.get("MAX_CONCURRENT_API_CALLS", "50")
+)  # Limit upstream pressure
 
 ALLOWED_ORIGINS = os.environ.get(
     "ALLOWED_ORIGINS",
@@ -77,13 +77,15 @@ async def lifespan(app: FastAPI):
     )
     # Semaphore limits concurrent API calls to prevent overwhelming upstream
     api_semaphore = asyncio.Semaphore(MAX_CONCURRENT_API_CALLS)
-    print(f"[{INSTANCE_ID}] HTTP client initialized (max {MAX_CONCURRENT_API_CALLS} concurrent API calls)")
+    print(
+        f"[{INSTANCE_ID}] HTTP client initialized (max {MAX_CONCURRENT_API_CALLS} concurrent API calls)"
+    )
     yield
     if http_client:
         await http_client.aclose()
 
 
-app = FastAPI(title="Page Translator Middleware", lifespan=lifespan)
+app = FastAPI(title="Translator Middleware", lifespan=lifespan)
 
 
 # ============================================================================
@@ -172,7 +174,7 @@ cache = TranslationCache()
 class RequestDeduplicator:
     """
     Coalesces identical in-flight requests to avoid duplicate API calls.
-    
+
     If User A and User B request the same translation simultaneously,
     only one API call is made and both get the result.
     """
@@ -208,7 +210,12 @@ class RequestDeduplicator:
             return future, True
 
     async def complete(
-        self, texts: List[str], lang: str, model: str, result: Optional[List[str]], error: Optional[str] = None
+        self,
+        texts: List[str],
+        lang: str,
+        model: str,
+        result: Optional[List[str]],
+        error: Optional[str] = None,
     ):
         """Mark request as complete, notify all waiters."""
         if not DEDUP_ENABLED:
@@ -342,13 +349,16 @@ class AuthLimiter:
             self._failures.pop(client, None)
         # Clean stale failure records (no activity for CLIENT_TTL)
         stale = [
-            c for c, timestamps in self._failures.items()
+            c
+            for c, timestamps in self._failures.items()
             if not timestamps or now - max(timestamps) > CLIENT_TTL
         ]
         for client in stale:
             del self._failures[client]
         if expired or stale:
-            print(f"{INSTANCE_ID}: cleaned {len(expired)} lockouts, {len(stale)} stale auth entries")
+            print(
+                f"{INSTANCE_ID}: cleaned {len(expired)} lockouts, {len(stale)} stale auth entries"
+            )
 
 
 auth_limiter = AuthLimiter()
@@ -591,9 +601,9 @@ async def stream_translations(
                         break
                     try:
                         data = json.loads(line)
-                        content = data.get("system_response", "") or data.get("choices", [{}])[
-                            0
-                        ].get("delta", {}).get("system_response", "")
+                        content = data.get("system_response", "") or data.get(
+                            "choices", [{}]
+                        )[0].get("delta", {}).get("system_response", "")
                         if content:
                             for item in parser.feed(content):
                                 translations.append(item)
@@ -695,7 +705,7 @@ async def handle_sync_request(
 ) -> JSONResponse:
     """
     Handle synchronous translation with request deduplication.
-    
+
     If multiple users request the same translation simultaneously,
     only one API call is made and all users receive the same result.
     """
@@ -710,7 +720,14 @@ async def handle_sync_request(
                 if result:
                     return JSONResponse(
                         content={
-                            "choices": [{"message": {"role": "assistant", "content": json.dumps(result)}}],
+                            "choices": [
+                                {
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": json.dumps(result),
+                                    }
+                                }
+                            ],
                             "model": request.model,
                             "coalesced": True,
                         },
@@ -732,7 +749,9 @@ async def handle_sync_request(
 
     if not http_client or not api_semaphore:
         if texts and is_owner:
-            await deduplicator.complete(texts, lang, request.model, None, "Server not initialized")
+            await deduplicator.complete(
+                texts, lang, request.model, None, "Server not initialized"
+            )
         raise HTTPException(status_code=503, detail="Server not initialized")
 
     try:
@@ -796,7 +815,9 @@ async def handle_sync_request(
 
     except httpx.ConnectError:
         if texts and is_owner:
-            await deduplicator.complete(texts, lang, request.model, None, "Connection failed")
+            await deduplicator.complete(
+                texts, lang, request.model, None, "Connection failed"
+            )
         raise HTTPException(status_code=502, detail="Connection failed")
     except httpx.TimeoutException:
         if texts and is_owner:
@@ -814,25 +835,25 @@ if __name__ == "__main__":
 
     import uvicorn
 
-    parser = argparse.ArgumentParser(description="Page Translator Middleware Server")
+    parser = argparse.ArgumentParser(description="Translator Middleware Server")
     parser.add_argument("--host", default=None, help="Host to bind to")
     parser.add_argument("--port", type=int, default=8000, help="Port to bind to")
     parser.add_argument(
-        "--workers", 
-        type=int, 
+        "--workers",
+        type=int,
         default=None,
-        help="Number of worker processes (default: CPU cores, max 4)"
+        help="Number of worker processes (default: CPU cores, max 4)",
     )
     args = parser.parse_args()
 
     # Auto-detect workers based on CPU cores (capped at 4 for most use cases)
     if args.workers is None:
-        args.workers = min(multiprocessing.cpu_count(), 4)
+        args.workers = min(multiprocessing.cpu_count(), 1)
 
     host = args.host or get_lan_ip()
-    
+
     print(f"\n{'=' * 60}")
-    print(f"  Page Translator Middleware - High Concurrency Edition")
+    print(f"  Translator Middleware")
     print(f"{'=' * 60}")
     print(f"  Instance:    {INSTANCE_ID}")
     print(f"  Server:      http://{host}:{args.port}")
@@ -846,18 +867,17 @@ if __name__ == "__main__":
     print(f"    GET  /health           - Health check")
     print(f"    GET  /stats            - Cache & dedup statistics")
     print(f"{'=' * 60}\n")
-
-    # Note: With multiple workers, each worker has its own cache/deduplicator
-    # For true horizontal scaling, use Redis for shared state
+    
+    
     if args.workers > 1:
         print(f"⚠️  Note: Running {args.workers} workers with in-memory cache.")
         print(f"   Each worker has separate cache. For shared cache, use Redis.\n")
 
     uvicorn.run(
-        "server:app", 
-        host=host, 
-        port=args.port, 
-        workers=args.workers, 
+        "server:app",
+        host=host,
+        port=args.port,
+        workers=args.workers,
         access_log=True,
         limit_concurrency=1000,  # Max concurrent connections
         limit_max_requests=10000,  # Restart worker after N requests (prevents memory leaks)
