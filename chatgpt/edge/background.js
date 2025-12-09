@@ -10,6 +10,19 @@ const DEFAULT_SETTINGS = {
   targetLanguage: 'English'
 };
 
+// Language code to full name mapping (fallback for short codes)
+const LANG_MAP = {
+  'ja': 'Japanese',
+  'en': 'English',
+  'zh-CN': 'Chinese (Simplified)',
+  'zh-TW': 'Chinese (Traditional)',
+  'ko': 'Korean',
+  'vi': 'Vietnamese'
+};
+
+// Convert language code to full name for AI prompt
+const getLanguageName = code => LANG_MAP[code] || code;
+
 // ============================================================================
 // UTILITIES
 // ============================================================================
@@ -217,22 +230,38 @@ async function sendRequest(batch, settings, retries = 2) {
 // MESSAGE HANDLERS
 // ============================================================================
 
+// Track active streaming connections for cleanup
 const activePorts = new Map();
 
-async function handleStreaming(request, port) {
+async function handleStreaming(request, port, portId) {
   try {
     const settings = await getSettings();
     if (!settings.targetEndpoint) throw new Error('Target endpoint not configured');
     if (!settings.username || !settings.password) throw new Error('Credentials not configured');
-    if (request.targetLang) settings.targetLanguage = request.targetLang;
+    // Convert language code to full name for AI prompt
+    if (request.targetLang) settings.targetLanguage = getLanguageName(request.targetLang);
 
     await streamTranslation(request.batch, settings, (idx, trans, cached) => {
-      port.postMessage({ type: 'translation', index: idx, translation: trans, cached: !!cached });
+      // Check if port still active before sending
+      if (activePorts.has(portId)) {
+        try {
+          port.postMessage({ type: 'translation', index: idx, translation: trans, cached: !!cached });
+        } catch (e) {
+          // Port disconnected, clean up
+          activePorts.delete(portId);
+        }
+      }
     }, { preserveFormat: request.preserveFormat || false });
 
-    port.postMessage({ type: 'done' });
+    if (activePorts.has(portId)) {
+      port.postMessage({ type: 'done' });
+    }
   } catch (e) {
-    port.postMessage({ type: 'error', error: e.message });
+    if (activePorts.has(portId)) {
+      try {
+        port.postMessage({ type: 'error', error: e.message });
+      } catch { /* Port already disconnected */ }
+    }
   }
 }
 
@@ -264,12 +293,18 @@ async function handleInline(request) {
 // Long-lived connections for streaming
 chrome.runtime.onConnect.addListener(port => {
   if (port.name !== 'translate-stream') return;
-  const id = Date.now() + Math.random();
-  activePorts.set(id, port);
+  const portId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  activePorts.set(portId, port);
+  
   port.onMessage.addListener(req => {
-    if (req.type === 'translate' && req.batch) handleStreaming(req, port);
+    if (req.type === 'translate' && req.batch) {
+      handleStreaming(req, port, portId);
+    }
   });
-  port.onDisconnect.addListener(() => activePorts.delete(id));
+  
+  port.onDisconnect.addListener(() => {
+    activePorts.delete(portId);
+  });
 });
 
 // One-shot messages

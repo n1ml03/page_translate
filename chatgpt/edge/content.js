@@ -35,8 +35,34 @@
   const STATUS_ID = 'page-translator-status', TOOLTIP_ID = 'page-translator-tooltip';
   const CONCURRENCY = 2, CACHE_MAX = 500, DEBOUNCE_MS = 300, MAX_BATCH = 100, MAX_CHARS = 5000;
 
+  // Full language names used as codes (matching popup.js format)
+  const LANG_NAMES = ['Japanese', 'English', 'Chinese (Simplified)', 'Chinese (Traditional)', 'Korean', 'Vietnamese'];
+  // Legacy short code mapping for backward compatibility
   const LANG_MAP = { 'ja': 'Japanese', 'en': 'English', 'zh-CN': 'Chinese (Simplified)', 'zh-TW': 'Chinese (Traditional)', 'ko': 'Korean', 'vi': 'Vietnamese' };
-  const LANG_REVERSE = Object.fromEntries(Object.entries(LANG_MAP).map(([k, v]) => [v, k]));
+  // Convert any format to full language name
+  const toLangName = code => LANG_MAP[code] || code;
+
+  // Error types must match server (categorize_error + stream/rate limiter)
+  const ERROR_MAP = {
+    UNAUTHORIZED: 'Auth failed', FORBIDDEN: 'Access denied', MODEL_NOT_FOUND: 'Model not found',
+    RATE_LIMIT: 'Rate limited', TIMEOUT: 'Timeout', CONTEXT_LENGTH_EXCEEDED: 'Text too long',
+    BAD_REQUEST: 'Bad request', GATEWAY_ERROR: 'Server unavailable', SERVER_ERROR: 'Server error',
+    UNKNOWN_ERROR: 'Unknown error', CONNECTION_ERROR: 'Connection failed', RATE_LIMITED: 'Too many requests',
+    LOCKED: 'Account locked', ERROR: 'Error',
+    401: 'Auth failed', 403: 'Access denied', 404: 'Not found', 429: 'Rate limited',
+    500: 'Server error', 502: 'Bad gateway', 503: 'Unavailable', 504: 'Timeout'
+  };
+
+  function parsePageError(msg) {
+    if (!msg) return 'Error';
+    msg = String(msg);
+    for (const [k, v] of Object.entries(ERROR_MAP)) {
+      if (msg.includes(k) || msg.toUpperCase().includes(k)) return v;
+    }
+    const m = msg.match(/(\d{3})/);
+    if (m && ERROR_MAP[m[1]]) return ERROR_MAP[m[1]];
+    return msg.length > 40 ? msg.substring(0, 40) + '...' : msg;
+  }
 
   const processed = new WeakSet();
   const cache = new Map();
@@ -162,7 +188,7 @@
   function createStatus() {
     if (document.getElementById(STATUS_ID)) return;
     isTranslating = true;
-    chrome.storage.local.set({ pageTranslationInProgress: true });
+    chrome.storage.local.set({ pageTranslationInProgress: true, pageTranslationStartTime: Date.now() });
     const el = document.createElement('div');
     el.id = STATUS_ID;
     el.style.cssText = 'position:fixed;top:20px;right:20px;background:linear-gradient(135deg,#4285f4,#34a853);color:white;padding:12px 20px;border-radius:24px;font-family:-apple-system,sans-serif;font-size:14px;font-weight:500;box-shadow:0 4px 12px rgba(66,133,244,0.4);z-index:2147483647;display:flex;align-items:center;gap:10px;';
@@ -175,14 +201,20 @@
 
   const updateStatus = (cur, total) => { const el = document.getElementById(STATUS_ID); if (el) el.querySelector('.status-text').textContent = `Translating ${cur}/${total}...`; };
 
-  function showComplete(success, msg) {
+  function showComplete(success, msg, errorDetails = null) {
     const el = document.getElementById(STATUS_ID);
     if (!el) return;
     el.style.background = success ? 'linear-gradient(135deg,#34a853,#0f9d58)' : 'linear-gradient(135deg,#ea4335,#c5221f)';
     const spinner = el.querySelector('div');
     if (spinner) spinner.style.display = 'none';
-    el.querySelector('.status-text').textContent = msg || (success ? 'Done!' : 'Failed');
-    setTimeout(removeStatus, 3000);
+    
+    // Show user-friendly error message
+    let displayMsg = msg || (success ? 'Done!' : 'Failed');
+    if (!success && errorDetails) {
+      displayMsg = parsePageError(errorDetails);
+    }
+    el.querySelector('.status-text').textContent = displayMsg;
+    setTimeout(removeStatus, success ? 3000 : 5000); // Show errors longer
   }
 
   function removeStatus() {
@@ -354,7 +386,7 @@
     if (batch.length) batches.push(batch);
 
     createStatus();
-    let errors = 0, count = 0;
+    let errors = 0, count = 0, lastError = null;
     const total = unique.length;
 
     const textToIdx = new Map();
@@ -376,13 +408,25 @@
             }
             count++;
             updateStatus(count, total);
-          }).catch(e => { errors++; console.error('Translation error:', e); })
+          }).catch(e => { 
+            errors++; 
+            lastError = e.message || String(e);
+            console.error('Translation error:', e); 
+          })
         );
       }
       await Promise.all(promises);
     }
 
-    showComplete(errors === 0, errors === 0 ? 'Translation complete!' : `Done with ${errors} error(s)`);
+    if (errors === 0) {
+      showComplete(true, 'Translation complete!');
+    } else if (count === 0) {
+      // All failed - show the error
+      showComplete(false, null, lastError);
+    } else {
+      // Partial success
+      showComplete(false, `${count}/${total} translated`, lastError);
+    }
   }
 
   // ============================================================================
@@ -469,15 +513,17 @@
   async function loadInlineSettings() {
     return new Promise(resolve => {
       chrome.storage.local.get({ recentLanguages: ['Japanese', 'English', 'Vietnamese'], textTargetLang: 'English' }, result => {
-        const codes = result.recentLanguages.map(n => LANG_REVERSE[n] || n).filter(c => c);
-        const defaultLang = LANG_REVERSE[result.textTargetLang] || 'en';
-        resolve({ recentLanguages: codes, defaultLang });
+        // Use full language names as codes (convert any legacy short codes)
+        const recentLangs = result.recentLanguages.map(n => toLangName(n)).filter(c => c);
+        const defaultLang = toLangName(result.textTargetLang);
+        resolve({ recentLanguages: recentLangs, defaultLang });
       });
     });
   }
 
   async function addToHistory(src, trans, langCode) {
-    const langName = LANG_MAP[langCode] || langCode;
+    // langCode is now the full name (e.g., 'Vietnamese', not 'vi')
+    const langName = toLangName(langCode);
     return new Promise(resolve => {
       chrome.storage.local.get({ translationHistory: [] }, result => {
         const history = [{ id: Date.now(), source: src.substring(0, 200), translation: trans.substring(0, 200), targetLang: langName, timestamp: new Date().toISOString() }, ...(result.translationHistory || [])].slice(0, 20);
@@ -487,12 +533,14 @@
   }
 
   async function updateRecentLangs(langCode) {
-    const langName = LANG_MAP[langCode] || langCode;
+    // langCode is now the full name (e.g., 'Vietnamese', not 'vi')
+    const langName = toLangName(langCode);
     return new Promise(resolve => {
       chrome.storage.local.get({ recentLanguages: [] }, result => {
         let recent = [langName, ...result.recentLanguages.filter(l => l !== langName)].slice(0, 4);
         chrome.storage.local.set({ recentLanguages: recent }, () => {
-          if (inlineTranslator) inlineTranslator.updateRecentLanguages(recent.map(n => LANG_REVERSE[n] || n));
+          // Pass full language names to inline translator
+          if (inlineTranslator) inlineTranslator.updateRecentLanguages(recent);
           resolve(recent);
         });
       });
@@ -530,12 +578,12 @@
       defaultLang: settings.defaultLang,
       recentLanguages: settings.recentLanguages,
       languages: [
-        { code: 'ja', name: 'Japanese', native: '日本語' },
-        { code: 'en', name: 'English', native: 'English' },
-        { code: 'zh-CN', name: 'Chinese Simplified', native: '简体中文' },
-        { code: 'zh-TW', name: 'Chinese Traditional', native: '繁體中文' },
-        { code: 'ko', name: 'Korean', native: '한국어' },
-        { code: 'vi', name: 'Vietnamese', native: 'Tiếng Việt' },
+        { code: 'Japanese', name: 'Japanese' },
+        { code: 'English', name: 'English' },
+        { code: 'Chinese (Simplified)', name: 'Chinese Simplified' },
+        { code: 'Chinese (Traditional)', name: 'Chinese Traditional' },
+        { code: 'Korean', name: 'Korean' },
+        { code: 'Vietnamese', name: 'Vietnamese' },
       ],
       iconUrl: chrome.runtime?.getURL ? chrome.runtime.getURL('images/icon16.png') : null,
       onHistoryAdd: addToHistory
@@ -546,8 +594,9 @@
     chrome.storage.onChanged.addListener((changes, area) => {
       if (area !== 'local' || !inlineTranslator) return;
       if (changes.recentLanguages) {
-        const codes = (changes.recentLanguages.newValue || []).map(n => LANG_REVERSE[n] || n);
-        inlineTranslator.updateRecentLanguages(codes);
+        // Pass full language names to inline translator
+        const langs = (changes.recentLanguages.newValue || []).map(n => toLangName(n));
+        inlineTranslator.updateRecentLanguages(langs);
       }
     });
   }

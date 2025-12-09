@@ -6,20 +6,43 @@ class InlineTranslator {
   static INLINE_TAGS = new Set(['B', 'I', 'U', 'STRONG', 'EM', 'SPAN', 'A', 'FONT', 'SMALL', 'BIG', 'SUB', 'SUP', 'BR', 'IMG', 'CODE', 'MARK', 'DEL', 'INS', 'S']);
   static BLOCK_TAGS = new Set(['P', 'DIV', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'LI', 'TD', 'TH', 'BLOCKQUOTE', 'ARTICLE', 'SECTION']);
 
+  // Error types must match server (categorize_error + stream/rate limiter)
+  static ERROR_MAP = {
+    UNAUTHORIZED: 'Authentication failed', FORBIDDEN: 'Access denied', MODEL_NOT_FOUND: 'Model not found',
+    RATE_LIMIT: 'Rate limited - wait', TIMEOUT: 'Request timeout', CONTEXT_LENGTH_EXCEEDED: 'Text too long',
+    BAD_REQUEST: 'Bad request', GATEWAY_ERROR: 'Server unavailable', SERVER_ERROR: 'Server error',
+    UNKNOWN_ERROR: 'Unknown error', CONNECTION_ERROR: 'Connection failed', RATE_LIMITED: 'Too many requests',
+    LOCKED: 'Account locked', ERROR: 'Translation error',
+    401: 'Auth failed', 403: 'Forbidden', 404: 'Not found', 429: 'Rate limited',
+    500: 'Server error', 502: 'Bad gateway', 503: 'Unavailable', 504: 'Timeout'
+  };
+
+  static parseError(error) {
+    const msg = error?.message || String(error);
+    for (const [k, v] of Object.entries(this.ERROR_MAP)) {
+      if (msg.includes(k) || msg.toUpperCase().includes(k)) return v;
+    }
+    const m = msg.match(/(\d{3})/);
+    if (m && this.ERROR_MAP[m[1]]) return this.ERROR_MAP[m[1]];
+    if (/fetch|network/i.test(msg)) return this.ERROR_MAP.CONNECTION_ERROR;
+    if (/timeout/i.test(msg)) return this.ERROR_MAP.TIMEOUT;
+    return msg.length > 80 ? msg.substring(0, 80) + '...' : msg;
+  }
+
   constructor(opts = {}) {
     this.translateFn = opts.translateFn || this._mock.bind(this);
     this.languages = opts.languages || [
-      { code: 'ja', name: 'Japanese', native: '日本語' },
-      { code: 'en', name: 'English', native: 'English' },
-      { code: 'zh-CN', name: 'Chinese Simplified', native: '简体中文' },
-      { code: 'zh-TW', name: 'Chinese Traditional', native: '繁體中文' },
-      { code: 'ko', name: 'Korean', native: '한국어' },
-      { code: 'vi', name: 'Vietnamese', native: 'Tiếng Việt' },
+      { code: 'Japanese', name: 'Japanese' },
+      { code: 'English', name: 'English' },
+      { code: 'Chinese (Simplified)', name: 'Chinese Simplified' },
+      { code: 'Chinese (Traditional)', name: 'Chinese Traditional' },
+      { code: 'Korean', name: 'Korean' },
+      { code: 'Vietnamese', name: 'Vietnamese' },
     ];
-    this.defaultLang = opts.defaultLang || 'en';
+    this.defaultLang = opts.defaultLang || 'English';
     this.iconUrl = opts.iconUrl || null;
     this.onHistoryAdd = opts.onHistoryAdd || null;
-    this.recentLanguages = opts.recentLanguages || ['en', 'ja', 'vi'];
+    this.recentLanguages = opts.recentLanguages || ['English', 'Japanese', 'Vietnamese'];
 
     this.host = null;
     this.shadow = null;
@@ -351,7 +374,7 @@ class InlineTranslator {
       if (!lang) return;
       const btn = document.createElement('button');
       btn.className = 'it-quick-btn' + (code === this.currentLang ? ' active' : '');
-      btn.textContent = lang.native;
+      btn.textContent = lang.name;
       btn.title = lang.name;
       btn.dataset.lang = code;
       const handler = () => {
@@ -517,7 +540,7 @@ class InlineTranslator {
       if (e.name === 'AbortError' || !this.panel) return;
       transBox.classList.remove('loading');
       transBox.classList.add('error');
-      transBox.textContent = `Error: ${e.message}`;
+      transBox.textContent = InlineTranslator.parseError(e);
       this._addRetry(panel, btns);
     } finally {
       this.isTranslating = false;

@@ -1,6 +1,12 @@
 """
-Page Translator Middleware - Optimized
+Page Translator Middleware - High Concurrency Optimized
 FastAPI server proxying translation requests to LLM API with streaming support.
+
+Optimizations for high concurrency:
+- Request deduplication (coalescing identical in-flight requests)
+- Efficient async locking with timeouts
+- Connection pooling with higher limits
+- Graceful degradation under load
 """
 
 import asyncio
@@ -14,7 +20,7 @@ import time
 import uuid
 from collections import OrderedDict
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator, Dict, List, Optional
+from typing import AsyncGenerator, Dict, List, Optional, Set
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -26,11 +32,11 @@ from pydantic import BaseModel, Field
 # CONFIGURATION
 # ============================================================================
 
-CACHE_MAX_SIZE = int(os.environ.get("CACHE_MAX_SIZE", "5000"))
+CACHE_MAX_SIZE = int(os.environ.get("CACHE_MAX_SIZE", "10000"))  # Increased for high traffic
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "3600"))
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "120"))
-MAX_CONNECTIONS = int(os.environ.get("MAX_CONNECTIONS", "100"))
-MAX_KEEPALIVE = int(os.environ.get("MAX_KEEPALIVE", "50"))
+MAX_CONNECTIONS = int(os.environ.get("MAX_CONNECTIONS", "500"))  # Increased for concurrency
+MAX_KEEPALIVE = int(os.environ.get("MAX_KEEPALIVE", "100"))  # Increased
 CONNECT_TIMEOUT = int(os.environ.get("CONNECT_TIMEOUT", "10"))
 RATE_LIMIT_RPM = int(os.environ.get("RATE_LIMIT_RPM", "120"))
 RATE_LIMIT_BURST = int(os.environ.get("RATE_LIMIT_BURST", "20"))
@@ -38,6 +44,9 @@ AUTH_FAILURE_MAX = int(os.environ.get("AUTH_FAILURE_MAX_ATTEMPTS", "10"))
 AUTH_LOCKOUT_SEC = int(os.environ.get("AUTH_FAILURE_LOCKOUT_SECONDS", "300"))
 AUTH_WINDOW_SEC = int(os.environ.get("AUTH_FAILURE_WINDOW_SECONDS", "60"))
 INSTANCE_ID = os.environ.get("INSTANCE_ID", str(uuid.uuid4())[:8])
+DEDUP_ENABLED = os.environ.get("DEDUP_ENABLED", "true").lower() == "true"
+LOCK_TIMEOUT = float(os.environ.get("LOCK_TIMEOUT", "5.0"))  # Max wait for lock
+MAX_CONCURRENT_API_CALLS = int(os.environ.get("MAX_CONCURRENT_API_CALLS", "50"))  # Limit upstream pressure
 
 ALLOWED_ORIGINS = os.environ.get(
     "ALLOWED_ORIGINS",
@@ -45,6 +54,7 @@ ALLOWED_ORIGINS = os.environ.get(
 ).split(",")
 
 http_client: Optional[httpx.AsyncClient] = None
+api_semaphore: Optional[asyncio.Semaphore] = None
 
 
 # ============================================================================
@@ -54,7 +64,7 @@ http_client: Optional[httpx.AsyncClient] = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global http_client
+    global http_client, api_semaphore
     http_client = httpx.AsyncClient(
         limits=httpx.Limits(
             max_connections=MAX_CONNECTIONS,
@@ -65,7 +75,9 @@ async def lifespan(app: FastAPI):
         verify=False,
         http2=True,
     )
-    print(f"[{INSTANCE_ID}] HTTP client initialized")
+    # Semaphore limits concurrent API calls to prevent overwhelming upstream
+    api_semaphore = asyncio.Semaphore(MAX_CONCURRENT_API_CALLS)
+    print(f"[{INSTANCE_ID}] HTTP client initialized (max {MAX_CONCURRENT_API_CALLS} concurrent API calls)")
     yield
     if http_client:
         await http_client.aclose()
@@ -80,11 +92,14 @@ app = FastAPI(title="Page Translator Middleware", lifespan=lifespan)
 
 
 class TranslationCache:
+    """LRU cache with TTL expiration, periodic cleanup, and lock timeout."""
+
     def __init__(self, max_size: int = CACHE_MAX_SIZE, ttl: int = CACHE_TTL):
         self.max_size, self.ttl = max_size, ttl
         self._cache: OrderedDict = OrderedDict()
         self._lock = asyncio.Lock()
-        self._hits = self._misses = 0
+        self._hits = self._misses = self._timeouts = 0
+        self._last_cleanup = time.time()
 
     def _key(self, texts: List[str], lang: str, model: str) -> str:
         return hashlib.sha256(
@@ -93,32 +108,55 @@ class TranslationCache:
 
     async def get(self, texts: List[str], lang: str, model: str) -> Optional[List[str]]:
         key = self._key(texts, lang, model)
-        async with self._lock:
-            if key in self._cache and time.time() - self._cache[key]["ts"] < self.ttl:
-                self._cache.move_to_end(key)
-                self._hits += 1
-                return self._cache[key]["data"]
-            self._cache.pop(key, None)
-            self._misses += 1
+        try:
+            async with asyncio.timeout(LOCK_TIMEOUT):
+                async with self._lock:
+                    now = time.time()
+                    if now - self._last_cleanup > CLEANUP_INTERVAL:
+                        self._cleanup_expired(now)
+                        self._last_cleanup = now
+
+                    if key in self._cache and now - self._cache[key]["ts"] < self.ttl:
+                        self._cache.move_to_end(key)
+                        self._hits += 1
+                        return self._cache[key]["data"]
+                    self._cache.pop(key, None)
+                    self._misses += 1
+        except asyncio.TimeoutError:
+            self._timeouts += 1
         return None
 
     async def set(
         self, texts: List[str], lang: str, model: str, translations: List[str]
     ):
         key = self._key(texts, lang, model)
-        async with self._lock:
-            self._cache[key] = {"data": translations, "ts": time.time()}
-            self._cache.move_to_end(key)
-            while len(self._cache) > self.max_size:
-                self._cache.popitem(last=False)
+        try:
+            async with asyncio.timeout(LOCK_TIMEOUT):
+                async with self._lock:
+                    self._cache[key] = {"data": translations, "ts": time.time()}
+                    self._cache.move_to_end(key)
+                    while len(self._cache) > self.max_size:
+                        self._cache.popitem(last=False)
+        except asyncio.TimeoutError:
+            pass  # Skip caching if lock contention is too high
+
+    def _cleanup_expired(self, now: float):
+        """Remove expired cache entries."""
+        expired = [k for k, v in self._cache.items() if now - v["ts"] > self.ttl]
+        for key in expired:
+            del self._cache[key]
+        if expired:
+            print(f"{INSTANCE_ID}: cleaned {len(expired)} expired cache entries")
 
     async def stats(self) -> Dict:
         async with self._lock:
             total = self._hits + self._misses
             return {
                 "size": len(self._cache),
+                "max_size": self.max_size,
                 "hits": self._hits,
                 "misses": self._misses,
+                "timeouts": self._timeouts,
                 "hit_rate": f"{(self._hits / total * 100) if total else 0:.1f}%",
             }
 
@@ -127,20 +165,101 @@ cache = TranslationCache()
 
 
 # ============================================================================
-# RATE LIMITER
+# REQUEST DEDUPLICATION (Coalescing)
 # ============================================================================
 
 
+class RequestDeduplicator:
+    """
+    Coalesces identical in-flight requests to avoid duplicate API calls.
+    
+    If User A and User B request the same translation simultaneously,
+    only one API call is made and both get the result.
+    """
+
+    def __init__(self):
+        self._pending: Dict[str, asyncio.Future] = {}
+        self._lock = asyncio.Lock()
+        self._coalesced = 0  # Requests that were deduplicated
+
+    def _key(self, texts: List[str], lang: str, model: str) -> str:
+        return hashlib.sha256(
+            json.dumps({"t": texts, "l": lang, "m": model}, sort_keys=True).encode()
+        ).hexdigest()
+
+    async def get_or_create(
+        self, texts: List[str], lang: str, model: str
+    ) -> tuple[Optional[asyncio.Future], bool]:
+        """
+        Returns (future, is_owner).
+        - If is_owner=True: caller should execute the request and set future result
+        - If is_owner=False: caller should await the future for result
+        """
+        if not DEDUP_ENABLED:
+            return None, True
+
+        key = self._key(texts, lang, model)
+        async with self._lock:
+            if key in self._pending:
+                self._coalesced += 1
+                return self._pending[key], False
+            future = asyncio.get_event_loop().create_future()
+            self._pending[key] = future
+            return future, True
+
+    async def complete(
+        self, texts: List[str], lang: str, model: str, result: Optional[List[str]], error: Optional[str] = None
+    ):
+        """Mark request as complete, notify all waiters."""
+        if not DEDUP_ENABLED:
+            return
+
+        key = self._key(texts, lang, model)
+        async with self._lock:
+            future = self._pending.pop(key, None)
+            if future and not future.done():
+                if error:
+                    future.set_exception(Exception(error))
+                else:
+                    future.set_result(result)
+
+    async def stats(self) -> Dict:
+        async with self._lock:
+            return {
+                "pending": len(self._pending),
+                "coalesced": self._coalesced,
+            }
+
+
+deduplicator = RequestDeduplicator()
+
+
+# ============================================================================
+# RATE LIMITER
+# ============================================================================
+
+CLEANUP_INTERVAL = int(os.environ.get("CLEANUP_INTERVAL", "300"))  # 5 minutes
+CLIENT_TTL = int(os.environ.get("CLIENT_TTL", "3600"))  # 1 hour
+
+
 class RateLimiter:
+    """Token bucket rate limiter with automatic cleanup of stale clients."""
+
     def __init__(self, rpm: int = RATE_LIMIT_RPM, burst: int = RATE_LIMIT_BURST):
         self.rate, self.burst = rpm / 60.0, burst
         self._tokens: Dict[str, float] = {}
         self._last: Dict[str, float] = {}
         self._lock = asyncio.Lock()
+        self._last_cleanup = time.time()
 
     async def acquire(self, client: str = "global") -> tuple[bool, float]:
         async with self._lock:
             now = time.time()
+            # Periodic cleanup of stale clients
+            if now - self._last_cleanup > CLEANUP_INTERVAL:
+                self._cleanup_stale(now)
+                self._last_cleanup = now
+
             if client not in self._tokens:
                 self._tokens[client], self._last[client] = self.burst, now
             self._tokens[client] = min(
@@ -153,6 +272,15 @@ class RateLimiter:
                 return True, 0
             return False, (1 - self._tokens[client]) / self.rate
 
+    def _cleanup_stale(self, now: float):
+        """Remove clients inactive for more than CLIENT_TTL seconds."""
+        stale = [c for c, t in self._last.items() if now - t > CLIENT_TTL]
+        for client in stale:
+            self._tokens.pop(client, None)
+            self._last.pop(client, None)
+        if stale:
+            print(f"{INSTANCE_ID}: cleaned up {len(stale)} stale rate limit entries")
+
 
 limiter = RateLimiter()
 
@@ -163,15 +291,24 @@ limiter = RateLimiter()
 
 
 class AuthLimiter:
+    """Tracks authentication failures with automatic cleanup of stale entries."""
+
     def __init__(self):
         self._failures: Dict[str, List[float]] = {}
         self._lockouts: Dict[str, float] = {}
         self._lock = asyncio.Lock()
+        self._last_cleanup = time.time()
 
     async def is_locked(self, client: str) -> tuple[bool, float]:
         async with self._lock:
+            now = time.time()
+            # Periodic cleanup
+            if now - self._last_cleanup > CLEANUP_INTERVAL:
+                self._cleanup_stale(now)
+                self._last_cleanup = now
+
             if client in self._lockouts:
-                remaining = self._lockouts[client] - time.time()
+                remaining = self._lockouts[client] - now
                 if remaining > 0:
                     return True, remaining
                 del self._lockouts[client]
@@ -195,6 +332,23 @@ class AuthLimiter:
         async with self._lock:
             self._failures.pop(client, None)
             self._lockouts.pop(client, None)
+
+    def _cleanup_stale(self, now: float):
+        """Remove expired lockouts and stale failure records."""
+        # Clean expired lockouts
+        expired = [c for c, t in self._lockouts.items() if now > t]
+        for client in expired:
+            del self._lockouts[client]
+            self._failures.pop(client, None)
+        # Clean stale failure records (no activity for CLIENT_TTL)
+        stale = [
+            c for c, timestamps in self._failures.items()
+            if not timestamps or now - max(timestamps) > CLIENT_TTL
+        ]
+        for client in stale:
+            del self._failures[client]
+        if expired or stale:
+            print(f"{INSTANCE_ID}: cleaned {len(expired)} lockouts, {len(stale)} stale auth entries")
 
 
 auth_limiter = AuthLimiter()
@@ -370,7 +524,11 @@ async def translate_head():
 
 @app.get("/stats")
 async def stats():
-    return {"instance_id": INSTANCE_ID, "cache": await cache.stats()}
+    return {
+        "instance_id": INSTANCE_ID,
+        "cache": await cache.stats(),
+        "deduplication": await deduplicator.stats(),
+    }
 
 
 # ============================================================================
@@ -397,50 +555,55 @@ async def stream_translations(
         return
 
     try:
-        async with http_client.stream(
-            "POST", request.target_endpoint, json=payload, headers=headers
-        ) as response:
-            if response.status_code != 200:
-                text = (await response.aread()).decode()
-                err_type, err_msg = categorize_error(
-                    response.status_code, text, request.model
-                )
-                if response.status_code in (401, 403):
-                    locked, left = await auth_limiter.record_failure(client_id)
-                    err_msg = (
-                        "Account locked"
-                        if locked
-                        else f"{err_msg} ({left} attempts left)"
+        if not api_semaphore:
+            yield f"data: {json.dumps({'error': {'type': 'SERVER_ERROR', 'message': 'Server not initialized'}})}\n\n"
+            return
+
+        async with api_semaphore:
+            async with http_client.stream(
+                "POST", request.target_endpoint, json=payload, headers=headers
+            ) as response:
+                if response.status_code != 200:
+                    text = (await response.aread()).decode()
+                    err_type, err_msg = categorize_error(
+                        response.status_code, text, request.model
                     )
-                yield f"data: {json.dumps({'error': {'type': err_type, 'message': err_msg}})}\n\n"
-                return
+                    if response.status_code in (401, 403):
+                        locked, left = await auth_limiter.record_failure(client_id)
+                        err_msg = (
+                            "Account locked"
+                            if locked
+                            else f"{err_msg} ({left} attempts left)"
+                        )
+                    yield f"data: {json.dumps({'error': {'type': err_type, 'message': err_msg}})}\n\n"
+                    return
 
-            await auth_limiter.record_success(client_id)
-            parser = StreamingJSONParser()
-            translations = []
+                await auth_limiter.record_success(client_id)
+                parser = StreamingJSONParser()
+                translations = []
 
-            async for line in response.aiter_lines():
-                if not line:
-                    continue
-                if line.startswith("data: "):
-                    line = line[6:]
-                if line == "[DONE]":
-                    break
-                try:
-                    data = json.loads(line)
-                    content = data.get("system_response", "") or data.get("choices", [{}])[
-                        0
-                    ].get("delta", {}).get("system_response", "")
-                    if content:
-                        for item in parser.feed(content):
-                            translations.append(item)
-                            yield f"data: {json.dumps({'index': len(translations) - 1, 'translation': item})}\n\n"
-                except json.JSONDecodeError:
-                    continue
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
+                    if line.startswith("data: "):
+                        line = line[6:]
+                    if line == "[DONE]":
+                        break
+                    try:
+                        data = json.loads(line)
+                        content = data.get("system_response", "") or data.get("choices", [{}])[
+                            0
+                        ].get("delta", {}).get("system_response", "")
+                        if content:
+                            for item in parser.feed(content):
+                                translations.append(item)
+                                yield f"data: {json.dumps({'index': len(translations) - 1, 'translation': item})}\n\n"
+                    except json.JSONDecodeError:
+                        continue
 
-            if texts and len(translations) == len(texts):
-                await cache.set(texts, lang, request.model, translations)
-            yield f"data: {json.dumps({'done': True, 'total': len(translations)})}\n\n"
+                if texts and len(translations) == len(texts):
+                    await cache.set(texts, lang, request.model, translations)
+                yield f"data: {json.dumps({'done': True, 'total': len(translations)})}\n\n"
 
     except httpx.ConnectError:
         yield f"data: {json.dumps({'error': {'type': 'CONNECTION_ERROR', 'message': 'Failed to connect'}})}\n\n"
@@ -530,6 +693,32 @@ async def translate(request: TranslateRequest, req: Request):
 async def handle_sync_request(
     request: TranslateRequest, texts: Optional[List[str]], lang: str, client_id: str
 ) -> JSONResponse:
+    """
+    Handle synchronous translation with request deduplication.
+    
+    If multiple users request the same translation simultaneously,
+    only one API call is made and all users receive the same result.
+    """
+    # Try deduplication for batch translations
+    future, is_owner = None, True
+    if texts:
+        future, is_owner = await deduplicator.get_or_create(texts, lang, request.model)
+        if not is_owner and future:
+            # Another request is already in flight, wait for it
+            try:
+                result = await asyncio.wait_for(future, timeout=HTTP_TIMEOUT)
+                if result:
+                    return JSONResponse(
+                        content={
+                            "choices": [{"message": {"role": "assistant", "content": json.dumps(result)}}],
+                            "model": request.model,
+                            "coalesced": True,
+                        },
+                        headers={"X-Instance-ID": INSTANCE_ID},
+                    )
+            except (asyncio.TimeoutError, Exception):
+                pass  # Fallback to making our own request
+
     headers = {
         "Authorization": basic_auth(request.username, request.password),
         "Content-Type": "application/json",
@@ -541,13 +730,17 @@ async def handle_sync_request(
         "top_p": request.top_p,
     }
 
-    if not http_client:
-        raise HTTPException(status_code=503, detail="HTTP client not initialized")
+    if not http_client or not api_semaphore:
+        if texts and is_owner:
+            await deduplicator.complete(texts, lang, request.model, None, "Server not initialized")
+        raise HTTPException(status_code=503, detail="Server not initialized")
 
     try:
-        response = await http_client.post(
-            request.target_endpoint, json=payload, headers=headers
-        )
+        # Use semaphore to limit concurrent API calls
+        async with api_semaphore:
+            response = await http_client.post(
+                request.target_endpoint, json=payload, headers=headers
+            )
 
         if response.status_code != 200:
             err_type, err_msg = categorize_error(
@@ -558,6 +751,8 @@ async def handle_sync_request(
                 err_msg = (
                     "Account locked" if locked else f"{err_msg} ({left} attempts left)"
                 )
+            if texts and is_owner:
+                await deduplicator.complete(texts, lang, request.model, None, err_msg)
             return JSONResponse(
                 status_code=response.status_code,
                 content={"error": {"type": err_type, "message": err_msg}},
@@ -570,21 +765,25 @@ async def handle_sync_request(
         # Log token usage
         usage = data.get("token_usage", {})
         print(f"{INSTANCE_ID}: token_usage: {usage}")
-        # log_tokens(usage)
 
         # Extract content
         content = data.get("system_response", "") or data.get("choices", [{}])[0].get(
             "message", {}
         ).get("system_response", "")
 
-        # Cache if applicable
+        # Cache and complete deduplication
+        translations = None
         if texts and content:
             try:
                 trans = json.loads(content)
                 if isinstance(trans, list) and len(trans) == len(texts):
+                    translations = trans
                     await cache.set(texts, lang, request.model, trans)
             except (json.JSONDecodeError, KeyError):
                 pass
+
+        if texts and is_owner:
+            await deduplicator.complete(texts, lang, request.model, translations)
 
         return JSONResponse(
             content={
@@ -596,8 +795,12 @@ async def handle_sync_request(
         )
 
     except httpx.ConnectError:
+        if texts and is_owner:
+            await deduplicator.complete(texts, lang, request.model, None, "Connection failed")
         raise HTTPException(status_code=502, detail="Connection failed")
     except httpx.TimeoutException:
+        if texts and is_owner:
+            await deduplicator.complete(texts, lang, request.model, None, "Timeout")
         raise HTTPException(status_code=504, detail="Timeout")
 
 
@@ -607,20 +810,55 @@ async def handle_sync_request(
 
 if __name__ == "__main__":
     import argparse
+    import multiprocessing
 
     import uvicorn
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default=None)
-    parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--workers", type=int, default=1)
+    parser = argparse.ArgumentParser(description="Page Translator Middleware Server")
+    parser.add_argument("--host", default=None, help="Host to bind to")
+    parser.add_argument("--port", type=int, default=8000, help="Port to bind to")
+    parser.add_argument(
+        "--workers", 
+        type=int, 
+        default=None,
+        help="Number of worker processes (default: CPU cores, max 4)"
+    )
     args = parser.parse_args()
 
+    # Auto-detect workers based on CPU cores (capped at 4 for most use cases)
+    if args.workers is None:
+        args.workers = min(multiprocessing.cpu_count(), 4)
+
     host = args.host or get_lan_ip()
-    print(f"{'=' * 50}\nPage Translator Middleware\n{'=' * 50}")
-    print(f"Instance: {INSTANCE_ID} | Server: http://{host}:{args.port}")
-    print(f"{'=' * 50}")
+    
+    print(f"\n{'=' * 60}")
+    print(f"  Page Translator Middleware - High Concurrency Edition")
+    print(f"{'=' * 60}")
+    print(f"  Instance:    {INSTANCE_ID}")
+    print(f"  Server:      http://{host}:{args.port}")
+    print(f"  Workers:     {args.workers}")
+    print(f"  Connections: {MAX_CONNECTIONS} max")
+    print(f"  Cache:       {CACHE_MAX_SIZE} entries, {CACHE_TTL}s TTL")
+    print(f"  Dedup:       {'enabled' if DEDUP_ENABLED else 'disabled'}")
+    print(f"{'=' * 60}")
+    print(f"  Endpoints:")
+    print(f"    POST /proxy/translate  - Translation endpoint")
+    print(f"    GET  /health           - Health check")
+    print(f"    GET  /stats            - Cache & dedup statistics")
+    print(f"{'=' * 60}\n")
+
+    # Note: With multiple workers, each worker has its own cache/deduplicator
+    # For true horizontal scaling, use Redis for shared state
+    if args.workers > 1:
+        print(f"⚠️  Note: Running {args.workers} workers with in-memory cache.")
+        print(f"   Each worker has separate cache. For shared cache, use Redis.\n")
 
     uvicorn.run(
-        "server:app", host=host, port=args.port, workers=args.workers, access_log=True
+        "server:app", 
+        host=host, 
+        port=args.port, 
+        workers=args.workers, 
+        access_log=True,
+        limit_concurrency=1000,  # Max concurrent connections
+        limit_max_requests=10000,  # Restart worker after N requests (prevents memory leaks)
     )

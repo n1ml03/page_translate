@@ -15,15 +15,66 @@ const DEFAULT_SETTINGS = {
 };
 
 const LANGUAGES = [
-  { code: 'Japanese', name: 'Japanese', native: '日本語' },
-  { code: 'English', name: 'English', native: 'English' },
-  { code: 'Chinese (Simplified)', name: 'Chinese Simplified', native: '简体中文' },
-  { code: 'Chinese (Traditional)', name: 'Chinese Traditional', native: '繁體中文' },
-  { code: 'Korean', name: 'Korean', native: '한국어' },
-  { code: 'Vietnamese', name: 'Vietnamese', native: 'Tiếng Việt' }
+  { code: 'Japanese', name: 'Japanese' },
+  { code: 'English', name: 'English' },
+  { code: 'Chinese (Simplified)', name: 'Chinese Simplified' },
+  { code: 'Chinese (Traditional)', name: 'Chinese Traditional' },
+  { code: 'Korean', name: 'Korean' },
+  { code: 'Vietnamese', name: 'Vietnamese' }
 ];
 
-const MAX_TEXT = 5000, MAX_HISTORY = 20, MAX_RECENT = 3, TIMEOUT = 5000;
+const MAX_TEXT = 5000, MAX_HISTORY = 20, MAX_RECENT = 3, TIMEOUT = 5000, VERIFY_TIMEOUT = 10000;
+
+// Global connection state
+let isConnected = false;
+
+// Error type to user-friendly message mapping (must match server error types)
+const ERROR_MAP = {
+  // Server error types from categorize_error()
+  UNAUTHORIZED: 'Authentication failed - check credentials',
+  FORBIDDEN: 'Access denied',
+  MODEL_NOT_FOUND: 'Model not found - check settings',
+  RATE_LIMIT: 'Rate limited - please wait',
+  TIMEOUT: 'Request timeout',
+  CONTEXT_LENGTH_EXCEEDED: 'Text too long',
+  BAD_REQUEST: 'Bad request',
+  GATEWAY_ERROR: 'Server unavailable',
+  SERVER_ERROR: 'Server error',
+  UNKNOWN_ERROR: 'Unknown error',
+  // Server error types from stream/rate limiter
+  CONNECTION_ERROR: 'Connection failed - check network',
+  RATE_LIMITED: 'Too many requests - wait and retry',
+  LOCKED: 'Account locked - wait before retry',
+  ERROR: 'Translation error',
+  // HTTP status codes fallback
+  401: 'Auth failed', 403: 'Access denied', 404: 'Not found',
+  429: 'Rate limited', 500: 'Server error', 502: 'Bad gateway',
+  503: 'Service unavailable', 504: 'Timeout'
+};
+
+function parseErrorMessage(error, data = null) {
+  // Server error response with type
+  if (data?.error) {
+    const type = data.error.type || data.error.code;
+    const msg = data.error.message || '';
+    return ERROR_MAP[type] ? `${ERROR_MAP[type]}${msg ? ': ' + msg : ''}` : (msg || 'Translation failed');
+  }
+  // HTTP status
+  if (error?.status) {
+    const s = error.status;
+    return ERROR_MAP[s] || (s >= 500 ? `Server error (${s})` : `Request failed (${s})`);
+  }
+  // Error object
+  if (error instanceof Error) {
+    const msg = error.message || '';
+    if (msg.includes('fetch') || msg.includes('Network')) return ERROR_MAP.CONNECTION_ERROR;
+    if (/timeout/i.test(msg)) return ERROR_MAP.TIMEOUT;
+    const m = msg.match(/(\d{3})/);
+    if (m && ERROR_MAP[m[1]]) return ERROR_MAP[m[1]];
+    return msg;
+  }
+  return 'Translation failed';
+}
 
 const saveSettings = s => new Promise((res, rej) => chrome.storage.local.set(s, () => chrome.runtime.lastError ? rej(chrome.runtime.lastError) : res()));
 const loadSettings = () => new Promise((res, rej) => chrome.storage.local.get(DEFAULT_SETTINGS, r => chrome.runtime.lastError ? rej(chrome.runtime.lastError) : res(r)));
@@ -87,6 +138,24 @@ function updateStatus({ status, message }) {
   el.classList.add(status);
   const text = el.querySelector('.status-text');
   if (text) text.textContent = message;
+  
+  // Update global state and button states
+  isConnected = status === 'connected';
+  updateTranslateButtons();
+}
+
+function updateTranslateButtons() {
+  const translateBtn = document.getElementById('translateBtn');
+  const textTranslateBtn = document.getElementById('textTranslateBtn');
+  
+  if (translateBtn) {
+    translateBtn.disabled = !isConnected;
+    translateBtn.title = isConnected ? 'Translate current page' : 'Not connected - check settings';
+  }
+  if (textTranslateBtn) {
+    textTranslateBtn.disabled = !isConnected;
+    textTranslateBtn.title = isConnected ? 'Translate text' : 'Not connected - check settings';
+  }
 }
 
 function togglePassword(id) {
@@ -119,17 +188,93 @@ async function checkConnection(url) {
   }
 }
 
+// Verify connection with credentials by sending a minimal test request
+async function verifyConnection(settings = null) {
+  if (!settings) {
+    try { settings = await loadCredentials(); } 
+    catch { return { status: 'unconfigured', message: 'Not configured' }; }
+  }
+  
+  const { isValid } = validateSettings(settings);
+  if (!isValid) return { status: 'unconfigured', message: 'Not configured' };
+  
+  try {
+    const ctrl = new AbortController();
+    setTimeout(() => ctrl.abort(), VERIFY_TIMEOUT);
+    
+    // Send a minimal test request to verify credentials
+    const res = await fetch(settings.proxyUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: ctrl.signal,
+      body: JSON.stringify({
+        target_endpoint: settings.targetEndpoint,
+        username: settings.username,
+        password: settings.password,
+        model: settings.model || DEFAULT_SETTINGS.model,
+        system_prompt: 'Reply with: OK',
+        user_input: 'test',
+        temperature: 0,
+        top_p: 1,
+        stream: false
+      })
+    });
+    
+    const data = await res.json().catch(() => ({}));
+    
+    if (res.ok) {
+      return { status: 'connected', message: 'Connected' };
+    }
+    
+    // Handle specific error types
+    const errType = data?.error?.type;
+    if (res.status === 401 || errType === 'UNAUTHORIZED') {
+      return { status: 'disconnected', message: 'Invalid credentials' };
+    }
+    if (res.status === 403 || errType === 'FORBIDDEN') {
+      return { status: 'disconnected', message: 'Access denied' };
+    }
+    if (res.status === 429 || errType === 'RATE_LIMIT' || errType === 'RATE_LIMITED' || errType === 'LOCKED') {
+      // Rate limited but credentials are valid
+      return { status: 'connected', message: 'Connected (rate limited)' };
+    }
+    if (res.status === 404 || errType === 'MODEL_NOT_FOUND') {
+      return { status: 'disconnected', message: 'Model not found' };
+    }
+    if (res.status >= 500) {
+      return { status: 'disconnected', message: 'Server error' };
+    }
+    
+    return { status: 'disconnected', message: data?.error?.message || 'Connection failed' };
+  } catch (e) {
+    if (e.name === 'AbortError') return { status: 'disconnected', message: 'Timeout' };
+    if (e.message?.includes('fetch') || e.message?.includes('Network')) {
+      return { status: 'disconnected', message: 'Cannot connect' };
+    }
+    return { status: 'disconnected', message: 'Connection failed' };
+  }
+}
+
 const openModal = () => document.getElementById('settingsModal')?.classList.remove('hidden');
 const closeModal = () => document.getElementById('settingsModal')?.classList.add('hidden');
 
 async function testConnection() {
-  const url = document.getElementById('proxyUrl').value;
   const result = document.getElementById('connectionResult');
   const btn = document.getElementById('testConnectionBtn');
   setLoading(btn, true);
   result.textContent = 'Testing...';
   result.className = 'connection-result checking';
-  const s = await checkConnection(url);
+  
+  // Get current form values for testing
+  const testSettings = {
+    proxyUrl: document.getElementById('proxyUrl').value,
+    targetEndpoint: document.getElementById('targetEndpoint').value,
+    username: document.getElementById('username').value,
+    password: document.getElementById('password').value,
+    model: document.getElementById('model').value
+  };
+  
+  const s = await verifyConnection(testSettings);
   result.textContent = s.message;
   result.className = `connection-result ${s.status}`;
   setLoading(btn, false);
@@ -149,10 +294,10 @@ async function saveSettingsHandler() {
   setLoading(document.getElementById('saveSettingsBtn'), true);
   try {
     await saveCredentials(settings);
-    showToast('Settings saved!', 'success');
+    showToast('Settings saved! Verifying...', 'success');
     closeModal();
-    updateStatus({ status: 'checking', message: 'Checking...' });
-    updateStatus(await checkConnection(settings.proxyUrl));
+    updateStatus({ status: 'checking', message: 'Verifying...' });
+    updateStatus(await verifyConnection(settings));
   } catch { showToast('Failed to save', 'error'); }
   finally { setLoading(document.getElementById('saveSettingsBtn'), false); }
 }
@@ -350,6 +495,7 @@ async function translateText() {
   const lang = document.getElementById('textTargetLang').value;
   const btn = document.getElementById('textTranslateBtn');
 
+  if (!isConnected) { showToast('Not connected - check settings', 'error'); return openModal(); }
   if (!src.trim()) return showToast('Enter text', 'error');
   if (src.length > MAX_TEXT) return showToast(`Max ${MAX_TEXT} chars`, 'error');
 
@@ -376,8 +522,11 @@ async function translateText() {
         stream: false
       })
     });
-    if (!res.ok) throw new Error(`Error: ${res.status}`);
     const data = await res.json();
+    if (!res.ok) {
+      const errorMsg = parseErrorMessage(res, data);
+      throw new Error(errorMsg);
+    }
     const trans = data.choices?.[0]?.message?.content || '';
     outEl.innerText = trans;
 
@@ -387,7 +536,8 @@ async function translateText() {
     chrome.storage.local.set({ textTargetLang: lang });
     saveTextState();
   } catch (e) {
-    showToast(`Failed: ${e.message}`, 'error');
+    const errorMsg = parseErrorMessage(e);
+    showToast(errorMsg, 'error', 3000);
     outEl.textContent = '';
   } finally {
     showProgress(false);
@@ -466,51 +616,77 @@ function restoreTextState() {
   });
 }
 
+// Lock to prevent race condition on rapid clicks
+let _translateLock = false;
+
 async function translatePage() {
-  const settings = await loadCredentials();
-  const lang = document.getElementById('targetLanguage').value;
-  const btn = document.getElementById('translateBtn');
-
-  if (!validateSettings(settings).isValid) { showToast('Configure settings first', 'error'); return openModal(); }
-
-  const { pageTranslationInProgress } = await new Promise(resolve => 
-    chrome.storage.local.get({ pageTranslationInProgress: false }, resolve)
-  );
-  if (pageTranslationInProgress) {
+  // Immediate lock to prevent race condition
+  if (_translateLock) {
     showToast('Translation in progress...', 'info');
     return;
   }
+  _translateLock = true;
 
-  // Disable button immediately and set flag to prevent spam clicks
+  const btn = document.getElementById('translateBtn');
   setLoading(btn, true);
-  await chrome.storage.local.set({ pageTranslationInProgress: true });
-  
+
   try {
+    const settings = await loadCredentials();
+    const lang = document.getElementById('targetLanguage').value;
+
+    if (!isConnected) {
+      showToast('Not connected - check settings', 'error');
+      openModal();
+      return;
+    }
+    if (!validateSettings(settings).isValid) {
+      showToast('Configure settings first', 'error');
+      openModal();
+      return;
+    }
+
+    // Check storage flag (may be stale from crashed content script)
+    const { pageTranslationInProgress, pageTranslationStartTime } = await new Promise(resolve => 
+      chrome.storage.local.get({ pageTranslationInProgress: false, pageTranslationStartTime: 0 }, resolve)
+    );
+    
+    // Auto-reset stale flag (older than 5 minutes)
+    const isStale = pageTranslationStartTime && Date.now() - pageTranslationStartTime > 300000;
+    if (pageTranslationInProgress && !isStale) {
+      showToast('Translation in progress...', 'info');
+      return;
+    }
+
+    // Set flag with timestamp for staleness detection
+    await chrome.storage.local.set({ 
+      pageTranslationInProgress: true, 
+      pageTranslationStartTime: Date.now() 
+    });
+    
     await saveSettings({ targetLanguage: lang });
     await updateRecent(lang);
+    
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab) {
       await chrome.storage.local.set({ pageTranslationInProgress: false });
-      setLoading(btn, false);
-      return showToast('No active tab', 'error');
+      showToast('No active tab', 'error');
+      return;
     }
 
     chrome.tabs.sendMessage(tab.id, { action: 'translate' }, res => {
       if (chrome.runtime.lastError) {
         chrome.scripting.executeScript({ target: { tabId: tab.id, allFrames: true }, files: ['content.js'] })
           .then(() => setTimeout(() => chrome.tabs.sendMessage(tab.id, { action: 'translate' }), 100))
-          .catch(() => {
-            chrome.storage.local.set({ pageTranslationInProgress: false });
-            setLoading(btn, false);
-          });
+          .catch(() => chrome.storage.local.set({ pageTranslationInProgress: false }));
       }
     });
     showToast('Translation started!', 'success');
-    // Don't re-enable button here - content script will set pageTranslationInProgress to false when done
   } catch (e) {
     showToast(`Failed: ${e.message}`, 'error');
     await chrome.storage.local.set({ pageTranslationInProgress: false });
-    setLoading(btn, false);
+  } finally {
+    _translateLock = false;
+    // Button state managed by storage listener
   }
 }
 
@@ -520,7 +696,13 @@ async function updateTranslateButtonState() {
   const { pageTranslationInProgress } = await new Promise(resolve => 
     chrome.storage.local.get({ pageTranslationInProgress: false }, resolve)
   );
-  setLoading(btn, pageTranslationInProgress);
+  // Only enable if connected and not in progress
+  if (pageTranslationInProgress) {
+    setLoading(btn, true);
+  } else {
+    btn.disabled = !isConnected;
+    btn.classList.remove('loading');
+  }
 }
 
 
@@ -548,7 +730,10 @@ async function init() {
   document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
 
   document.getElementById('translateBtn')?.addEventListener('click', translatePage);
-  document.getElementById('targetLanguage')?.addEventListener('change', e => updateRecent(e.target.value).then(r => renderQuickLangs('pageQuickLangs', e.target.value, r, pageQuickSelect)));
+  document.getElementById('targetLanguage')?.addEventListener('change', e => {
+    chrome.storage.local.set({ targetLanguage: e.target.value });
+    updateRecent(e.target.value).then(r => renderQuickLangs('pageQuickLangs', e.target.value, r, pageQuickSelect));
+  });
 
   document.getElementById('sourceText')?.addEventListener('input', () => { updateCharCount(); saveTextState(); });
   document.getElementById('textTranslateBtn')?.addEventListener('click', translateText);
@@ -556,7 +741,10 @@ async function init() {
   document.getElementById('copyResultBtn')?.addEventListener('click', copyResult);
   document.getElementById('pasteBtn')?.addEventListener('click', handlePasteFromClipboard);
   document.getElementById('swapBtn')?.addEventListener('click', handleSwapTexts);
-  document.getElementById('textTargetLang')?.addEventListener('change', e => updateRecent(e.target.value).then(r => renderQuickLangs('textQuickLangs', e.target.value, r, textQuickSelect)));
+  document.getElementById('textTargetLang')?.addEventListener('change', e => {
+    chrome.storage.local.set({ textTargetLang: e.target.value });
+    updateRecent(e.target.value).then(r => renderQuickLangs('textQuickLangs', e.target.value, r, textQuickSelect));
+  });
   document.getElementById('sourceText')?.addEventListener('keydown', e => { if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); translateText(); } });
 
   const autoTranslateToggle = document.getElementById('autoTranslateToggle');
@@ -574,8 +762,8 @@ async function init() {
   renderQuickLangs('pageQuickLangs', settings.targetLanguage, recent, pageQuickSelect);
   renderQuickLangs('textQuickLangs', settings.textTargetLang, recent, textQuickSelect);
 
-  updateStatus({ status: 'checking', message: 'Checking...' });
-  updateStatus(await checkConnection(settings.proxyUrl));
+  updateStatus({ status: 'checking', message: 'Verifying...' });
+  updateStatus(await verifyConnection(settings));
 
   updateTranslateButtonState();
 
