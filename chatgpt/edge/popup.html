@@ -25,7 +25,6 @@
       </div>
     </header>
 
-    <!-- Settings Modal -->
     <div id="settingsModal" class="modal-overlay hidden">
       <div class="modal" role="dialog" aria-labelledby="settingsTitle">
         <div class="modal-header">
@@ -78,14 +77,12 @@
       </div>
     </div>
 
-    <!-- Tab Navigation -->
     <nav class="tab-nav">
       <button type="button" class="tab-btn active" data-tab="page">Page</button>
       <button type="button" class="tab-btn" data-tab="text">Text</button>
       <button type="button" class="tab-btn" data-tab="history">History</button>
     </nav>
 
-    <!-- Page Translation Tab -->
     <main id="pageTab" class="tab-content active">
       <section class="settings-group">
         <h2>Translation Settings</h2>
@@ -105,7 +102,6 @@
           <div id="pageQuickLangs" class="quick-lang-buttons"></div>
         </div>
       </section>
-
       <footer>
         <button id="translateBtn" class="btn-primary">
           <span class="btn-text">Translate Page</span>
@@ -113,7 +109,6 @@
       </footer>
     </main>
 
-    <!-- Text Translation Tab -->
     <main id="textTab" class="tab-content">
       <section class="translator-panel">
         <div class="translator-header">
@@ -125,10 +120,8 @@
             <option value="Korean">Korean</option>
             <option value="Vietnamese">Vietnamese</option>
           </select>
-          <!-- Quick Language Toggle -->
           <div id="textQuickLangs" class="quick-lang-buttons compact"></div>
-          <!-- Auto-translate toggle -->
-          <label class="auto-translate-toggle" title="Auto-translate when pasting">
+          <label class="auto-translate-toggle" title="Auto-translate when pasting or typing stops">
             <input type="checkbox" id="autoTranslateToggle" />
             <span class="toggle-label">Auto</span>
           </label>
@@ -162,7 +155,6 @@
           </div>
           <div class="text-area-wrapper output">
             <div id="translatedText" class="translated-output"></div>
-            <!-- Progress indicator -->
             <div id="translationProgress" class="translation-progress hidden">
               <div class="progress-bar">
                 <div class="progress-fill"></div>
@@ -185,7 +177,6 @@
       </section>
     </main>
 
-    <!-- History Tab -->
     <main id="historyTab" class="tab-content">
       <section class="history-panel">
         <div class="history-header">
@@ -199,7 +190,19 @@
     </main>
 
     <div id="toastContainer" class="toast-container"></div>
-
+    
+    <!-- Resize Handle for popup resizing -->
+    <div id="resizeHandle" class="resize-handle" title="Drag to resize • Double-click to reset">
+      <svg viewBox="0 0 10 10" fill="currentColor">
+        <circle cx="8" cy="2" r="1"/>
+        <circle cx="5" cy="5" r="1"/>
+        <circle cx="8" cy="5" r="1"/>
+        <circle cx="2" cy="8" r="1"/>
+        <circle cx="5" cy="8" r="1"/>
+        <circle cx="8" cy="8" r="1"/>
+      </svg>
+    </div>
+    
     <script src="crypto.js"></script>
     <script src="popup.js"></script>
   </body>

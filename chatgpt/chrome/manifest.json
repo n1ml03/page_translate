@@ -1,20 +1,12 @@
 {
   "manifest_version": 3,
-  "name": "Gemini Page Translator",
-  "version": "1.0.0",
-  "description": "Translate web pages using Google Gemini API",
-  "permissions": [
-    "storage",
-    "activeTab",
-    "scripting",
-    "clipboardRead"
-  ],
-  "host_permissions": [
-    "<all_urls>"
-  ],
+  "name": "Page Translator",
+  "version": "1.2.0",
+  "description": "Translate web pages using custom LLM API",
+  "permissions": ["storage", "activeTab", "scripting", "sidePanel"],
+  "host_permissions": ["<all_urls>"],
   "action": {
-    "default_popup": "popup.html",
-    "default_title": "Gemini Page Translator",
+    "default_title": "Page Translator",
     "default_icon": {
       "16": "images/icon16.png",
       "48": "images/icon48.png",
@@ -29,10 +21,13 @@
   "background": {
     "service_worker": "background.js"
   },
+  "side_panel": {
+    "default_path": "popup.html"
+  },
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["tag-manager.js", "inline-translator.js", "content.js"],
+      "js": ["inline-translator.js", "content.js"],
       "run_at": "document_start",
       "all_frames": true
     }

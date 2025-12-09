@@ -43,7 +43,9 @@
 
   const EXCLUDED_TAGS = ['SCRIPT', 'STYLE', 'CODE', 'PRE', 'NOSCRIPT', 'IFRAME', 'SVG', 'FOOTER'];
   const INLINE_TAGS = new Set(['B', 'I', 'U', 'STRONG', 'EM', 'SPAN', 'A', 'FONT', 'SMALL', 'BIG', 'SUB', 'SUP', 'BR', 'IMG', 'CODE']);
-  const BLOCK_TAGS = new Set(['P', 'DIV', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'LI', 'TD', 'TH', 'DD', 'DT', 'CAPTION']);
+  // Block-level tags that can be Atomic Blocks (contain only text and inline elements)
+  // Includes table cells, list items, definition list items, and captions per Requirements 1.1, 3.3
+  const BLOCK_TAGS = new Set(['P', 'DIV', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'LI', 'TD', 'TH', 'DD', 'DT', 'CAPTION', 'BLOCKQUOTE', 'FIGCAPTION', 'ARTICLE', 'SECTION', 'HEADER', 'ASIDE', 'NAV', 'MAIN', 'ADDRESS']);
   const STATUS_ID = 'page-translator-status';
   const TOOLTIP_ID = 'page-translator-tooltip';
   const CONCURRENCY = 2, CACHE_MAX_SIZE = 500, MUTATION_DEBOUNCE_MS = 300;
@@ -242,6 +244,9 @@
   // DOM EXTRACTION
   // ============================================================================
 
+  // Import TagManager for HTML tag masking (loaded via manifest.json)
+  // TagManager is expected to be available globally from tag-manager.js
+
   function isInFooter(node) {
     let parent = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
     while (parent) {
@@ -263,6 +268,12 @@
     return false;
   }
 
+  /**
+   * Checks if an element contains only text nodes and inline elements (no nested block-level children).
+   * Used by isAtomicBlock() to determine if an element is suitable for tag masking.
+   * @param {Node} node - The DOM node to check
+   * @returns {boolean} True if the node contains only inline content
+   */
   function hasOnlyInlineContent(node) {
     for (const child of node.childNodes) {
       if (child.nodeType === Node.TEXT_NODE) continue;
@@ -276,6 +287,84 @@
     return true;
   }
 
+  /**
+   * AtomicBlockDetector - Identifies block-level elements suitable for translation with tag masking.
+   * An Atomic Block is a block-level element that contains only text and inline elements,
+   * with no nested block-level children.
+   * 
+   * Requirements: 1.1, 3.3
+   */
+  const AtomicBlockDetector = {
+    /**
+     * Checks if an element is an Atomic Block suitable for tag masking.
+     * An element is an Atomic Block if:
+     * - It is a block-level element (P, DIV, TD, TH, LI, H1-H6, DD, DT, CAPTION, etc.)
+     * - It contains only text nodes and inline elements
+     * - It has no nested block-level children
+     * - It has meaningful text content
+     * 
+     * @param {Element} element - The DOM element to check
+     * @returns {boolean} True if the element is an Atomic Block
+     * 
+     * Requirements: 1.1, 3.3
+     */
+    isAtomicBlock(element) {
+      if (!element || element.nodeType !== Node.ELEMENT_NODE) {
+        return false;
+      }
+
+      const tagName = element.tagName;
+
+      // Must be a block-level tag
+      if (!BLOCK_TAGS.has(tagName)) {
+        return false;
+      }
+
+      // Must have text content with at least one letter
+      const textContent = element.textContent.trim();
+      if (!textContent || !/\p{L}/u.test(textContent)) {
+        return false;
+      }
+
+      // Must contain only inline content (no nested block-level elements)
+      if (!hasOnlyInlineContent(element)) {
+        return false;
+      }
+
+      return true;
+    },
+
+    /**
+     * Extracts all Atomic Blocks from a root element.
+     * @param {Element} root - The root element to search within
+     * @returns {Array<{element: Element, innerHTML: string, originalText: string}>}
+     */
+    extractAtomicBlocks(root) {
+      const blocks = [];
+      
+      function traverse(element) {
+        if (!element || element.nodeType !== Node.ELEMENT_NODE) return;
+        if (EXCLUDED_TAGS.includes(element.tagName)) return;
+        
+        if (AtomicBlockDetector.isAtomicBlock(element)) {
+          blocks.push({
+            element,
+            innerHTML: element.innerHTML.trim(),
+            originalText: element.textContent.trim()
+          });
+          return; // Don't traverse children of atomic blocks
+        }
+        
+        for (const child of element.children) {
+          traverse(child);
+        }
+      }
+      
+      traverse(root);
+      return blocks;
+    }
+  };
+
   function markProcessed(element) {
     processedNodes.add(element);
     if (element.nodeType === Node.ELEMENT_NODE) {
@@ -285,6 +374,20 @@
     }
   }
 
+  /**
+   * Extracts text nodes and atomic blocks from the DOM for translation.
+   * 
+   * This function traverses the DOM and identifies:
+   * 1. Atomic Blocks - block-level elements with only inline content (processed as HTML)
+   * 2. Text nodes - standalone text that needs translation
+   * 
+   * Requirements 3.1, 3.2: Processes elements regardless of CSS visibility state
+   * (including display:none, visibility:hidden) to include accordion panels,
+   * tabs, and other dynamically revealed content.
+   * 
+   * @param {Node} root - The root node to start extraction from
+   * @returns {Array<{type: string, content: string, node: Node, ...}>}
+   */
   function extractTextNodes(root = document.documentElement) {
     const nodes = [];
 
@@ -306,10 +409,35 @@
         if (element.classList?.contains('pt-translated') || element.classList?.contains('pt-translated-block')) return;
         if (isInFooter(element)) return;
 
-        if (BLOCK_TAGS.has(element.tagName) && element.textContent.trim() && /\p{L}/u.test(element.textContent) && hasOnlyInlineContent(element)) {
+        // NOTE: Visibility checks intentionally removed per Requirements 3.1, 3.2
+        // We process elements regardless of CSS visibility state (display:none, visibility:hidden)
+        // to include accordion panels, tabs, and other dynamically revealed content.
+
+        // Use AtomicBlockDetector to identify blocks suitable for tag masking
+        if (AtomicBlockDetector.isAtomicBlock(element)) {
           const html = element.innerHTML.trim();
           if (html) {
-            nodes.push({ type: 'HTML', content: html, originalPlainText: element.textContent.trim(), node: element });
+            // Use TagManager to mask HTML tags with placeholders
+            // Requirements 1.2, 6.3: Mask innerHTML before adding to batch
+            const plainText = element.textContent.trim();
+            
+            // Check if TagManager is available (loaded from tag-manager.js)
+            if (typeof TagManager !== 'undefined') {
+              const { masked, tags } = TagManager.mask(html);
+              // Store MaskedContent object with original, masked, tags, and plainText
+              nodes.push({
+                type: 'HTML',
+                content: masked,           // Send masked content to translation
+                original: html,            // Original innerHTML for reference
+                tags: tags,                // Tag array for restoration
+                plainText: plainText,      // Plain text fallback
+                originalPlainText: plainText,
+                node: element
+              });
+            } else {
+              // Fallback: use original HTML if TagManager not available
+              nodes.push({ type: 'HTML', content: html, originalPlainText: plainText, node: element });
+            }
             markProcessed(element);
             return;
           }
@@ -328,13 +456,42 @@
   // DOM UPDATE
   // ============================================================================
 
+  /**
+   * Updates the DOM with translated content.
+   * 
+   * For HTML type nodes with tag masking:
+   * - Uses TagManager.unmask() to restore placeholders to original tags
+   * - Validates placeholders before restoration
+   * - Falls back to plain text if validation fails (Requirements 1.7, 1.8)
+   * 
+   * @param {Object} nodeInfo - Node information from extractTextNodes()
+   * @param {string} translated - Translated text (may contain placeholders for HTML nodes)
+   */
   function updateDOM(nodeInfo, translated) {
     if (!translated || (nodeInfo.type === 'TEXT' && !nodeInfo.node.parentNode)) return;
 
     if (nodeInfo.type === 'HTML') {
-      nodeInfo.node.innerHTML = translated;
+      let finalContent = translated;
+      
+      // Check if this node was processed with TagManager (has tags array)
+      if (nodeInfo.tags && Array.isArray(nodeInfo.tags) && typeof TagManager !== 'undefined') {
+        // Validate placeholders before restoration (Requirements 1.7, 1.8)
+        const isValid = TagManager.validatePlaceholders(translated, nodeInfo.tags.length);
+        
+        if (isValid) {
+          // Restore placeholders to original HTML tags
+          finalContent = TagManager.unmask(translated, nodeInfo.tags);
+        } else {
+          // Fallback: strip all tags/placeholders and use plain text
+          // This preserves readability when AI returns invalid placeholders
+          console.warn('[PageTranslator] Invalid placeholders detected, falling back to plain text');
+          finalContent = TagManager.stripToPlainText(translated);
+        }
+      }
+      
+      nodeInfo.node.innerHTML = finalContent;
       nodeInfo.node.classList.add('pt-translated-block');
-      nodeInfo.node.dataset.ptOriginal = nodeInfo.originalPlainText || nodeInfo.node.textContent.trim();
+      nodeInfo.node.dataset.ptOriginal = nodeInfo.originalPlainText || nodeInfo.plainText || nodeInfo.node.textContent.trim();
     } else {
       const wrapper = document.createElement('span');
       wrapper.className = 'pt-translated';
@@ -355,7 +512,19 @@
   // BATCH PROCESSING
   // ============================================================================
 
-  function translateBatchStreaming(texts, onTranslation) {
+  /**
+   * Sends a batch of texts for translation via streaming.
+   * 
+   * @param {string[]} texts - Array of texts to translate
+   * @param {Function} onTranslation - Callback for each translated item (index, translation)
+   * @param {Object} options - Optional settings
+   * @param {boolean} options.useMasking - Whether the batch contains masked HTML content
+   * @returns {Promise<void>}
+   * 
+   * Requirements 7.1: Forward masked text batches to server with useMasking flag
+   * Requirements 7.2, 7.3: Relay translated items and propagate errors
+   */
+  function translateBatchStreaming(texts, onTranslation, options = {}) {
     return new Promise((resolve, reject) => {
       const port = chrome.runtime.connect({ name: 'translate-stream' });
       port.onMessage.addListener(msg => {
@@ -366,7 +535,12 @@
       port.onDisconnect.addListener(() => {
         if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
       });
-      port.postMessage({ type: 'translate', batch: texts });
+      // Include useMasking flag when batch contains masked HTML content
+      port.postMessage({ 
+        type: 'translate', 
+        batch: texts,
+        useMasking: options.useMasking || false
+      });
     });
   }
 
@@ -381,24 +555,38 @@
     if (!uncachedNodes.length) return;
 
     const seen = new Set(), uniqueTexts = [];
+    // Track which texts come from masked HTML nodes (Requirements 7.1)
+    const maskedTexts = new Set();
     for (const n of uncachedNodes) {
-      if (!seen.has(n.content)) { seen.add(n.content); uniqueTexts.push(n.content); }
+      if (!seen.has(n.content)) { 
+        seen.add(n.content); 
+        uniqueTexts.push(n.content);
+        // Mark text as masked if it comes from an HTML node with tags array
+        if (n.type === 'HTML' && n.tags && Array.isArray(n.tags) && n.tags.length > 0) {
+          maskedTexts.add(n.content);
+        }
+      }
     }
 
     const batches = [];
     let currentBatch = [];
     let currentBatchChars = 0;
+    let currentBatchHasMasked = false;
 
     for (const text of uniqueTexts) {
       if (currentBatch.length >= MAX_BATCH_ITEMS || (currentBatchChars + text.length > MAX_BATCH_CHARS && currentBatch.length > 0)) {
-        batches.push(currentBatch);
+        batches.push({ texts: currentBatch, useMasking: currentBatchHasMasked });
         currentBatch = [];
         currentBatchChars = 0;
+        currentBatchHasMasked = false;
       }
       currentBatch.push(text);
       currentBatchChars += text.length;
+      if (maskedTexts.has(text)) {
+        currentBatchHasMasked = true;
+      }
     }
-    if (currentBatch.length) batches.push(currentBatch);
+    if (currentBatch.length) batches.push({ texts: currentBatch, useMasking: currentBatchHasMasked });
 
     createStatusIndicator();
     let errors = 0, translatedCount = 0;
@@ -413,7 +601,9 @@
     for (let batchIdx = 0; batchIdx < batches.length; batchIdx += CONCURRENCY) {
       const batchPromises = [];
       for (let j = 0; j < CONCURRENCY && batchIdx + j < batches.length; j++) {
-        const batch = batches[batchIdx + j];
+        const batchInfo = batches[batchIdx + j];
+        const batch = batchInfo.texts;
+        // Requirements 7.1: Pass useMasking flag when batch contains masked HTML content
         batchPromises.push(
           translateBatchStreaming(batch, (indexInBatch, translation) => {
             const originalText = batch[indexInBatch];
@@ -423,7 +613,7 @@
             }
             translatedCount++;
             updateStatus(translatedCount, totalTexts);
-          }).catch(err => { errors++; console.error('Translation batch error:', err); })
+          }, { useMasking: batchInfo.useMasking }).catch(err => { errors++; console.error('Translation batch error:', err); })
         );
       }
       await Promise.all(batchPromises);

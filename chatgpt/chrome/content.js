@@ -125,7 +125,7 @@
   function setupTooltip() {
     document.addEventListener('mouseover', e => {
       if (hoveringTooltip) return;
-      const target = e.target.closest('.pt-translated, .pt-translated-block');
+      const target = e.target.closest('.pt-translated, .pt-translated-block, .pt-inline-replaced');
       if (target && target !== hoveredEl) {
         clearTimeout(hideTimer);
         hoveredEl = target;
@@ -134,7 +134,7 @@
     });
     document.addEventListener('mouseout', e => {
       if (hoveringTooltip) return;
-      const target = e.target.closest('.pt-translated, .pt-translated-block');
+      const target = e.target.closest('.pt-translated, .pt-translated-block, .pt-inline-replaced');
       const t = document.getElementById(TOOLTIP_ID);
       if (t && (t.contains(e.relatedTarget) || e.relatedTarget === t)) return;
       if (target && !target.contains(e.relatedTarget)) scheduleHide(2000);
@@ -157,8 +157,12 @@
   // STATUS
   // ============================================================================
 
+  let isTranslating = false;
+
   function createStatus() {
     if (document.getElementById(STATUS_ID)) return;
+    isTranslating = true;
+    chrome.storage.local.set({ pageTranslationInProgress: true });
     const el = document.createElement('div');
     el.id = STATUS_ID;
     el.style.cssText = 'position:fixed;top:20px;right:20px;background:linear-gradient(135deg,#4285f4,#34a853);color:white;padding:12px 20px;border-radius:24px;font-family:-apple-system,sans-serif;font-size:14px;font-weight:500;box-shadow:0 4px 12px rgba(66,133,244,0.4);z-index:2147483647;display:flex;align-items:center;gap:10px;';
@@ -184,6 +188,8 @@
   function removeStatus() {
     const el = document.getElementById(STATUS_ID);
     if (!el) return;
+    isTranslating = false;
+    chrome.storage.local.set({ pageTranslationInProgress: false });
     el.style.opacity = '0';
     setTimeout(() => el.remove(), 300);
   }
@@ -495,6 +501,11 @@
 
   async function initInline() {
     if (typeof InlineTranslator === 'undefined') return;
+    
+    // Initialize tooltip system for inline translations
+    injectStyles();
+    setupTooltip();
+    
     const settings = await loadInlineSettings();
 
     inlineTranslator = new InlineTranslator({

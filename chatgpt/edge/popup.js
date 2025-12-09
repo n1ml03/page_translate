@@ -79,7 +79,9 @@ function showToast(msg, type = 'info', ms = null) {
   toast.innerHTML = `<span class="toast-message">${msg}</span><button class="toast-dismiss">&times;</button>`;
   toast.querySelector('.toast-dismiss').onclick = () => dismissToast(toast);
   container.appendChild(toast);
-  setTimeout(() => dismissToast(toast), ms ?? (type === 'error' ? 2500 : 1500));
+  // Shorter toast times: error=1500ms, success=800ms, info=600ms
+  const defaultTimes = { error: 1500, success: 800, info: 600 };
+  setTimeout(() => dismissToast(toast), ms ?? (defaultTimes[type] || 800));
 }
 
 function dismissToast(t) {
@@ -180,6 +182,522 @@ async function saveSettingsHandler() {
 }
 
 // ============================================================================
+// RESIZE MANAGER
+// ============================================================================
+
+/**
+ * ResizeManager - Handles popup resizing with dimension persistence
+ * Features:
+ * - Smooth resizing with requestAnimationFrame
+ * - Dimension persistence to chrome.storage
+ * - Min/max constraints for usability
+ * - Responsive to user preferences
+ * - Touch support for mobile/tablet
+ */
+const ResizeManager = {
+  // Dimension constraints
+  MIN_WIDTH: 320,
+  MIN_HEIGHT: 350,
+  MAX_WIDTH: 800,
+  MAX_HEIGHT: 700,
+  DEFAULT_WIDTH: 380,
+  DEFAULT_HEIGHT: 520,
+
+  // State
+  isResizing: false,
+  startX: 0,
+  startY: 0,
+  startWidth: 0,
+  startHeight: 0,
+  rafId: null,
+  pendingWidth: 0,
+  pendingHeight: 0,
+  isDetached: false,
+
+  /**
+   * Initialize resize functionality
+   */
+  init() {
+    // Check if running in detached mode
+    this.checkDetachedMode();
+    
+    // Load saved dimensions
+    this.loadDimensions();
+    
+    // Attach resize handle events
+    this.attachHandles();
+    
+    // Listen for window resize events (for detached mode)
+    window.addEventListener('resize', this.handleWindowResize.bind(this));
+  },
+
+  /**
+   * Check if running as a detached popup window
+   */
+  async checkDetachedMode() {
+    try {
+      const currentWindow = await chrome.windows.getCurrent();
+      this.isDetached = currentWindow.type === 'popup';
+      if (this.isDetached) {
+        document.documentElement.classList.add('detached');
+        document.body.classList.add('detached');
+        // In detached mode, allow smaller sizes for flexibility
+        this.MIN_WIDTH = 280;
+        this.MIN_HEIGHT = 280;
+      }
+    } catch (e) {
+      // If we can't get window info, assume it's a normal popup
+      this.isDetached = false;
+    }
+  },
+
+  /**
+   * Handle window resize events (for detached mode)
+   */
+  handleWindowResize() {
+    if (this.isDetached) {
+      // In detached mode, let window control size
+      return;
+    }
+  },
+
+  /**
+   * Load saved dimensions from storage and apply them
+   */
+  async loadDimensions() {
+    // In detached mode, don't apply fixed dimensions
+    if (this.isDetached) {
+      return;
+    }
+    
+    try {
+      const stored = await new Promise(resolve => {
+        chrome.storage.local.get(['popupWidth', 'popupHeight'], resolve);
+      });
+      
+      const width = this.clamp(
+        stored.popupWidth || this.DEFAULT_WIDTH,
+        this.MIN_WIDTH,
+        this.MAX_WIDTH
+      );
+      const height = this.clamp(
+        stored.popupHeight || this.DEFAULT_HEIGHT,
+        this.MIN_HEIGHT,
+        this.MAX_HEIGHT
+      );
+      
+      this.applyDimensions(width, height);
+    } catch (e) {
+      // Apply default dimensions on error
+      this.applyDimensions(this.DEFAULT_WIDTH, this.DEFAULT_HEIGHT);
+    }
+  },
+
+  /**
+   * Apply dimensions to the popup
+   */
+  applyDimensions(width, height) {
+    // Set dimensions on both html and body for consistent behavior
+    document.documentElement.style.width = `${width}px`;
+    document.documentElement.style.height = `${height}px`;
+    document.body.style.width = `${width}px`;
+    document.body.style.height = `${height}px`;
+    
+    // Also update CSS custom properties for responsive components
+    document.documentElement.style.setProperty('--popup-width', `${width}px`);
+    document.documentElement.style.setProperty('--popup-height', `${height}px`);
+  },
+
+  /**
+   * Attach event listeners to resize handle
+   */
+  attachHandles() {
+    const handle = document.getElementById('resizeHandle');
+    if (!handle) return;
+
+    // Use bound methods for proper this context
+    this._startResize = this.startResize.bind(this);
+    this._doResize = this.doResize.bind(this);
+    this._stopResize = this.stopResize.bind(this);
+
+    // Mouse events
+    handle.addEventListener('mousedown', this._startResize);
+    document.addEventListener('mousemove', this._doResize);
+    document.addEventListener('mouseup', this._stopResize);
+    
+    // Double-click to reset to default size
+    handle.addEventListener('dblclick', this.resetToDefault.bind(this));
+    
+    // Handle mouse leaving window during resize
+    document.addEventListener('mouseleave', (e) => {
+      // Only stop if we actually left the window (not just entered a child element)
+      if (this.isResizing && e.relatedTarget === null) {
+        this._stopResize(e);
+      }
+    });
+
+    // Touch events for mobile/tablet support
+    handle.addEventListener('touchstart', this.handleTouchStart.bind(this), { passive: false });
+    document.addEventListener('touchmove', this.handleTouchMove.bind(this), { passive: false });
+    document.addEventListener('touchend', this._stopResize);
+    document.addEventListener('touchcancel', this._stopResize);
+  },
+
+  /**
+   * Clamp value between min and max
+   */
+  clamp(value, min, max) {
+    return Math.min(Math.max(value, min), max);
+  },
+
+  /**
+   * Start resize operation (mouse)
+   */
+  startResize(e) {
+    if (this.isDetached) return; // Don't resize in detached mode (use window chrome)
+    
+    this.isResizing = true;
+    this.startX = e.clientX;
+    this.startY = e.clientY;
+    this.startWidth = document.documentElement.offsetWidth;
+    this.startHeight = document.documentElement.offsetHeight;
+    this.pendingWidth = this.startWidth;
+    this.pendingHeight = this.startHeight;
+    
+    document.body.classList.add('resizing');
+    e.preventDefault();
+    e.stopPropagation();
+  },
+
+  /**
+   * Handle touch start for mobile resize
+   */
+  handleTouchStart(e) {
+    if (this.isDetached || e.touches.length !== 1) return;
+    
+    const touch = e.touches[0];
+    this.isResizing = true;
+    this.startX = touch.clientX;
+    this.startY = touch.clientY;
+    this.startWidth = document.documentElement.offsetWidth;
+    this.startHeight = document.documentElement.offsetHeight;
+    this.pendingWidth = this.startWidth;
+    this.pendingHeight = this.startHeight;
+    
+    document.body.classList.add('resizing');
+    e.preventDefault();
+  },
+
+  /**
+   * Handle resize drag with requestAnimationFrame for smoothness
+   */
+  doResize(e) {
+    if (!this.isResizing) return;
+
+    const clientX = e.clientX;
+    const clientY = e.clientY;
+
+    this.pendingWidth = this.clamp(
+      this.startWidth + (clientX - this.startX),
+      this.MIN_WIDTH,
+      this.MAX_WIDTH
+    );
+    this.pendingHeight = this.clamp(
+      this.startHeight + (clientY - this.startY),
+      this.MIN_HEIGHT,
+      this.MAX_HEIGHT
+    );
+
+    // Use requestAnimationFrame for smooth visual updates
+    if (!this.rafId) {
+      this.rafId = requestAnimationFrame(() => {
+        this.applyDimensions(this.pendingWidth, this.pendingHeight);
+        this.rafId = null;
+      });
+    }
+  },
+
+  /**
+   * Handle touch move for mobile resize
+   */
+  handleTouchMove(e) {
+    if (!this.isResizing || e.touches.length !== 1) return;
+    
+    const touch = e.touches[0];
+    
+    this.pendingWidth = this.clamp(
+      this.startWidth + (touch.clientX - this.startX),
+      this.MIN_WIDTH,
+      this.MAX_WIDTH
+    );
+    this.pendingHeight = this.clamp(
+      this.startHeight + (touch.clientY - this.startY),
+      this.MIN_HEIGHT,
+      this.MAX_HEIGHT
+    );
+
+    if (!this.rafId) {
+      this.rafId = requestAnimationFrame(() => {
+        this.applyDimensions(this.pendingWidth, this.pendingHeight);
+        this.rafId = null;
+      });
+    }
+    
+    e.preventDefault();
+  },
+
+  /**
+   * Stop resize operation and persist dimensions
+   */
+  stopResize() {
+    if (!this.isResizing) return;
+    
+    this.isResizing = false;
+    document.body.classList.remove('resizing');
+    
+    // Cancel any pending animation frame
+    if (this.rafId) {
+      cancelAnimationFrame(this.rafId);
+      this.rafId = null;
+    }
+    
+    // Apply final dimensions
+    this.applyDimensions(this.pendingWidth, this.pendingHeight);
+    
+    // Persist to storage
+    this.persistDimensions();
+  },
+
+  /**
+   * Save current dimensions to storage
+   */
+  async persistDimensions() {
+    try {
+      await chrome.storage.local.set({
+        popupWidth: this.pendingWidth,
+        popupHeight: this.pendingHeight
+      });
+    } catch (e) {
+      console.warn('Failed to persist popup dimensions:', e);
+    }
+  },
+
+  /**
+   * Reset to default dimensions
+   */
+  async resetToDefault() {
+    this.pendingWidth = this.DEFAULT_WIDTH;
+    this.pendingHeight = this.DEFAULT_HEIGHT;
+    this.applyDimensions(this.DEFAULT_WIDTH, this.DEFAULT_HEIGHT);
+    await this.persistDimensions();
+    showToast('Popup size reset to default', 'success');
+  },
+
+  /**
+   * Get current dimensions
+   */
+  getDimensions() {
+    return {
+      width: document.documentElement.offsetWidth,
+      height: document.documentElement.offsetHeight
+    };
+  }
+};
+
+// ============================================================================
+// DRAG MANAGER - Open as detached window for true movability
+// ============================================================================
+
+/**
+ * DragManager - Allows opening popup as a detached window by dragging header
+ * Double-click header to detach, or drag header to detach and position
+ */
+const DragManager = {
+  isDragging: false,
+  startX: 0,
+  startY: 0,
+  dragThreshold: 10, // pixels to move before considering it a drag
+
+  init() {
+    const header = document.querySelector('.header');
+    if (!header) return;
+
+    // Make header draggable
+    header.style.cursor = 'grab';
+    
+    header.addEventListener('mousedown', this.startDrag.bind(this));
+    document.addEventListener('mousemove', this.checkDrag.bind(this));
+    document.addEventListener('mouseup', this.stopDrag.bind(this));
+    
+    // Double-click to open as detached window
+    header.addEventListener('dblclick', this.openDetached.bind(this));
+  },
+
+  startDrag(e) {
+    // Don't drag if clicking on buttons
+    if (e.target.closest('button')) return;
+    
+    this.isDragging = true;
+    this.startX = e.screenX;
+    this.startY = e.screenY;
+    this.hasMoved = false;
+    e.preventDefault();
+  },
+
+  checkDrag(e) {
+    if (!this.isDragging) return;
+    
+    const dx = Math.abs(e.screenX - this.startX);
+    const dy = Math.abs(e.screenY - this.startY);
+    
+    // If moved beyond threshold, open as detached window
+    if (dx > this.dragThreshold || dy > this.dragThreshold) {
+      this.hasMoved = true;
+      this.openDetached(e);
+      this.isDragging = false;
+    }
+  },
+
+  stopDrag() {
+    this.isDragging = false;
+  },
+
+  /**
+   * Open popup as a detached window that can be moved anywhere
+   */
+  async openDetached(e) {
+    try {
+      const width = document.body.offsetWidth || 520;
+      const height = document.body.offsetHeight || 500;
+      
+      // Calculate position - try to place near where user dragged
+      let left = e?.screenX ? e.screenX - width / 2 : undefined;
+      let top = e?.screenY ? e.screenY - 20 : undefined;
+      
+      await chrome.windows.create({
+        url: 'popup.html',
+        type: 'popup',
+        width: Math.round(width),
+        height: Math.round(height),
+        left: left ? Math.round(left) : undefined,
+        top: top ? Math.round(top) : undefined
+      });
+      
+      // Close the current popup
+      window.close();
+    } catch (err) {
+      console.log('Failed to open detached window:', err);
+      showToast('Drag header to detach window', 'info');
+    }
+  }
+};
+
+// ============================================================================
+// CLIPBOARD FEATURES
+// ============================================================================
+
+/**
+ * ClipboardManager - Handles clipboard reading with immediate activation on Text tab switch
+ * Implements fallback to storage-based clipboard when API fails
+ */
+const ClipboardManager = {
+  lastText: '',
+  permissionGranted: false,
+
+  async checkPermission() {
+    try {
+      if (navigator.permissions?.query) {
+        const result = await navigator.permissions.query({ name: 'clipboard-read' });
+        this.permissionGranted = result.state === 'granted';
+        result.onchange = () => { this.permissionGranted = result.state === 'granted'; };
+      }
+    } catch (e) { /* Permission API not available */ }
+    return this.permissionGranted;
+  },
+
+  /**
+   * Called immediately when Text tab becomes active
+   * Reads clipboard and populates source field if empty
+   */
+  async onTextTabActivated() {
+    const sourceText = document.getElementById('sourceText');
+    if (sourceText?.value.trim()) return;
+
+    // Check permission first (won't prompt), then try to read
+    await this.checkPermission();
+    const text = await this.readClipboard(false);
+    if (text && text.trim()) {
+      sourceText.value = text.trim();
+      updateCharCount();
+      saveTextState();
+      showToast('Clipboard text loaded', 'info');
+
+      // Auto-translate if enabled
+      const autoTranslate = document.getElementById('autoTranslateToggle')?.checked;
+      if (autoTranslate) translateText();
+    }
+  },
+
+  /**
+   * Unified clipboard read with fallback to storage
+   * @param {boolean} userActivated - true if user clicked paste button
+   */
+  async readClipboard(userActivated = false) {
+    // Try clipboard API only if permission granted or user clicked
+    try {
+      if (navigator.clipboard?.readText && (this.permissionGranted || userActivated)) {
+        const text = await navigator.clipboard.readText();
+        if (text) return text;
+      }
+    } catch (e) {
+      console.log('Clipboard API unavailable:', e.message);
+      if (userActivated && e.name === 'NotAllowedError') {
+        showToast('Clipboard access denied. Try Ctrl+V.', 'error');
+      }
+    }
+
+    // Fallback to storage (from content script copy event)
+    try {
+      const stored = await new Promise(resolve => {
+        chrome.storage.local.get(['lastCopiedText', 'lastCopiedTimestamp'], resolve);
+      });
+      // Only use stored text if it's recent (within 60 seconds)
+      if (stored.lastCopiedTimestamp && Date.now() - stored.lastCopiedTimestamp < 60000) {
+        if (userActivated) chrome.storage.local.remove(['lastCopiedText', 'lastCopiedTimestamp']);
+        return stored.lastCopiedText;
+      }
+    } catch (e) {
+      console.log('Storage fallback failed:', e);
+    }
+
+    return null;
+  }
+};
+
+async function handlePasteFromClipboard() {
+  const pasteBtn = document.getElementById('pasteBtn');
+  const sourceTextEl = document.getElementById('sourceText');
+  if (!sourceTextEl) return;
+
+  const text = await ClipboardManager.readClipboard(true); // User clicked paste
+
+  if (text && text.trim()) {
+    sourceTextEl.value = text.trim();
+    updateCharCount();
+    saveTextState();
+    pasteBtn?.classList.add('pasted');
+    setTimeout(() => pasteBtn?.classList.remove('pasted'), 1000);
+
+    // Auto-translate if enabled
+    const autoTranslate = document.getElementById('autoTranslateToggle')?.checked;
+    if (autoTranslate) translateText();
+    showToast('Pasted from clipboard', 'success');
+  } else {
+    showToast('Clipboard is empty or inaccessible', 'info');
+  }
+}
+
+// ============================================================================
 // TABS
 // ============================================================================
 
@@ -188,6 +706,8 @@ function switchTab(id) {
   document.querySelectorAll('.tab-content').forEach(c => c.classList.toggle('active', c.id === `${id}Tab`));
   chrome.storage.local.set({ activeTab: id });
   if (id === 'history') renderHistory();
+  // Requirement 1.1, 1.2: Read clipboard immediately when Text tab becomes active
+  if (id === 'text') ClipboardManager.onTextTabActivated();
 }
 
 // ============================================================================
@@ -382,100 +902,6 @@ async function copyResult() {
   } catch { showToast('Copy failed', 'error'); }
 }
 
-// ============================================================================
-// CLIPBOARD FEATURES
-// ============================================================================
-
-let lastClipboardText = '';
-let clipboardCheckInterval = null;
-
-async function readClipboard() {
-  try {
-    if (navigator.clipboard?.readText) {
-      return await navigator.clipboard.readText();
-    }
-  } catch (e) {
-    console.log('Clipboard API failed:', e.message);
-  }
-  return null;
-}
-
-async function handlePasteFromClipboard() {
-  const pasteBtn = document.getElementById('pasteBtn');
-  const sourceTextEl = document.getElementById('sourceText');
-  if (!sourceTextEl) return;
-
-  // First try to get recently copied text from storage (from content script)
-  let text = null;
-  try {
-    const stored = await new Promise(resolve => {
-      chrome.storage.local.get(['lastCopiedText', 'lastCopiedTimestamp'], resolve);
-    });
-    const isRecent = stored.lastCopiedTimestamp && Date.now() - stored.lastCopiedTimestamp < 60000;
-    if (isRecent && stored.lastCopiedText) {
-      text = stored.lastCopiedText;
-      chrome.storage.local.remove(['lastCopiedText', 'lastCopiedTimestamp']);
-    }
-  } catch (e) {
-    console.log('Storage read failed:', e);
-  }
-
-  // Fallback to clipboard API
-  if (!text) text = await readClipboard();
-
-  if (text && text.trim()) {
-    sourceTextEl.value = text.trim();
-    updateCharCount();
-    saveTextState();
-    pasteBtn?.classList.add('pasted');
-    setTimeout(() => pasteBtn?.classList.remove('pasted'), 1000);
-
-    // Auto-translate if enabled
-    const autoTranslate = document.getElementById('autoTranslateToggle')?.checked;
-    if (autoTranslate) translateText();
-    showToast('Pasted from clipboard', 'success');
-  } else {
-    showToast('Clipboard is empty or inaccessible', 'info');
-  }
-}
-
-async function checkClipboardForNewText() {
-  const stored = await new Promise(resolve => {
-    chrome.storage.local.get(['lastCopiedText', 'lastCopiedTimestamp'], resolve);
-  });
-  const isRecent = stored.lastCopiedTimestamp && (Date.now() - stored.lastCopiedTimestamp < 30000);
-  let text = isRecent ? stored.lastCopiedText : null;
-  if (!text) text = await readClipboard();
-  if (!text || text === lastClipboardText) return;
-
-  lastClipboardText = text;
-  const sourceTextEl = document.getElementById('sourceText');
-  if (sourceTextEl && !sourceTextEl.value.trim()) {
-    const activeTab = document.querySelector('.tab-btn.active')?.dataset.tab;
-    if (activeTab === 'text') {
-      sourceTextEl.value = text.trim();
-      updateCharCount();
-      saveTextState();
-      showToast('Clipboard text loaded', 'info');
-      const autoTranslate = document.getElementById('autoTranslateToggle')?.checked;
-      if (autoTranslate && text.trim()) translateText();
-    }
-  }
-  if (isRecent) chrome.storage.local.remove(['lastCopiedText', 'lastCopiedTimestamp']);
-}
-
-function startClipboardMonitoring() {
-  checkClipboardForNewText();
-  clipboardCheckInterval = setInterval(checkClipboardForNewText, 1500);
-}
-
-function stopClipboardMonitoring() {
-  if (clipboardCheckInterval) {
-    clearInterval(clipboardCheckInterval);
-    clipboardCheckInterval = null;
-  }
-}
-
 async function handleAutoTranslateToggle(e) {
   const enabled = e.target.checked;
   await saveSettings({ autoTranslate: enabled });
@@ -533,29 +959,92 @@ async function translatePage() {
 
   if (!validateSettings(settings).isValid) { showToast('Configure settings first', 'error'); return openModal(); }
 
+  // Check if translation is already in progress
+  const { pageTranslationInProgress } = await new Promise(resolve => 
+    chrome.storage.local.get({ pageTranslationInProgress: false }, resolve)
+  );
+  if (pageTranslationInProgress) {
+    showToast('Translation in progress...', 'info');
+    return;
+  }
+
+  // Disable button immediately and set flag to prevent spam clicks
   setLoading(btn, true);
+  await chrome.storage.local.set({ pageTranslationInProgress: true });
+  
   try {
     await saveSettings({ targetLanguage: lang });
     await updateRecent(lang);
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab) return showToast('No active tab', 'error');
+    if (!tab) {
+      await chrome.storage.local.set({ pageTranslationInProgress: false });
+      setLoading(btn, false);
+      return showToast('No active tab', 'error');
+    }
 
     chrome.tabs.sendMessage(tab.id, { action: 'translate' }, res => {
       if (chrome.runtime.lastError) {
         chrome.scripting.executeScript({ target: { tabId: tab.id, allFrames: true }, files: ['content.js'] })
-          .then(() => setTimeout(() => chrome.tabs.sendMessage(tab.id, { action: 'translate' }), 100));
+          .then(() => setTimeout(() => chrome.tabs.sendMessage(tab.id, { action: 'translate' }), 100))
+          .catch(() => {
+            chrome.storage.local.set({ pageTranslationInProgress: false });
+            setLoading(btn, false);
+          });
       }
     });
     showToast('Translation started!', 'success');
-  } catch (e) { showToast(`Failed: ${e.message}`, 'error'); }
-  finally { setLoading(btn, false); }
+    // Don't re-enable button here - content script will set pageTranslationInProgress to false when done
+  } catch (e) {
+    showToast(`Failed: ${e.message}`, 'error');
+    await chrome.storage.local.set({ pageTranslationInProgress: false });
+    setLoading(btn, false);
+  }
 }
+
+// Check and update translate button state based on translation progress
+async function updateTranslateButtonState() {
+  const btn = document.getElementById('translateBtn');
+  if (!btn) return;
+  const { pageTranslationInProgress } = await new Promise(resolve => 
+    chrome.storage.local.get({ pageTranslationInProgress: false }, resolve)
+  );
+  setLoading(btn, pageTranslationInProgress);
+}
+
+// ============================================================================
+// POPUP PERSISTENCE
+// ============================================================================
+
+/**
+ * Note on Popup Persistence (Requirements 2.1, 2.2, 2.3, 2.4):
+ * 
+ * Chrome extension popups inherently close when they lose focus (clicking outside).
+ * This is browser-controlled behavior that cannot be overridden via JavaScript.
+ * 
+ * The popup can be closed via:
+ * - Clicking outside the popup (Chrome default behavior - cannot be prevented)
+ * - Pressing Escape key (closes settings modal if open)
+ * - Clicking the X button on the settings modal
+ * 
+ * There are NO custom click-outside handlers that close the main popup.
+ * The settings modal has a click-outside handler to close the modal overlay only.
+ * 
+ * If true persistence is required (popup stays open when clicking outside),
+ * the extension would need to open as a detached window instead:
+ *   chrome.windows.create({ url: 'popup.html', type: 'popup', width: 520, height: 500 });
+ */
 
 // ============================================================================
 // INIT
 // ============================================================================
 
 async function init() {
+  // Initialize resize functionality (handles detached mode detection internally)
+  ResizeManager.init();
+  
+  // Initialize drag-to-detach functionality
+  DragManager.init();
+
   let settings;
   try { settings = await loadCredentials(); } catch { settings = DEFAULT_SETTINGS; }
 
@@ -614,9 +1103,20 @@ async function init() {
   updateStatus({ status: 'checking', message: 'Checking...' });
   updateStatus(await checkConnection(settings.proxyUrl));
 
-  // Start clipboard monitoring for Text tab
-  startClipboardMonitoring();
-  window.addEventListener('unload', stopClipboardMonitoring);
+  // Check translate button state on popup open
+  updateTranslateButtonState();
+
+  // Listen for translation progress changes
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local' && changes.pageTranslationInProgress) {
+      updateTranslateButtonState();
+    }
+  });
+
+  // Read clipboard immediately if Text tab is active on popup open
+  if (settings.activeTab === 'text') {
+    ClipboardManager.onTextTabActivated();
+  }
 }
 
 if (typeof chrome !== 'undefined' && chrome.storage) {

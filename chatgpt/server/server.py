@@ -222,14 +222,14 @@ def extract_texts(user_input: str) -> Optional[List[str]]:
         return None
 
 
-def log_tokens(usage: Dict):
-    """Log: Instance ID: token_usage (prompt/completion/total)"""
-    p, c, t = (
-        usage.get("prompt_tokens", "N/A"),
-        usage.get("completion_tokens", "N/A"),
-        usage.get("total_tokens", "N/A"),
-    )
-    print(f"{INSTANCE_ID}: token_usage ({p}/{c}/{t})")
+# def log_tokens(usage: Dict):
+#     """Log: Instance ID: token_usage (prompt/completion/total)"""
+#     p, c, t = (
+#         usage.get("prompt_tokens", "N/A"),
+#         usage.get("completion_tokens", "N/A"),
+#         usage.get("total_tokens", "N/A"),
+#     )
+#     print(f"{INSTANCE_ID}: token_usage ({p}/{c}/{t})")
 
 
 def categorize_error(status: int, text: str, model: str) -> tuple[str, str]:
@@ -428,9 +428,9 @@ async def stream_translations(
                     break
                 try:
                     data = json.loads(line)
-                    content = data.get("content", "") or data.get("choices", [{}])[
+                    content = data.get("system_response", "") or data.get("choices", [{}])[
                         0
-                    ].get("delta", {}).get("content", "")
+                    ].get("delta", {}).get("system_response", "")
                     if content:
                         for item in parser.feed(content):
                             translations.append(item)
@@ -568,13 +568,14 @@ async def handle_sync_request(
         data = response.json()
 
         # Log token usage
-        usage = data.get("usage", {})
-        log_tokens(usage)
+        usage = data.get("token_usage", {})
+        print(f"{INSTANCE_ID}: token_usage: {usage}")
+        # log_tokens(usage)
 
         # Extract content
-        content = data.get("content", "") or data.get("choices", [{}])[0].get(
+        content = data.get("system_response", "") or data.get("choices", [{}])[0].get(
             "message", {}
-        ).get("content", "")
+        ).get("system_response", "")
 
         # Cache if applicable
         if texts and content:

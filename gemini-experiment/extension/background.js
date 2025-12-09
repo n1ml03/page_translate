@@ -61,7 +61,9 @@ function constructPayload(batch, settings, stream = false, options = {}) {
     };
   }
   
-  return {
+  // Build payload with optional masking flag
+  // Requirements 7.1: Forward masked text batches to server with useMasking flag
+  const payload = {
     model: settings.model || DEFAULT_SETTINGS.model,
     messages: [{ role: 'user', content: JSON.stringify(batch) }],
     temperature: 0.3,
@@ -69,6 +71,13 @@ function constructPayload(batch, settings, stream = false, options = {}) {
     target_language: settings.targetLanguage || DEFAULT_SETTINGS.targetLanguage,
     stream
   };
+  
+  // Add useMasking flag when content contains masked placeholders
+  if (options.useMasking) {
+    payload.use_masking = true;
+  }
+  
+  return payload;
 }
 
 function parseResponse(response) {
@@ -299,13 +308,19 @@ async function handleStreamingTranslationRequest(request, port) {
       settings.targetLanguage = request.targetLang;
     }
 
-    // Check if this is an inline translator request (single text with preserveFormat)
-    const options = { preserveFormat: request.preserveFormat || false };
+    // Build options object with preserveFormat and useMasking flags
+    // Requirements 7.1: Handle useMasking flag in requests
+    const options = {
+      preserveFormat: request.preserveFormat || false,
+      useMasking: request.useMasking || false
+    };
 
+    // Requirements 7.2: Relay translated items back to content script via streaming
     await sendStreamingTranslationRequest(
       request.batch,
       settings,
       (index, translation, cached) => {
+        // Relay each translated item back to content script
         port.postMessage({
           type: 'translation',
           index,
@@ -318,6 +333,7 @@ async function handleStreamingTranslationRequest(request, port) {
 
     port.postMessage({ type: 'done' });
   } catch (error) {
+    // Requirements 7.3: Propagate errors for fallback handling
     port.postMessage({ type: 'error', error: error.message });
   }
 }

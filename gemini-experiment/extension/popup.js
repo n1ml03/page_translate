@@ -69,7 +69,9 @@ function showToast(message, type = 'info', autoDismissMs = null) {
   toast.querySelector('.toast-dismiss').addEventListener('click', () => dismissToast(toast));
   container.appendChild(toast);
 
-  const dismissTime = autoDismissMs ?? (type === 'error' ? 2500 : 1500);
+  // Shorter toast times: error=1500ms, success=800ms, info=600ms
+  const defaultTimes = { error: 1500, success: 800, info: 600 };
+  const dismissTime = autoDismissMs ?? (defaultTimes[type] || 800);
   if (dismissTime > 0) setTimeout(() => dismissToast(toast), dismissTime);
 }
 
@@ -484,15 +486,57 @@ function handleClearSource() {
 
 let lastClipboardText = '';
 let clipboardCheckInterval = null;
+let clipboardPermissionGranted = false;
 
-async function readClipboard() {
+// Check if clipboard-read permission is granted (won't prompt user)
+async function checkClipboardPermission() {
+  try {
+    if (navigator.permissions?.query) {
+      const result = await navigator.permissions.query({ name: 'clipboard-read' });
+      clipboardPermissionGranted = result.state === 'granted';
+      // Listen for permission changes
+      result.onchange = () => {
+        clipboardPermissionGranted = result.state === 'granted';
+      };
+      return clipboardPermissionGranted;
+    }
+  } catch (e) {
+    // Permission API not supported or clipboard-read not queryable
+    console.log('Clipboard permission check not available:', e.message);
+  }
+  return false;
+}
+
+async function readClipboard(requireUserActivation = false) {
+  // Try direct clipboard API - requires user activation or granted permission
   try {
     if (navigator.clipboard?.readText) {
-      return await navigator.clipboard.readText();
+      // Only attempt if we have permission granted OR user just clicked (activation)
+      if (clipboardPermissionGranted || requireUserActivation) {
+        const text = await navigator.clipboard.readText();
+        if (text) return text;
+      }
     }
   } catch (e) {
     console.log('Clipboard API failed:', e.message);
+    // Don't show error toast for auto-read attempts, only for user-initiated paste
+    if (requireUserActivation && e.name === 'NotAllowedError') {
+      showToast('Clipboard access denied. Try Ctrl+V.', 'error');
+    }
   }
+  
+  // Fallback: check storage for recently copied text from content script
+  try {
+    const stored = await new Promise(resolve => {
+      chrome.storage.local.get(['lastCopiedText', 'lastCopiedTimestamp'], resolve);
+    });
+    if (stored.lastCopiedTimestamp && Date.now() - stored.lastCopiedTimestamp < 60000) {
+      return stored.lastCopiedText;
+    }
+  } catch (e) {
+    console.log('Storage fallback failed:', e.message);
+  }
+  
   return null;
 }
 
@@ -502,36 +546,16 @@ async function handlePasteFromClipboard() {
 
   if (!sourceTextEl) return;
 
-  // First try to get recently copied text from storage (from content script)
-  let text = null;
-  try {
-    const stored = await new Promise((resolve) => {
-      chrome.storage.local.get(
-        ['lastCopiedText', 'lastCopiedTimestamp'],
-        resolve
-      );
-    });
-    const isRecent =
-      stored.lastCopiedTimestamp &&
-      Date.now() - stored.lastCopiedTimestamp < 60000;
-    if (isRecent && stored.lastCopiedText) {
-      text = stored.lastCopiedText;
-      // Clear after use
-      chrome.storage.local.remove(['lastCopiedText', 'lastCopiedTimestamp']);
-    }
-  } catch (e) {
-    console.log('Storage read failed:', e);
-  }
-
-  // Fallback to clipboard API
-  if (!text) {
-    text = await readClipboard();
-  }
+  // User clicked paste button - this counts as user activation
+  const text = await readClipboard(true); // true = user-initiated, can prompt for permission
 
   if (text && text.trim()) {
     sourceTextEl.value = text.trim();
     updateCharCount();
     saveTextTabState();
+
+    // Clear any stored clipboard text after use
+    chrome.storage.local.remove(['lastCopiedText', 'lastCopiedTimestamp']);
 
     // Visual feedback
     pasteBtn?.classList.add('pasted');
@@ -550,18 +574,28 @@ async function handlePasteFromClipboard() {
 }
 
 async function checkClipboardForNewText() {
-  // First check if there's recently copied text from the page
-  const stored = await new Promise(resolve => {
-    chrome.storage.local.get(['lastCopiedText', 'lastCopiedTimestamp'], resolve);
-  });
+  // First check if there's recently copied text from storage (from content script)
+  let text = null;
+  let isFromStorage = false;
   
-  // Use stored text if it was copied within the last 30 seconds
-  const isRecent = stored.lastCopiedTimestamp && (Date.now() - stored.lastCopiedTimestamp < 30000);
-  let text = isRecent ? stored.lastCopiedText : null;
+  try {
+    const stored = await new Promise(resolve => {
+      chrome.storage.local.get(['lastCopiedText', 'lastCopiedTimestamp'], resolve);
+    });
+    
+    // Use stored text if it was copied within the last 30 seconds
+    const isRecent = stored.lastCopiedTimestamp && (Date.now() - stored.lastCopiedTimestamp < 30000);
+    if (isRecent && stored.lastCopiedText) {
+      text = stored.lastCopiedText;
+      isFromStorage = true;
+    }
+  } catch (e) {
+    console.log('Storage check failed:', e.message);
+  }
   
-  // Fallback to clipboard API
-  if (!text) {
-    text = await readClipboard();
+  // Only try clipboard API if permission is already granted (won't prompt)
+  if (!text && clipboardPermissionGranted) {
+    text = await readClipboard(false); // false = no user activation
   }
   
   if (!text || text === lastClipboardText) return;
@@ -589,12 +623,15 @@ async function checkClipboardForNewText() {
   }
   
   // Clear the stored copied text after using it
-  if (isRecent) {
+  if (isFromStorage) {
     chrome.storage.local.remove(['lastCopiedText', 'lastCopiedTimestamp']);
   }
 }
 
-function startClipboardMonitoring() {
+async function startClipboardMonitoring() {
+  // First check if we have clipboard permission (won't prompt)
+  await checkClipboardPermission();
+  
   // Check clipboard on popup open
   checkClipboardForNewText();
   

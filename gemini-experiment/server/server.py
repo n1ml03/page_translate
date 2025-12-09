@@ -7,7 +7,6 @@ import asyncio
 import hashlib
 import json
 import os
-import re
 import socket
 import time
 import uuid
@@ -105,205 +104,19 @@ class RateLimiter:
 limiter = RateLimiter()
 
 
-# ============================================================================
-# TRANSLATION VALIDATION
-# ============================================================================
-ENGLISH_COMMON_WORDS = {
-    "the",
-    "a",
-    "an",
-    "this",
-    "that",
-    "these",
-    "those",
-    "my",
-    "your",
-    "his",
-    "her",
-    "its",
-    "our",
-    "their",
-    "i",
-    "you",
-    "he",
-    "she",
-    "it",
-    "we",
-    "they",
-    "me",
-    "him",
-    "them",
-    "us",
-    "who",
-    "what",
-    "which",
-    "is",
-    "are",
-    "was",
-    "were",
-    "be",
-    "been",
-    "have",
-    "has",
-    "had",
-    "do",
-    "does",
-    "did",
-    "will",
-    "would",
-    "in",
-    "on",
-    "at",
-    "to",
-    "for",
-    "of",
-    "with",
-    "by",
-    "from",
-    "up",
-    "down",
-    "out",
-    "and",
-    "or",
-    "but",
-    "click",
-    "here",
-    "more",
-    "view",
-    "read",
-    "next",
-    "back",
-    "home",
-    "page",
-    "link",
-    "button",
-    "menu",
-}
-ENGLISH_WORD_PATTERN = re.compile(r"\b[a-zA-Z]+\b")
-ASCII_LETTER_PATTERN = re.compile(r"[a-zA-Z]")
-NON_LATIN_LANGS = {
-    "japanese",
-    "chinese",
-    "korean",
-    "thai",
-    "vietnamese",
-    "arabic",
-    "hebrew",
-    "hindi",
-    "russian",
-    "greek",
-    "日本語",
-    "中文",
-    "한국어",
-    "tiếng việt",
-}
-HTML_TAG_PATTERN = re.compile(r"<(/?)(\w+)([^>]*)>", re.IGNORECASE)
-HTML_SELF_CLOSING = {
-    "br",
-    "hr",
-    "img",
-    "input",
-    "meta",
-    "link",
-    "area",
-    "base",
-    "col",
-    "embed",
-    "source",
-    "track",
-    "wbr",
-}
-
-
-def strip_html(text: str) -> str:
-    return re.sub(r"<[^>]+>", "", text)
-
-
-def extract_words(text: str) -> List[str]:
-    return [
-        w.lower() for w in ENGLISH_WORD_PATTERN.findall(strip_html(text)) if len(w) > 1
-    ]
-
-
-def is_non_latin(lang: str) -> bool:
-    return any(l in lang.lower() for l in NON_LATIN_LANGS)
-
-
-def detect_untranslated(orig: str, trans: str, lang: str) -> bool:
-    orig_clean, trans_clean = strip_html(orig).strip(), strip_html(trans).strip()
-    if not trans_clean and orig_clean:
-        return True
-    if orig_clean.lower() == trans_clean.lower() and len(orig_clean) > 2:
-        return True
-    if len(orig_clean) > 5 and len(trans_clean) > 5:
-        common = sum(1 for c in orig_clean.lower() if c in trans_clean.lower())
-        if common / max(len(orig_clean), len(trans_clean)) > 0.85:
-            return True
-    if is_non_latin(lang):
-        ascii_ratio = len(ASCII_LETTER_PATTERN.findall(trans_clean)) / max(
-            len(trans_clean.replace(" ", "")), 1
-        )
-        if ascii_ratio > 0.5:
-            words = extract_words(trans_clean)
-            eng_count = sum(1 for w in words if w in ENGLISH_COMMON_WORDS)
-            if words and eng_count / len(words) > 0.2:
-                return True
-    return False
-
-
-def detect_residual_tags(orig: str, trans: str) -> bool:
-    orig_tags = [
-        m[1].lower()
-        for m in HTML_TAG_PATTERN.findall(orig)
-        if m[1].lower() not in HTML_SELF_CLOSING
-    ]
-    trans_tags = [
-        m[1].lower()
-        for m in HTML_TAG_PATTERN.findall(trans)
-        if m[1].lower() not in HTML_SELF_CLOSING
-    ]
-    if sorted(orig_tags) != sorted(trans_tags):
-        return True
-    stack = []
-    for match in HTML_TAG_PATTERN.finditer(trans):
-        is_closing, tag = match.group(1) == "/", match.group(2).lower()
-        if tag in HTML_SELF_CLOSING:
-            continue
-        if is_closing:
-            if not stack or stack[-1] != tag:
-                return True
-            stack.pop()
-        else:
-            stack.append(tag)
-    return bool(stack)
-
-
-def validate_translation(orig: str, trans: str, lang: str) -> tuple[bool, str]:
-    if not trans:
-        return False, "empty"
-    if detect_untranslated(orig, trans, lang):
-        return False, "untranslated"
-    if detect_residual_tags(orig, trans):
-        return False, "residual_tags"
-    return True, "ok"
-
-
-def get_incomplete_indices(
-    originals: List[str], translations: List[str], lang: str
-) -> List[int]:
-    return [
-        i
-        for i, (o, t) in enumerate(zip(originals, translations))
-        if not validate_translation(o, t, lang)[0]
-    ]
 
 
 # ============================================================================
 # STREAMING JSON PARSER
 # ============================================================================
-class StreamingJSONArrayParser:
+
+
+class StreamingJSONParser:
+    """Simple streaming JSON array parser."""
+    
     def __init__(self):
-        self.buffer, self.in_array, self.items_yielded = "", False, 0
+        self.buffer = ""
+        self.in_array = False
 
     def feed(self, chunk: str) -> List[str]:
         self.buffer += chunk
@@ -315,6 +128,7 @@ class StreamingJSONArrayParser:
                 self.buffer = self.buffer[idx + 1 :]
             else:
                 return items
+
         while self.buffer:
             self.buffer = self.buffer.lstrip()
             if not self.buffer or self.buffer.startswith("]"):
@@ -326,7 +140,6 @@ class StreamingJSONArrayParser:
                 item, remaining = self._parse_string()
                 if item is not None:
                     items.append(item)
-                    self.items_yielded += 1
                     self.buffer = remaining
                 else:
                     break
@@ -367,29 +180,6 @@ RULES:
 Return ONLY the JSON array."""
 
 
-def get_retry_prompt(texts: List[str], lang: str, issues: List[str]) -> str:
-    instructions = []
-    if "untranslated" in issues:
-        instructions.extend(
-            [
-                f"- Translate ALL text completely to {lang}",
-                "- Do NOT leave source language words",
-            ]
-        )
-    if "residual_tags" in issues:
-        instructions.extend(
-            [
-                "- Preserve HTML tag structure exactly",
-                "- Ensure matching opening/closing tags",
-            ]
-        )
-    if "empty" in issues:
-        instructions.append("- Provide actual translated content")
-    return f"""Fix and translate these texts to {lang}.
-CRITICAL:
-{chr(10).join(instructions) or '- Translate completely and preserve HTML'}
-Input: {json.dumps(texts)}
-Return ONLY a valid JSON array."""
 
 
 # ============================================================================
@@ -525,7 +315,7 @@ async def stream_translations(
     start_time: float,
 ) -> AsyncGenerator[str, None]:
     try:
-        parser = StreamingJSONArrayParser()
+        parser = StreamingJSONParser()
         all_translations = []
         final_usage = None
         
@@ -655,12 +445,10 @@ async def translate(request: TranslateRequest, req: Request):
             stream=request.stream,
         )
 
-        # Build contents
-        system_prompt = (
-            get_translation_prompt(request.target_language)
-            if request.html_aware and request.target_language
-            else None
-        )
+        # Build contents - select appropriate prompt based on content type
+        system_prompt = None
+        if request.target_language and request.html_aware:
+            system_prompt = get_translation_prompt(request.target_language)
         contents = []
         for msg in request.messages:
             role, content = msg.get("role", "user"), msg.get("content", "")
@@ -709,76 +497,22 @@ async def translate(request: TranslateRequest, req: Request):
             instance_id=instance_id,
         )
 
-        # Validate and retry incomplete translations
+        # Cache successful translations
         if success and texts_to_translate and request.target_language and response_text:
             try:
                 translations = json.loads(response_text)
-                if isinstance(translations, list) and len(translations) == len(
-                    texts_to_translate
-                ):
-                    incomplete_idx = get_incomplete_indices(
-                        texts_to_translate, translations, request.target_language
-                    )
-                    retried = False
-                    if incomplete_idx:
-                        issues = set(
-                            validate_translation(
-                                texts_to_translate[i],
-                                translations[i],
-                                request.target_language,
-                            )[1]
-                            for i in incomplete_idx
-                        )
-                        log_validation(instance_id, len(incomplete_idx), list(issues))
-                        retry_contents = [
-                            types.Content(
-                                role="user",
-                                parts=[
-                                    types.Part(
-                                        text=get_retry_prompt(
-                                            [
-                                                texts_to_translate[i]
-                                                for i in incomplete_idx
-                                            ],
-                                            request.target_language,
-                                            list(issues),
-                                        )
-                                    )
-                                ],
-                            )
-                        ]
-                        retry_text, retry_ok, _ = await call_gemini(
-                            request.model,
-                            retry_contents,
-                            config,
-                            len(incomplete_idx),
-                            instance_id=instance_id,
-                        )
-                        if retry_ok and retry_text:
-                            retry_translations = json.loads(retry_text)
-                            if len(retry_translations) == len(incomplete_idx):
-                                for i, idx in enumerate(incomplete_idx):
-                                    translations[idx] = retry_translations[i]
-                                response_text = json.dumps(translations)
-                                retried = True
+                if isinstance(translations, list) and len(translations) == len(texts_to_translate):
                     await cache.set(
                         texts_to_translate,
                         request.target_language,
                         request.model,
                         translations,
                     )
-                    log_response(
-                        instance_id,
-                        len(translations),
-                        (time.time() - start_time) * 1000,
-                        retried=retried,
-                    )
             except (json.JSONDecodeError, TypeError):
                 pass
 
         duration_ms = (time.time() - start_time) * 1000
-        if not texts_to_translate:
-            log_response(instance_id, 1, duration_ms)
+        log_response(instance_id, len(texts_to_translate) if texts_to_translate else 1, duration_ms)
 
         return JSONResponse(
             content={
@@ -832,9 +566,8 @@ def log_response(
     count: int,
     duration_ms: float,
     cached: bool = False,
-    retried: bool = False,
 ):
-    status = "CACHED" if cached else ("RETRIED" if retried else "OK")
+    status = "CACHED" if cached else "OK"
     print(f"[{instance_id}] RES | {status} | texts={count} | time={duration_ms:.0f}ms")
 
 
@@ -849,10 +582,6 @@ def log_tokens(instance_id: str, usage):
 
 def log_error(instance_id: str, error_type: str, message: str):
     print(f"[{instance_id}] ERR | {error_type} | {message[:100]}")
-
-
-def log_validation(instance_id: str, count: int, issues: List[str]):
-    print(f"[{instance_id}] VAL | incomplete={count} | issues={','.join(issues)}")
 
 
 # ============================================================================
