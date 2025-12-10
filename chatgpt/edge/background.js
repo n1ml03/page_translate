@@ -1,4 +1,5 @@
 // Background Script - Translation requests with streaming support
+
 importScripts('crypto.js');
 
 const DEFAULT_SETTINGS = {
@@ -54,12 +55,45 @@ async function getSettings() {
 }
 
 // ============================================================================
-// PAYLOAD CONSTRUCTION - New API Format
+// PAYLOAD CONSTRUCTION - New API Format with HTML-aware Translation
 // ============================================================================
 
-function buildPayload(batch, settings, stream = false) {
+function buildPayload(batch, settings, stream = false, options = {}) {
+  const targetLang = settings.targetLanguage || 'English';
+  const isInlineTranslator = options.preserveFormat && batch.length === 1;
+  
+  // Construct full endpoint from model
+  const fullEndpoint = getFullEndpoint(settings.model);
+  
+  // For inline translator - single text with formatting preservation
+  if (isInlineTranslator) {
+    const hasPlaceholders = /\{\{\/?(\d+|br)\}\}/.test(batch[0]);
+    const systemPrompt = hasPlaceholders
+      ? `Translate the following text to ${targetLang}. 
+CRITICAL RULES:
+1. Preserve ALL placeholders like {{0}}, {{/0}}, {{1}}, {{/1}}, {{br}} EXACTLY as they appear.
+2. These placeholders represent HTML formatting - keep them in the same relative position around translated words.
+3. Keep all line breaks and paragraph spacing.
+4. Return ONLY the translation, no explanations.
+Example: "Hello {{0}}World{{/0}}" → "Bonjour {{0}}Monde{{/0}}"`
+      : `Translate the following text to ${targetLang}. IMPORTANT: Preserve exact formatting - keep all line breaks, paragraph spacing, and special characters exactly as in the original. Return only the translation.`;
+    
+    return {
+      target_endpoint: fullEndpoint,
+      username: settings.username,
+      password: settings.password,
+      model: settings.model,
+      system_prompt: systemPrompt,
+      user_input: batch[0],
+      temperature: 0.3,
+      top_p: 0.9,
+      stream: false
+    };
+  }
+  
+  // For batch translation (page translation) - HTML-aware
   const systemPrompt = `You are a professional web translator.
-Task: Translate the following JSON array of strings into ${settings.targetLanguage}.
+Task: Translate the following JSON array of strings into ${targetLang}.
 Input: A JSON array of strings.
 Output: Render ONLY a valid JSON array of translated strings.
 Rules:
@@ -67,10 +101,11 @@ Rules:
 2. Translate in context.
 3. Keep the output valid JSON. Escape all double quotes within strings correctly.
 4. Do NOT output Markdown code blocks.
-5. Do NOT add any conversational text.`;
-
-  // Construct full endpoint from model
-  const fullEndpoint = getFullEndpoint(settings.model);
+5. Do NOT add any conversational text.
+6. The input text may contain placeholders like {{0}}, {{/0}}, {{br}}. These represent HTML tags.
+   - You MUST preserve them exactly in the translation.
+   - You MUST place the translated text INSIDE the corresponding tags if they wrap content.
+   - Example: "Hello {{0}}World{{/0}}" -> "Bonjour {{0}}Monde{{/0}}".`;
 
   return {
     target_endpoint: fullEndpoint,
@@ -88,13 +123,23 @@ Rules:
 function buildInlinePayload(text, settings) {
   // Construct full endpoint from model
   const fullEndpoint = getFullEndpoint(settings.model);
+  const hasPlaceholders = /\{\{\/?(\d+|br)\}\}/.test(text);
+  
+  const systemPrompt = hasPlaceholders
+    ? `Translate the following text to ${settings.targetLanguage}. 
+CRITICAL RULES:
+1. Preserve ALL placeholders like {{0}}, {{/0}}, {{1}}, {{/1}}, {{br}} EXACTLY as they appear.
+2. These placeholders represent HTML formatting - keep them in the same relative position around translated words.
+3. Keep all line breaks and paragraph spacing.
+4. Return ONLY the translation, no explanations.`
+    : `Translate the following text to ${settings.targetLanguage}. Preserve exact formatting - keep all line breaks and spacing. Return only the translation.`;
 
   return {
     target_endpoint: fullEndpoint,
     username: settings.username,
     password: settings.password,
     model: settings.model,
-    system_prompt: `Translate the following text to ${settings.targetLanguage}. Preserve exact formatting - keep all line breaks and spacing. Return only the translation.`,
+    system_prompt: systemPrompt,
     user_input: text,
     temperature: 0.3,
     top_p: 0.9,
@@ -128,12 +173,13 @@ function formatError(err) {
 // ============================================================================
 
 async function streamTranslation(batch, settings, onTranslation, options = {}) {
-  // Inline translator uses non-streaming
+  // Inline translator uses non-streaming with format preservation
   if (options.preserveFormat && batch.length === 1) {
+    const payload = buildPayload(batch, settings, false, options);
     const res = await fetch(settings.proxyUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(buildInlinePayload(batch[0], settings))
+      body: JSON.stringify(payload)
     });
     if (!res.ok) {
       const data = await res.json().catch(() => res.text());
@@ -146,10 +192,11 @@ async function streamTranslation(batch, settings, onTranslation, options = {}) {
   }
 
   // Streaming for page translation
+  const payload = buildPayload(batch, settings, true, options);
   const res = await fetch(settings.proxyUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(buildPayload(batch, settings, true))
+    body: JSON.stringify(payload)
   });
 
   if (!res.ok) {
@@ -261,7 +308,7 @@ async function handleStreaming(request, port, portId) {
           activePorts.delete(portId);
         }
       }
-    }, { preserveFormat: request.preserveFormat || false });
+    }, { preserveFormat: request.preserveFormat || false, useMasking: request.useMasking || false });
 
     if (activePorts.has(portId)) {
       port.postMessage({ type: 'done' });

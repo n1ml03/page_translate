@@ -1,8 +1,7 @@
-/**
- * InlineTranslator - Inline translation with Shadow DOM isolation
- */
+// InlineTranslator - Inline translation with Shadow DOM isolation
+
 class InlineTranslator {
-  static MAX_TEXT = 1000;
+  static MAX_TEXT = 5000;
   static INLINE_TAGS = new Set(['B', 'I', 'U', 'STRONG', 'EM', 'SPAN', 'A', 'FONT', 'SMALL', 'BIG', 'SUB', 'SUP', 'BR', 'IMG', 'CODE', 'MARK', 'DEL', 'INS', 'S']);
   static BLOCK_TAGS = new Set(['P', 'DIV', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'LI', 'TD', 'TH', 'BLOCKQUOTE', 'ARTICLE', 'SECTION']);
 
@@ -27,6 +26,69 @@ class InlineTranslator {
     if (/fetch|network/i.test(msg)) return this.ERROR_MAP.CONNECTION_ERROR;
     if (/timeout/i.test(msg)) return this.ERROR_MAP.TIMEOUT;
     return msg.length > 80 ? msg.substring(0, 80) + '...' : msg;
+  }
+
+  // Tag abstraction for HTML preservation during translation
+  static TagAbstraction = class {
+    constructor() { this.placeholderRegex = /\{\{(\/?)(\d+|br)\}\}/g; }
+    
+    abstractSmart(html) {
+      const mapping = new Map();
+      let uid = 0;
+      const stack = [];
+      const tokens = html.split(/(<\/?(?:[a-z0-9]+)[^>]*>)/gi);
+      let result = '';
+      
+      for (const token of tokens) {
+        if (!token.match(/<[^>]+>/)) { result += token; continue; }
+        if (/^<br\s*\/?>$/i.test(token)) { result += '{{br}}'; continue; }
+
+        const isClose = token.startsWith('</');
+        const tagNameMatches = token.match(/<\/?([a-z0-9]+).*/i);
+        const tagName = tagNameMatches ? tagNameMatches[1].toLowerCase() : 'tag';
+        const isSelfClosing = token.endsWith('/>') || ['img', 'hr', 'input', 'meta', 'link'].includes(tagName);
+
+        if (isSelfClosing) {
+          const id = uid++;
+          mapping.set(id, { open: token, close: '' });
+          result += `{{${id}}}`;
+          continue; 
+        }
+
+        if (isClose) {
+          let lastIdx = stack.length - 1;
+          while (lastIdx >= 0 && stack[lastIdx].tagName !== tagName) lastIdx--;
+          
+          if (lastIdx >= 0) {
+            const { id } = stack[lastIdx];
+            mapping.get(id).close = token;
+            result += `{{/${id}}}`;
+            stack.splice(lastIdx, stack.length - lastIdx);
+          } else {
+            const id = uid++;
+            mapping.set(id, { open: token, close: '' });
+            result += `{{${id}}}`;
+          }
+        } else {
+          const id = uid++;
+          mapping.set(id, { open: token, close: '' });
+          stack.push({ tagName, id });
+          result += `{{${id}}}`;
+        }
+      }
+      return { text: result, mapping };
+    }
+
+    restore(translatedText, mapping) {
+      let res = translatedText.replace(/\{\{br\}\}/gi, '<br>');
+      res = res.replace(/\{\{(\/?)([0-9]+)\}\}/g, (match, slash, idDigits) => {
+        const id = parseInt(idDigits, 10);
+        const map = mapping.get(id);
+        if (!map) return '';
+        return slash ? (map.close || '') : (map.open || '');
+      });
+      return res;
+    }
   }
 
   constructor(opts = {}) {
@@ -56,6 +118,13 @@ class InlineTranslator {
     this.abortCtrl = null;
     this.startTime = null;
     this._listeners = [];
+
+    // Tag abstraction support
+    this.tagAbstractor = new InlineTranslator.TagAbstraction();
+    this.currentMapping = null;
+    this.currentOriginalHTML = '';
+    this.selectedPlainText = '';
+    this._needsAbstraction = false;
 
     this._onMouseUp = this._handleMouseUp.bind(this);
     this._onMouseDown = this._handleClickOutside.bind(this);
@@ -195,41 +264,80 @@ class InlineTranslator {
   }
 
   _handleScroll() {
-    if (this.panel && this.selectionRect) {
-      try {
-        const sel = window.getSelection();
-        if (sel?.rangeCount > 0) {
-          this.selectionRect = this._getRect(sel.getRangeAt(0));
-          const pos = this._panelPos(this.selectionRect, this._panelWidth(), 320);
+    try {
+      const sel = window.getSelection();
+      if (sel?.rangeCount > 0) {
+        this.selectionRect = sel.getRangeAt(0).getBoundingClientRect();
+        
+        if (this.panel) {
+          const pos = this._panelPos(this.selectionRect, this.panel.offsetWidth || 320, 320);
           this.panel.style.left = `${pos.left}px`;
           this.panel.style.top = `${pos.top}px`;
         }
-      } catch {}
-    }
-    if (this.icon && this.selectionRect) {
-      const pos = this._iconPos(this.selectionRect);
-      this.icon.style.left = `${pos.left}px`;
-      this.icon.style.top = `${pos.top}px`;
-    }
+        
+        if (this.icon) {
+          const pos = this._iconPos(this.selectionRect);
+          this.icon.style.left = `${pos.left}px`;
+          this.icon.style.top = `${pos.top}px`;
+        }
+      }
+    } catch {}
   }
 
   _handleMouseUp(e) {
     if (this.host?.contains(e.target) || e.target === this.host) return;
     setTimeout(() => {
-      let sel, text;
-      try { sel = window.getSelection(); text = sel?.toString().trim(); } catch { return; }
+      let sel;
+      try { sel = window.getSelection(); } catch { return; }
+      if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
+
+      const text = sel.toString().trim();
       if (!text) return;
+
       const active = document.activeElement;
       if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable)) return;
+
       try {
         const range = sel.getRangeAt(0);
         this.selectionRect = this._getRect(range);
-        this.selectedText = text;
         this.selectionRange = range.cloneRange();
+        this.selectedPlainText = text;
+        this._needsAbstraction = true;
+        
         this._hidePanel();
         this._showIcon();
       } catch {}
     }, 10);
+  }
+  
+  _performAbstraction() {
+    if (!this._needsAbstraction || !this.selectionRange) return false;
+    
+    try {
+      if (!this.selectionRange.commonAncestorContainer || !document.contains(this.selectionRange.commonAncestorContainer)) {
+        this.currentOriginalHTML = this.selectedPlainText;
+        this.selectedText = this.selectedPlainText;
+        this.currentMapping = new Map();
+        this._needsAbstraction = false;
+        return true;
+      }
+      
+      const div = document.createElement('div');
+      div.appendChild(this.selectionRange.cloneContents());
+      this.currentOriginalHTML = div.innerHTML;
+      
+      const { text: abstractText, mapping } = this.tagAbstractor.abstractSmart(this.currentOriginalHTML);
+      this.selectedText = abstractText;
+      this.currentMapping = mapping;
+      this._needsAbstraction = false;
+      return true;
+    } catch {
+      this.currentOriginalHTML = this.selectedPlainText;
+      this.selectedText = this.selectedPlainText;
+      this.currentMapping = new Map();
+      this._needsAbstraction = false;
+      return true;
+    }
   }
 
   _handleClickOutside(e) {
@@ -324,14 +432,22 @@ class InlineTranslator {
   _showPanel() {
     this._hidePanel();
     this.isTranslating = false;
+    this._performAbstraction();
 
-    const truncated = this.selectedText.length > InlineTranslator.MAX_TEXT;
-    const text = truncated ? this.selectedText.substring(0, InlineTranslator.MAX_TEXT) : this.selectedText;
+    let plainTextDisplay = this.selectedPlainText || '';
+    try { 
+      const freshText = window.getSelection().toString().trim();
+      if (freshText) plainTextDisplay = freshText;
+    } catch {}
+    if (!plainTextDisplay) plainTextDisplay = this.selectedText;
+
+    const truncated = plainTextDisplay.length > InlineTranslator.MAX_TEXT;
+    const displayText = truncated ? plainTextDisplay.substring(0, InlineTranslator.MAX_TEXT) : plainTextDisplay;
 
     const panel = document.createElement('div');
     panel.className = 'it-panel';
     panel.setAttribute('role', 'dialog');
-    this._buildPanel(panel, text, truncated);
+    this._buildPanel(panel, displayText, truncated);
 
     const pos = this._panelPos(this.selectionRect, this._panelWidth(), 380);
     panel.style.left = `${pos.left}px`;
@@ -518,10 +634,10 @@ class InlineTranslator {
 
     this.abortCtrl = new AbortController();
     const signal = this.abortCtrl.signal;
-    const text = this.selectedText.length > InlineTranslator.MAX_TEXT ? this.selectedText.substring(0, InlineTranslator.MAX_TEXT) : this.selectedText;
+    const textToSend = this.selectedText;
 
     try {
-      const trans = await this.translateFn(text, this.currentLang, signal);
+      const trans = await this.translateFn(textToSend, this.currentLang, signal);
       clearInterval(interval);
       if (!this.panel || signal.aborted) return;
 
@@ -529,11 +645,21 @@ class InlineTranslator {
       setTimeout(() => {
         transBox.classList.remove('loading');
         transBox.style.whiteSpace = 'pre-wrap';
-        this._setTextLines(transBox, trans);
-        transBox.dataset.translation = trans;
+        
+        // Restore HTML tags from placeholders
+        const restoredHTML = this.tagAbstractor.restore(trans, this.currentMapping);
+        const tempDiv = document.createElement('div');
+        tempDiv.innerHTML = restoredHTML;
+        const displayText = tempDiv.textContent;
+
+        this._setTextLines(transBox, displayText);
+        transBox.dataset.translationHtml = restoredHTML;
+        transBox.dataset.translationText = displayText;
+        transBox.dataset.translation = displayText; // backward compatibility
+        
         copyBtn.disabled = false;
         if (replaceBtn) replaceBtn.disabled = false;
-        if (this.onHistoryAdd) this.onHistoryAdd(text, trans, this.currentLang);
+        if (this.onHistoryAdd) this.onHistoryAdd(textToSend, displayText, this.currentLang);
       }, 150);
     } catch (e) {
       clearInterval(interval);
@@ -564,7 +690,7 @@ class InlineTranslator {
   // ============================================================================
 
   _copy(panel) {
-    const trans = panel.querySelector('.it-box.translated')?.dataset.translation;
+    const trans = panel.querySelector('.it-box.translated')?.dataset.translationText;
     const btn = panel.querySelector('.it-btn');
     if (!trans) return;
     navigator.clipboard.writeText(trans).then(() => {
@@ -575,9 +701,9 @@ class InlineTranslator {
   }
 
   _replace(panel) {
-    const trans = panel.querySelector('.it-box.translated')?.dataset.translation;
+    const transHtml = panel.querySelector('.it-box.translated')?.dataset.translationHtml;
     const btn = panel.querySelectorAll('.it-btn')[1];
-    if (!trans || !this.selectionRange) return;
+    if (!transHtml || !this.selectionRange) return;
 
     try {
       if (!this.selectionRange.commonAncestorContainer || !document.contains(this.selectionRange.commonAncestorContainer)) {
@@ -585,225 +711,29 @@ class InlineTranslator {
         setTimeout(() => btn.textContent = 'Replace', 1500);
         return;
       }
+      
+      const wrapper = document.createElement('span');
+      wrapper.className = 'pt-inline-replaced';
+      wrapper.title = 'Click to revert';
+      wrapper.dataset.ptOriginal = this.selectedPlainText;
+      wrapper.dataset.ptOriginalHtml = this.currentOriginalHTML;
+      wrapper.innerHTML = transHtml;
 
-      const container = this.selectionRange.commonAncestorContainer;
-      const parent = container.nodeType === Node.TEXT_NODE ? container.parentElement : container;
+      this.selectionRange.deleteContents();
+      this.selectionRange.insertNode(wrapper);
 
-      if (parent?.isContentEditable) {
-        const sel = window.getSelection();
-        sel.removeAllRanges();
-        sel.addRange(this.selectionRange);
-        this.selectionRange.deleteContents();
-        this.selectionRange.insertNode(document.createTextNode(trans));
-        parent.dispatchEvent(new InputEvent('input', { inputType: 'insertText', data: trans, bubbles: true }));
-      } else {
-        this._replaceWithFormatPreservation(trans);
-        window.getSelection()?.removeAllRanges();
-      }
+      window.getSelection()?.removeAllRanges();
 
       btn.textContent = 'Replaced!';
       btn.classList.add('replaced');
       btn.disabled = true;
       setTimeout(() => this._hidePanel(), 800);
-    } catch (e) {
-      console.error('[InlineTranslator] Replace error:', e);
+    } catch {
       btn.textContent = 'Failed';
       setTimeout(() => btn.textContent = 'Replace', 1500);
     }
   }
 
-  // ============================================================================
-  // FORMAT-PRESERVING REPLACEMENT ALGORITHM
-  // ============================================================================
-
-  _replaceWithFormatPreservation(translation) {
-    const range = this.selectionRange;
-    const selectionInfo = this._analyzeSelection(range);
-
-    if (selectionInfo.type === 'singleTextNode') {
-      this._replaceSingleTextNode(range, translation, selectionInfo);
-    } else if (selectionInfo.type === 'inlineOnly') {
-      this._replaceInlineSelection(range, translation, selectionInfo);
-    } else if (selectionInfo.type === 'singleBlock') {
-      this._replaceBlockInlineContent(range, translation, selectionInfo);
-    } else {
-      this._replaceMultiBlockPreserving(range, translation, selectionInfo);
-    }
-  }
-
-  _analyzeSelection(range) {
-    const startContainer = range.startContainer;
-    const endContainer = range.endContainer;
-
-    if (startContainer === endContainer && startContainer.nodeType === Node.TEXT_NODE) {
-      return { type: 'singleTextNode', textNode: startContainer, parentElement: startContainer.parentElement };
-    }
-
-    const ancestorElement = range.commonAncestorContainer.nodeType === Node.TEXT_NODE
-      ? range.commonAncestorContainer.parentElement
-      : range.commonAncestorContainer;
-
-    const startBlock = this._getBlockParent(startContainer);
-    const endBlock = this._getBlockParent(endContainer);
-
-    if (startBlock === endBlock) {
-      if (this._hasOnlyInlineContent(startBlock)) {
-        return { type: 'singleBlock', blockElement: startBlock, originalHTML: this._getSelectedHTML(range) };
-      }
-      return { type: 'inlineOnly', ancestorElement, originalHTML: this._getSelectedHTML(range) };
-    }
-
-    return { type: 'multiBlock', startBlock, endBlock, originalHTML: this._getSelectedHTML(range) };
-  }
-
-  _getBlockParent(node) {
-    let current = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
-    while (current && current !== document.body) {
-      if (InlineTranslator.BLOCK_TAGS.has(current.tagName)) return current;
-      current = current.parentElement;
-    }
-    return document.body;
-  }
-
-  _hasOnlyInlineContent(element) {
-    for (const child of element.childNodes) {
-      if (child.nodeType === Node.TEXT_NODE) continue;
-      if (child.nodeType === Node.ELEMENT_NODE) {
-        if (InlineTranslator.BLOCK_TAGS.has(child.tagName)) return false;
-        if (!InlineTranslator.INLINE_TAGS.has(child.tagName) && !this._hasOnlyInlineContent(child)) return false;
-      }
-    }
-    return true;
-  }
-
-  _getSelectedHTML(range) {
-    const fragment = range.cloneContents();
-    const div = document.createElement('div');
-    div.appendChild(fragment);
-    return div.innerHTML;
-  }
-
-  _replaceSingleTextNode(range, translation, info) {
-    const textNode = info.textNode;
-    const parent = info.parentElement;
-
-    if (!parent) {
-      range.deleteContents();
-      range.insertNode(document.createTextNode(translation));
-      return;
-    }
-
-    const beforeText = textNode.textContent.substring(0, range.startOffset);
-    const afterText = textNode.textContent.substring(range.endOffset);
-
-    const wrapper = document.createElement('span');
-    wrapper.className = 'pt-inline-replaced';
-    wrapper.dataset.ptOriginal = this.selectedText;
-    wrapper.title = 'Click to revert';
-    this._setTextLines(wrapper, translation);
-
-    const fragment = document.createDocumentFragment();
-    if (beforeText) fragment.appendChild(document.createTextNode(beforeText));
-    fragment.appendChild(wrapper);
-    if (afterText) fragment.appendChild(document.createTextNode(afterText));
-    parent.replaceChild(fragment, textNode);
-  }
-
-  _replaceInlineSelection(range, translation, info) {
-    const wrapper = document.createElement('span');
-    wrapper.className = 'pt-inline-replaced';
-    wrapper.dataset.ptOriginal = this.selectedText;
-    wrapper.dataset.ptOriginalHtml = info.originalHTML;
-    wrapper.title = 'Click to revert';
-    this._setTextLines(wrapper, translation);
-    range.deleteContents();
-    range.insertNode(wrapper);
-  }
-
-  _replaceBlockInlineContent(range, translation, info) {
-    const wrapper = document.createElement('span');
-    wrapper.className = 'pt-inline-replaced';
-    wrapper.dataset.ptOriginal = this.selectedText;
-    wrapper.dataset.ptOriginalHtml = info.originalHTML;
-    wrapper.title = 'Click to revert';
-    this._setTextLines(wrapper, translation);
-    range.deleteContents();
-    range.insertNode(wrapper);
-  }
-
-  _replaceMultiBlockPreserving(range, translation, info) {
-    const textNodes = this._getTextNodesInRange(range);
-    if (textNodes.length === 0) {
-      range.deleteContents();
-      const wrapper = this._createReplacementWrapper(translation, info.originalHTML);
-      range.insertNode(wrapper);
-      return;
-    }
-
-    const firstNode = textNodes[0];
-    const startOffset = firstNode.node === range.startContainer ? range.startOffset : 0;
-    const wrapper = this._createReplacementWrapper(translation, info.originalHTML);
-    const beforeText = firstNode.node.textContent.substring(0, startOffset);
-
-    for (let i = textNodes.length - 1; i >= 0; i--) {
-      const { node } = textNodes[i];
-      if (i === 0) {
-        const parent = node.parentNode;
-        if (!parent) continue;
-        if (beforeText) parent.insertBefore(document.createTextNode(beforeText), node);
-        parent.insertBefore(wrapper, node);
-        if (node === range.startContainer && node === range.endContainer) {
-          const afterText = node.textContent.substring(range.endOffset);
-          if (afterText) parent.insertBefore(document.createTextNode(afterText), node);
-        }
-        parent.removeChild(node);
-      } else if (i === textNodes.length - 1) {
-        const endOffset = node === range.endContainer ? range.endOffset : node.textContent.length;
-        const afterText = node.textContent.substring(endOffset);
-        if (afterText) node.textContent = afterText;
-        else node.parentNode?.removeChild(node);
-      } else {
-        node.parentNode?.removeChild(node);
-      }
-    }
-  }
-
-  _createReplacementWrapper(translation, originalHTML) {
-    const wrapper = document.createElement('span');
-    wrapper.className = 'pt-inline-replaced';
-    wrapper.dataset.ptOriginal = this.selectedText;
-    if (originalHTML) wrapper.dataset.ptOriginalHtml = originalHTML;
-    wrapper.title = 'Click to revert';
-    wrapper.style.whiteSpace = 'pre-wrap';
-    this._setTextLines(wrapper, translation);
-    return wrapper;
-  }
-
-  _getTextNodesInRange(range) {
-    const textNodes = [];
-    const container = range.commonAncestorContainer;
-
-    if (container.nodeType === Node.TEXT_NODE) {
-      return [{ node: container, isPartial: true }];
-    }
-
-    const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
-      acceptNode: (node) => {
-        const nodeRange = document.createRange();
-        nodeRange.selectNodeContents(node);
-        const startsBeforeEnd = range.compareBoundaryPoints(Range.START_TO_END, nodeRange) >= 0;
-        const endsAfterStart = range.compareBoundaryPoints(Range.END_TO_START, nodeRange) <= 0;
-        if (startsBeforeEnd && endsAfterStart && node.textContent.trim()) return NodeFilter.FILTER_ACCEPT;
-        return NodeFilter.FILTER_REJECT;
-      }
-    });
-
-    let node;
-    while ((node = walker.nextNode())) {
-      textNodes.push({ node, isPartial: node === range.startContainer || node === range.endContainer });
-    }
-    return textNodes;
-  }
 
   // ============================================================================
   // POSITIONING

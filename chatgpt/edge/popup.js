@@ -1139,10 +1139,10 @@ async function translatePage() {
     }
 
     // Check storage flag (may be stale from crashed content script)
-    const { pageTranslationInProgress, pageTranslationStartTime } = await new Promise(resolve => 
+    const { pageTranslationInProgress, pageTranslationStartTime } = await new Promise(resolve =>
       chrome.storage.local.get({ pageTranslationInProgress: false, pageTranslationStartTime: 0 }, resolve)
     );
-    
+
     // Auto-reset stale flag (older than 5 minutes)
     const isStale = pageTranslationStartTime && Date.now() - pageTranslationStartTime > 300000;
     if (pageTranslationInProgress && !isStale) {
@@ -1151,14 +1151,14 @@ async function translatePage() {
     }
 
     // Set flag with timestamp for staleness detection
-    await chrome.storage.local.set({ 
-      pageTranslationInProgress: true, 
-      pageTranslationStartTime: Date.now() 
+    await chrome.storage.local.set({
+      pageTranslationInProgress: true,
+      pageTranslationStartTime: Date.now()
     });
-    
+
     await saveSettings({ targetLanguage: lang });
     await updateRecent(lang);
-    
+
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab) {
       await chrome.storage.local.set({ pageTranslationInProgress: false });
@@ -1166,20 +1166,104 @@ async function translatePage() {
       return;
     }
 
-    chrome.tabs.sendMessage(tab.id, { action: 'translate' }, res => {
+    chrome.tabs.sendMessage(tab.id, { action: 'translate', targetLanguage: lang }, res => {
       if (chrome.runtime.lastError) {
         chrome.scripting.executeScript({ target: { tabId: tab.id, allFrames: true }, files: ['content.js'] })
-          .then(() => setTimeout(() => chrome.tabs.sendMessage(tab.id, { action: 'translate' }), 100))
+          .then(() => setTimeout(() => chrome.tabs.sendMessage(tab.id, { action: 'translate', targetLanguage: lang }), 100))
           .catch(() => chrome.storage.local.set({ pageTranslationInProgress: false }));
       }
+      // Check translation status after a short delay
+      setTimeout(checkTranslationStatus, 500);
     });
     showToast('Translation started!', 'success');
+    // Update UI after translation starts
+    setTimeout(checkTranslationStatus, 2000);
   } catch (e) {
     showToast(`Failed: ${e.message}`, 'error');
     await chrome.storage.local.set({ pageTranslationInProgress: false });
   } finally {
     _translateLock = false;
     // Button state managed by storage listener
+  }
+}
+
+// Check translation status from content script
+async function checkTranslationStatus() {
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab) return;
+
+    chrome.tabs.sendMessage(tab.id, { action: 'getTranslationStatus' }, response => {
+      if (chrome.runtime.lastError || !response?.success) {
+        updateTranslationStatusUI(null);
+        return;
+      }
+      updateTranslationStatusUI(response);
+    });
+  } catch {
+    updateTranslationStatusUI(null);
+  }
+}
+
+// Update UI based on translation status
+function updateTranslationStatusUI(status) {
+  const toggleBtn = document.getElementById('toggleTranslationBtn');
+  const statusEl = document.getElementById('translationStatus');
+  
+  if (!status || !status.isTranslated) {
+    toggleBtn?.classList.add('hidden');
+    statusEl?.classList.add('hidden');
+    return;
+  }
+
+  // Show toggle button
+  toggleBtn?.classList.remove('hidden');
+  statusEl?.classList.remove('hidden');
+  
+  const isShowingOriginal = status.displayMode === 'original';
+  const toggleText = toggleBtn?.querySelector('.toggle-text');
+  const statusLabel = statusEl?.querySelector('.status-label');
+  const statusInfo = statusEl?.querySelector('.status-info');
+  
+  if (isShowingOriginal) {
+    toggleBtn?.classList.add('showing-original');
+    if (toggleText) toggleText.textContent = 'Show Translation';
+    statusEl?.classList.add('original-mode');
+    if (statusLabel) statusLabel.textContent = 'Showing Original';
+  } else {
+    toggleBtn?.classList.remove('showing-original');
+    if (toggleText) toggleText.textContent = 'Show Original';
+    statusEl?.classList.remove('original-mode');
+    if (statusLabel) statusLabel.textContent = 'Translated';
+  }
+  
+  if (statusInfo) {
+    const lang = status.targetLanguage || '';
+    const count = status.totalElements || 0;
+    statusInfo.textContent = lang ? `${lang} • ${count} elements` : `${count} elements`;
+  }
+}
+
+// Handle toggle button click
+async function handleToggleTranslation() {
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab) return;
+
+    chrome.tabs.sendMessage(tab.id, { action: 'toggleTranslation' }, response => {
+      if (chrome.runtime.lastError) {
+        showToast('Failed to toggle translation', 'error');
+        return;
+      }
+      if (response?.success) {
+        updateTranslationStatusUI({ isTranslated: true, displayMode: response.displayMode });
+        // No toast - just update UI silently
+      } else {
+        showToast(response?.error || 'Page not translated', 'error');
+      }
+    });
+  } catch {
+    showToast('Failed to toggle translation', 'error');
   }
 }
 
@@ -1258,10 +1342,14 @@ async function init() {
 
   // Page tab
   document.getElementById('translateBtn')?.addEventListener('click', translatePage);
+  document.getElementById('toggleTranslationBtn')?.addEventListener('click', handleToggleTranslation);
   document.getElementById('targetLanguage')?.addEventListener('change', e => {
     chrome.storage.local.set({ targetLanguage: e.target.value });
     updateRecent(e.target.value).then(r => renderQuickLangs('pageQuickLangs', e.target.value, r, pageQuickSelect));
   });
+  
+  // Check translation status when popup opens
+  checkTranslationStatus();
 
   // Text tab
   document.getElementById('sourceText')?.addEventListener('input', () => { updateCharCount(); saveTextState(); });
@@ -1293,8 +1381,14 @@ async function init() {
   renderQuickLangs('pageQuickLangs', settings.targetLanguage, recent, pageQuickSelect);
   renderQuickLangs('textQuickLangs', settings.textTargetLang, recent, textQuickSelect);
 
-  updateStatus({ status: 'checking', message: 'Verifying...' });
-  updateStatus(await verifyConnection(settings));
+  // Quick connection check (HEAD request) - no tokens used
+  // Full verification only on "Test Connection" click or after saving settings
+  const { isValid } = validateSettings(settings);
+  if (!isValid) {
+    updateStatus({ status: 'unconfigured', message: 'Not configured' });
+  } else {
+    updateStatus(await checkConnection(settings.proxyUrl));
+  }
 
   // Check translate button state on popup open
   updateTranslateButtonState();
@@ -1306,10 +1400,6 @@ async function init() {
     }
   });
 
-  // Read clipboard immediately if Text tab is active on popup open
-  if (settings.activeTab === 'text') {
-    ClipboardManager.onTextTabActivated();
-  }
 }
 
 if (typeof chrome !== 'undefined' && chrome.storage) {

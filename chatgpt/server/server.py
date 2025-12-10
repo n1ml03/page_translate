@@ -14,7 +14,7 @@ import time
 import uuid
 from collections import OrderedDict
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator, Dict, List, Optional, Set
+from typing import AsyncGenerator, Dict, List, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -26,15 +26,11 @@ from pydantic import BaseModel, Field
 # CONFIGURATION
 # ============================================================================
 
-CACHE_MAX_SIZE = int(
-    os.environ.get("CACHE_MAX_SIZE", "10000")
-)  # Increased for high traffic
+CACHE_MAX_SIZE = int(os.environ.get("CACHE_MAX_SIZE", "10000"))
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "3600"))
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "120"))
-MAX_CONNECTIONS = int(
-    os.environ.get("MAX_CONNECTIONS", "500")
-)  # Increased for concurrency
-MAX_KEEPALIVE = int(os.environ.get("MAX_KEEPALIVE", "100"))  # Increased
+MAX_CONNECTIONS = int(os.environ.get("MAX_CONNECTIONS", "500"))
+MAX_KEEPALIVE = int(os.environ.get("MAX_KEEPALIVE", "100"))
 CONNECT_TIMEOUT = int(os.environ.get("CONNECT_TIMEOUT", "10"))
 RATE_LIMIT_RPM = int(os.environ.get("RATE_LIMIT_RPM", "120"))
 RATE_LIMIT_BURST = int(os.environ.get("RATE_LIMIT_BURST", "20"))
@@ -43,10 +39,10 @@ AUTH_LOCKOUT_SEC = int(os.environ.get("AUTH_FAILURE_LOCKOUT_SECONDS", "300"))
 AUTH_WINDOW_SEC = int(os.environ.get("AUTH_FAILURE_WINDOW_SECONDS", "60"))
 INSTANCE_ID = os.environ.get("INSTANCE_ID", str(uuid.uuid4())[:8])
 DEDUP_ENABLED = os.environ.get("DEDUP_ENABLED", "true").lower() == "true"
-LOCK_TIMEOUT = float(os.environ.get("LOCK_TIMEOUT", "5.0"))  # Max wait for lock
-MAX_CONCURRENT_API_CALLS = int(
-    os.environ.get("MAX_CONCURRENT_API_CALLS", "50")
-)  # Limit upstream pressure
+LOCK_TIMEOUT = float(os.environ.get("LOCK_TIMEOUT", "5.0"))
+MAX_CONCURRENT_API_CALLS = int(os.environ.get("MAX_CONCURRENT_API_CALLS", "50"))
+CLEANUP_INTERVAL = int(os.environ.get("CLEANUP_INTERVAL", "300"))
+CLIENT_TTL = int(os.environ.get("CLIENT_TTL", "3600"))
 
 ALLOWED_ORIGINS = os.environ.get(
     "ALLOWED_ORIGINS",
@@ -55,6 +51,81 @@ ALLOWED_ORIGINS = os.environ.get(
 
 http_client: Optional[httpx.AsyncClient] = None
 api_semaphore: Optional[asyncio.Semaphore] = None
+
+
+# ============================================================================
+# HELPERS
+# ============================================================================
+
+
+def cache_key(texts: List[str], lang: str, model: str) -> str:
+    """Generate cache key for translation requests."""
+    return hashlib.sha256(
+        json.dumps({"t": texts, "l": lang, "m": model}, sort_keys=True).encode()
+    ).hexdigest()
+
+
+def basic_auth(username: str, password: str) -> str:
+    return f"Basic {base64.b64encode(f'{username}:{password}'.encode()).decode()}"
+
+
+def extract_lang(prompt: str) -> str:
+    match = re.search(r"into\s+(\w+)", prompt, re.IGNORECASE)
+    return match.group(1) if match else "English"
+
+
+def extract_texts(user_input: str) -> Optional[List[str]]:
+    try:
+        texts = json.loads(user_input)
+        return texts if isinstance(texts, list) else None
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def sse_json(data: dict) -> str:
+    """Format data as Server-Sent Event."""
+    return f"data: {json.dumps(data)}\n\n"
+
+
+def sse_error(err_type: str, message: str) -> str:
+    """Format error as Server-Sent Event."""
+    return sse_json({"error": {"type": err_type, "message": message}})
+
+
+def categorize_error(status: int, text: str, model: str) -> tuple[str, str]:
+    detail = ""
+    try:
+        err = json.loads(text).get("error", {})
+        detail = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+    except Exception:
+        detail = text[:200]
+
+    error_map = {
+        401: "UNAUTHORIZED",
+        403: "FORBIDDEN",
+        404: "MODEL_NOT_FOUND",
+        429: "RATE_LIMIT",
+        504: "TIMEOUT",
+    }
+    if status in error_map:
+        return error_map[status], f"{error_map[status]}: {detail}"
+    if status == 400:
+        if "context_length" in text.lower() or "token" in text.lower():
+            return "CONTEXT_LENGTH_EXCEEDED", detail
+        return "BAD_REQUEST", detail
+    if status in (502, 503):
+        return "GATEWAY_ERROR", detail
+    return "SERVER_ERROR" if status >= 500 else "UNKNOWN_ERROR", detail
+
+
+def get_lan_ip() -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(0.1)
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except Exception:
+        return "0.0.0.0"
 
 
 # ============================================================================
@@ -75,11 +146,8 @@ async def lifespan(app: FastAPI):
         verify=False,
         http2=True,
     )
-    # Semaphore limits concurrent API calls to prevent overwhelming upstream
     api_semaphore = asyncio.Semaphore(MAX_CONCURRENT_API_CALLS)
-    print(
-        f"[{INSTANCE_ID}] HTTP client initialized (max {MAX_CONCURRENT_API_CALLS} concurrent API calls)"
-    )
+    print(f"[{INSTANCE_ID}] HTTP client initialized (max {MAX_CONCURRENT_API_CALLS} concurrent API calls)")
     yield
     if http_client:
         await http_client.aclose()
@@ -103,13 +171,8 @@ class TranslationCache:
         self._hits = self._misses = self._timeouts = 0
         self._last_cleanup = time.time()
 
-    def _key(self, texts: List[str], lang: str, model: str) -> str:
-        return hashlib.sha256(
-            json.dumps({"t": texts, "l": lang, "m": model}, sort_keys=True).encode()
-        ).hexdigest()
-
     async def get(self, texts: List[str], lang: str, model: str) -> Optional[List[str]]:
-        key = self._key(texts, lang, model)
+        key = cache_key(texts, lang, model)
         try:
             async with asyncio.timeout(LOCK_TIMEOUT):
                 async with self._lock:
@@ -128,10 +191,8 @@ class TranslationCache:
             self._timeouts += 1
         return None
 
-    async def set(
-        self, texts: List[str], lang: str, model: str, translations: List[str]
-    ):
-        key = self._key(texts, lang, model)
+    async def set(self, texts: List[str], lang: str, model: str, translations: List[str]):
+        key = cache_key(texts, lang, model)
         try:
             async with asyncio.timeout(LOCK_TIMEOUT):
                 async with self._lock:
@@ -140,15 +201,14 @@ class TranslationCache:
                     while len(self._cache) > self.max_size:
                         self._cache.popitem(last=False)
         except asyncio.TimeoutError:
-            pass  # Skip caching if lock contention is too high
+            pass
 
     def _cleanup_expired(self, now: float):
-        """Remove expired cache entries."""
         expired = [k for k, v in self._cache.items() if now - v["ts"] > self.ttl]
         for key in expired:
             del self._cache[key]
         if expired:
-            print(f"{INSTANCE_ID}: cleaned {len(expired)} expired cache entries")
+            print(f"[{INSTANCE_ID}] Cleaned {len(expired)} expired cache entries")
 
     async def stats(self) -> Dict:
         async with self._lock:
@@ -172,35 +232,21 @@ cache = TranslationCache()
 
 
 class RequestDeduplicator:
-    """
-    Coalesces identical in-flight requests to avoid duplicate API calls.
-
-    If User A and User B request the same translation simultaneously,
-    only one API call is made and both get the result.
-    """
+    """Coalesces identical in-flight requests to avoid duplicate API calls."""
 
     def __init__(self):
         self._pending: Dict[str, asyncio.Future] = {}
         self._lock = asyncio.Lock()
-        self._coalesced = 0  # Requests that were deduplicated
-
-    def _key(self, texts: List[str], lang: str, model: str) -> str:
-        return hashlib.sha256(
-            json.dumps({"t": texts, "l": lang, "m": model}, sort_keys=True).encode()
-        ).hexdigest()
+        self._coalesced = 0
 
     async def get_or_create(
         self, texts: List[str], lang: str, model: str
     ) -> tuple[Optional[asyncio.Future], bool]:
-        """
-        Returns (future, is_owner).
-        - If is_owner=True: caller should execute the request and set future result
-        - If is_owner=False: caller should await the future for result
-        """
+        """Returns (future, is_owner). Owner executes request; others await the future."""
         if not DEDUP_ENABLED:
             return None, True
 
-        key = self._key(texts, lang, model)
+        key = cache_key(texts, lang, model)
         async with self._lock:
             if key in self._pending:
                 self._coalesced += 1
@@ -210,18 +256,14 @@ class RequestDeduplicator:
             return future, True
 
     async def complete(
-        self,
-        texts: List[str],
-        lang: str,
-        model: str,
-        result: Optional[List[str]],
-        error: Optional[str] = None,
+        self, texts: List[str], lang: str, model: str, 
+        result: Optional[List[str]], error: Optional[str] = None
     ):
         """Mark request as complete, notify all waiters."""
         if not DEDUP_ENABLED:
             return
 
-        key = self._key(texts, lang, model)
+        key = cache_key(texts, lang, model)
         async with self._lock:
             future = self._pending.pop(key, None)
             if future and not future.done():
@@ -232,10 +274,7 @@ class RequestDeduplicator:
 
     async def stats(self) -> Dict:
         async with self._lock:
-            return {
-                "pending": len(self._pending),
-                "coalesced": self._coalesced,
-            }
+            return {"pending": len(self._pending), "coalesced": self._coalesced}
 
 
 deduplicator = RequestDeduplicator()
@@ -244,9 +283,6 @@ deduplicator = RequestDeduplicator()
 # ============================================================================
 # RATE LIMITER
 # ============================================================================
-
-CLEANUP_INTERVAL = int(os.environ.get("CLEANUP_INTERVAL", "300"))  # 5 minutes
-CLIENT_TTL = int(os.environ.get("CLIENT_TTL", "3600"))  # 1 hour
 
 
 class RateLimiter:
@@ -262,7 +298,6 @@ class RateLimiter:
     async def acquire(self, client: str = "global") -> tuple[bool, float]:
         async with self._lock:
             now = time.time()
-            # Periodic cleanup of stale clients
             if now - self._last_cleanup > CLEANUP_INTERVAL:
                 self._cleanup_stale(now)
                 self._last_cleanup = now
@@ -270,8 +305,7 @@ class RateLimiter:
             if client not in self._tokens:
                 self._tokens[client], self._last[client] = self.burst, now
             self._tokens[client] = min(
-                self.burst,
-                self._tokens[client] + (now - self._last[client]) * self.rate,
+                self.burst, self._tokens[client] + (now - self._last[client]) * self.rate
             )
             self._last[client] = now
             if self._tokens[client] >= 1:
@@ -280,13 +314,12 @@ class RateLimiter:
             return False, (1 - self._tokens[client]) / self.rate
 
     def _cleanup_stale(self, now: float):
-        """Remove clients inactive for more than CLIENT_TTL seconds."""
         stale = [c for c, t in self._last.items() if now - t > CLIENT_TTL]
         for client in stale:
             self._tokens.pop(client, None)
             self._last.pop(client, None)
         if stale:
-            print(f"{INSTANCE_ID}: cleaned up {len(stale)} stale rate limit entries")
+            print(f"[{INSTANCE_ID}] Cleaned {len(stale)} stale rate limit entries")
 
 
 limiter = RateLimiter()
@@ -298,7 +331,7 @@ limiter = RateLimiter()
 
 
 class AuthLimiter:
-    """Tracks authentication failures with automatic cleanup of stale entries."""
+    """Tracks authentication failures with automatic cleanup."""
 
     def __init__(self):
         self._failures: Dict[str, List[float]] = {}
@@ -309,7 +342,6 @@ class AuthLimiter:
     async def is_locked(self, client: str) -> tuple[bool, float]:
         async with self._lock:
             now = time.time()
-            # Periodic cleanup
             if now - self._last_cleanup > CLEANUP_INTERVAL:
                 self._cleanup_stale(now)
                 self._last_cleanup = now
@@ -341,97 +373,21 @@ class AuthLimiter:
             self._lockouts.pop(client, None)
 
     def _cleanup_stale(self, now: float):
-        """Remove expired lockouts and stale failure records."""
-        # Clean expired lockouts
         expired = [c for c, t in self._lockouts.items() if now > t]
         for client in expired:
             del self._lockouts[client]
             self._failures.pop(client, None)
-        # Clean stale failure records (no activity for CLIENT_TTL)
         stale = [
-            c
-            for c, timestamps in self._failures.items()
-            if not timestamps or now - max(timestamps) > CLIENT_TTL
+            c for c, ts in self._failures.items() 
+            if not ts or now - max(ts) > CLIENT_TTL
         ]
         for client in stale:
             del self._failures[client]
         if expired or stale:
-            print(
-                f"{INSTANCE_ID}: cleaned {len(expired)} lockouts, {len(stale)} stale auth entries"
-            )
+            print(f"[{INSTANCE_ID}] Cleaned {len(expired)} lockouts, {len(stale)} stale auth entries")
 
 
 auth_limiter = AuthLimiter()
-
-
-# ============================================================================
-# HELPERS
-# ============================================================================
-
-
-def basic_auth(username: str, password: str) -> str:
-    return f"Basic {base64.b64encode(f'{username}:{password}'.encode()).decode()}"
-
-
-def extract_lang(prompt: str) -> str:
-    match = re.search(r"into\s+(\w+)", prompt, re.IGNORECASE)
-    return match.group(1) if match else "English"
-
-
-def extract_texts(user_input: str) -> Optional[List[str]]:
-    try:
-        texts = json.loads(user_input)
-        return texts if isinstance(texts, list) else None
-    except (json.JSONDecodeError, TypeError):
-        return None
-
-
-# def log_tokens(usage: Dict):
-#     """Log: Instance ID: token_usage (prompt/completion/total)"""
-#     p, c, t = (
-#         usage.get("prompt_tokens", "N/A"),
-#         usage.get("completion_tokens", "N/A"),
-#         usage.get("total_tokens", "N/A"),
-#     )
-#     print(f"{INSTANCE_ID}: token_usage ({p}/{c}/{t})")
-
-
-def categorize_error(status: int, text: str, model: str) -> tuple[str, str]:
-    detail = ""
-    try:
-        err = json.loads(text).get("error", {})
-        detail = err.get("message", str(err)) if isinstance(err, dict) else str(err)
-    except Exception:
-        detail = text[:200]
-
-    errors = {
-        401: "UNAUTHORIZED",
-        403: "FORBIDDEN",
-        404: "MODEL_NOT_FOUND",
-        429: "RATE_LIMIT",
-        504: "TIMEOUT",
-    }
-    if status in errors:
-        return errors[status], f"{errors[status]}: {detail}"
-    if status == 400:
-        if "context_length" in text.lower() or "token" in text.lower():
-            return "CONTEXT_LENGTH_EXCEEDED", detail
-        return "BAD_REQUEST", detail
-    if status in (502, 503):
-        return "GATEWAY_ERROR", detail
-    return "SERVER_ERROR" if status >= 500 else "UNKNOWN_ERROR", detail
-
-
-def get_lan_ip() -> str:
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(0.1)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return "0.0.0.0"
 
 
 # ============================================================================
@@ -451,7 +407,7 @@ class StreamingJSONParser:
             idx = self.buffer.find("[")
             if idx != -1:
                 self.in_array = True
-                self.buffer = self.buffer[idx + 1 :]
+                self.buffer = self.buffer[idx + 1:]
             else:
                 return items
 
@@ -483,7 +439,7 @@ class StreamingJSONParser:
                 continue
             if self.buffer[i] == '"':
                 try:
-                    return json.loads(self.buffer[: i + 1]), self.buffer[i + 1 :]
+                    return json.loads(self.buffer[:i + 1]), self.buffer[i + 1:]
                 except json.JSONDecodeError:
                     return None, self.buffer
             i += 1
@@ -528,7 +484,7 @@ async def health():
 
 @app.head("/proxy/translate")
 async def translate_head():
-    """HEAD request cho connection check từ extension"""
+    """HEAD request for connection check from extension."""
     return JSONResponse(content=None, headers={"X-Instance-ID": INSTANCE_ID})
 
 
@@ -549,6 +505,10 @@ async def stats():
 async def stream_translations(
     request: TranslateRequest, texts: Optional[List[str]], lang: str, client_id: str
 ) -> AsyncGenerator[str, None]:
+    if not http_client or not api_semaphore:
+        yield sse_error("SERVER_ERROR", "Server not initialized")
+        return
+
     headers = {
         "Authorization": basic_auth(request.username, request.password),
         "Content-Type": "application/json",
@@ -560,32 +520,18 @@ async def stream_translations(
         "top_p": request.top_p,
     }
 
-    if not http_client:
-        yield f"data: {json.dumps({'error': {'type': 'SERVER_ERROR', 'message': 'HTTP client not initialized'}})}\n\n"
-        return
-
     try:
-        if not api_semaphore:
-            yield f"data: {json.dumps({'error': {'type': 'SERVER_ERROR', 'message': 'Server not initialized'}})}\n\n"
-            return
-
         async with api_semaphore:
             async with http_client.stream(
                 "POST", request.target_endpoint, json=payload, headers=headers
             ) as response:
                 if response.status_code != 200:
                     text = (await response.aread()).decode()
-                    err_type, err_msg = categorize_error(
-                        response.status_code, text, request.model
-                    )
+                    err_type, err_msg = categorize_error(response.status_code, text, request.model)
                     if response.status_code in (401, 403):
                         locked, left = await auth_limiter.record_failure(client_id)
-                        err_msg = (
-                            "Account locked"
-                            if locked
-                            else f"{err_msg} ({left} attempts left)"
-                        )
-                    yield f"data: {json.dumps({'error': {'type': err_type, 'message': err_msg}})}\n\n"
+                        err_msg = "Account locked" if locked else f"{err_msg} ({left} attempts left)"
+                    yield sse_error(err_type, err_msg)
                     return
 
                 await auth_limiter.record_success(client_id)
@@ -607,20 +553,20 @@ async def stream_translations(
                         if content:
                             for item in parser.feed(content):
                                 translations.append(item)
-                                yield f"data: {json.dumps({'index': len(translations) - 1, 'translation': item})}\n\n"
+                                yield sse_json({"index": len(translations) - 1, "translation": item})
                     except json.JSONDecodeError:
                         continue
 
                 if texts and len(translations) == len(texts):
                     await cache.set(texts, lang, request.model, translations)
-                yield f"data: {json.dumps({'done': True, 'total': len(translations)})}\n\n"
+                yield sse_json({"done": True, "total": len(translations)})
 
     except httpx.ConnectError:
-        yield f"data: {json.dumps({'error': {'type': 'CONNECTION_ERROR', 'message': 'Failed to connect'}})}\n\n"
+        yield sse_error("CONNECTION_ERROR", "Failed to connect")
     except httpx.TimeoutException:
-        yield f"data: {json.dumps({'error': {'type': 'TIMEOUT', 'message': 'Request timeout'}})}\n\n"
+        yield sse_error("TIMEOUT", "Request timeout")
     except Exception as e:
-        yield f"data: {json.dumps({'error': {'type': 'ERROR', 'message': str(e)}})}\n\n"
+        yield sse_error("ERROR", str(e))
 
 
 # ============================================================================
@@ -637,12 +583,7 @@ async def translate(request: TranslateRequest, req: Request):
     if locked:
         return JSONResponse(
             status_code=429,
-            content={
-                "error": {
-                    "type": "LOCKED",
-                    "message": f"Try again in {int(remaining)}s",
-                }
-            },
+            content={"error": {"type": "LOCKED", "message": f"Try again in {int(remaining)}s"}},
         )
 
     # Rate limit check
@@ -660,13 +601,12 @@ async def translate(request: TranslateRequest, req: Request):
     if texts:
         cached = await cache.get(texts, lang, request.model)
         if cached:
-            print(f"{INSTANCE_ID}: cache_hit ({len(cached)} items)")
+            print(f"[{INSTANCE_ID}] Cache hit ({len(cached)} items)")
             if request.stream:
-
                 async def stream_cached():
                     for i, item in enumerate(cached):
-                        yield f"data: {json.dumps({'index': i, 'translation': item, 'cached': True})}\n\n"
-                    yield f"data: {json.dumps({'done': True, 'total': len(cached), 'cached': True})}\n\n"
+                        yield sse_json({"index": i, "translation": item, "cached": True})
+                    yield sse_json({"done": True, "total": len(cached), "cached": True})
 
                 return StreamingResponse(
                     stream_cached(),
@@ -675,14 +615,7 @@ async def translate(request: TranslateRequest, req: Request):
                 )
             return JSONResponse(
                 content={
-                    "choices": [
-                        {
-                            "message": {
-                                "role": "assistant",
-                                "content": json.dumps(cached),
-                            }
-                        }
-                    ],
+                    "choices": [{"message": {"role": "assistant", "content": json.dumps(cached)}}],
                     "cached": True,
                 },
                 headers={"X-Instance-ID": INSTANCE_ID},
@@ -703,38 +636,26 @@ async def translate(request: TranslateRequest, req: Request):
 async def handle_sync_request(
     request: TranslateRequest, texts: Optional[List[str]], lang: str, client_id: str
 ) -> JSONResponse:
-    """
-    Handle synchronous translation with request deduplication.
-
-    If multiple users request the same translation simultaneously,
-    only one API call is made and all users receive the same result.
-    """
-    # Try deduplication for batch translations
+    """Handle synchronous translation with request deduplication."""
     future, is_owner = None, True
     if texts:
         future, is_owner = await deduplicator.get_or_create(texts, lang, request.model)
         if not is_owner and future:
-            # Another request is already in flight, wait for it
             try:
                 result = await asyncio.wait_for(future, timeout=HTTP_TIMEOUT)
                 if result:
                     return JSONResponse(
                         content={
-                            "choices": [
-                                {
-                                    "message": {
-                                        "role": "assistant",
-                                        "content": json.dumps(result),
-                                    }
-                                }
-                            ],
+                            "choices": [{"message": {"role": "assistant", "content": json.dumps(result)}}],
                             "model": request.model,
                             "coalesced": True,
                         },
                         headers={"X-Instance-ID": INSTANCE_ID},
                     )
-            except (asyncio.TimeoutError, Exception):
+            except asyncio.TimeoutError:
                 pass  # Fallback to making our own request
+            except Exception:
+                pass
 
     headers = {
         "Authorization": basic_auth(request.username, request.password),
@@ -749,27 +670,20 @@ async def handle_sync_request(
 
     if not http_client or not api_semaphore:
         if texts and is_owner:
-            await deduplicator.complete(
-                texts, lang, request.model, None, "Server not initialized"
-            )
+            await deduplicator.complete(texts, lang, request.model, None, "Server not initialized")
         raise HTTPException(status_code=503, detail="Server not initialized")
 
     try:
-        # Use semaphore to limit concurrent API calls
         async with api_semaphore:
             response = await http_client.post(
                 request.target_endpoint, json=payload, headers=headers
             )
 
         if response.status_code != 200:
-            err_type, err_msg = categorize_error(
-                response.status_code, response.text, request.model
-            )
+            err_type, err_msg = categorize_error(response.status_code, response.text, request.model)
             if response.status_code in (401, 403):
                 locked, left = await auth_limiter.record_failure(client_id)
-                err_msg = (
-                    "Account locked" if locked else f"{err_msg} ({left} attempts left)"
-                )
+                err_msg = "Account locked" if locked else f"{err_msg} ({left} attempts left)"
             if texts and is_owner:
                 await deduplicator.complete(texts, lang, request.model, None, err_msg)
             return JSONResponse(
@@ -781,16 +695,13 @@ async def handle_sync_request(
         await auth_limiter.record_success(client_id)
         data = response.json()
 
-        # Log token usage
         usage = data.get("token_usage", {})
-        print(f"{INSTANCE_ID}: token_usage: {usage}")
+        print(f"[{INSTANCE_ID}] Token usage: {usage}")
 
-        # Extract content
         content = data.get("system_response", "") or data.get("choices", [{}])[0].get(
             "message", {}
         ).get("system_response", "")
 
-        # Cache and complete deduplication
         translations = None
         if texts and content:
             try:
@@ -815,9 +726,7 @@ async def handle_sync_request(
 
     except httpx.ConnectError:
         if texts and is_owner:
-            await deduplicator.complete(
-                texts, lang, request.model, None, "Connection failed"
-            )
+            await deduplicator.complete(texts, lang, request.model, None, "Connection failed")
         raise HTTPException(status_code=502, detail="Connection failed")
     except httpx.TimeoutException:
         if texts and is_owner:
@@ -839,21 +748,18 @@ if __name__ == "__main__":
     parser.add_argument("--host", default=None, help="Host to bind to")
     parser.add_argument("--port", type=int, default=8000, help="Port to bind to")
     parser.add_argument(
-        "--workers",
-        type=int,
-        default=None,
+        "--workers", type=int, default=None,
         help="Number of worker processes (default: CPU cores, max 4)",
     )
     args = parser.parse_args()
 
-    # Auto-detect workers based on CPU cores (capped at 4 for most use cases)
     if args.workers is None:
         args.workers = min(multiprocessing.cpu_count(), 1)
 
     host = args.host or get_lan_ip()
 
     print(f"\n{'=' * 60}")
-    print(f"  Translator Middleware")
+    print("  Translator Middleware")
     print(f"{'=' * 60}")
     print(f"  Instance:    {INSTANCE_ID}")
     print(f"  Server:      http://{host}:{args.port}")
@@ -862,16 +768,15 @@ if __name__ == "__main__":
     print(f"  Cache:       {CACHE_MAX_SIZE} entries, {CACHE_TTL}s TTL")
     print(f"  Dedup:       {'enabled' if DEDUP_ENABLED else 'disabled'}")
     print(f"{'=' * 60}")
-    print(f"  Endpoints:")
-    print(f"    POST /proxy/translate  - Translation endpoint")
-    print(f"    GET  /health           - Health check")
-    print(f"    GET  /stats            - Cache & dedup statistics")
+    print("  Endpoints:")
+    print("    POST /proxy/translate  - Translation endpoint")
+    print("    GET  /health           - Health check")
+    print("    GET  /stats            - Cache & dedup statistics")
     print(f"{'=' * 60}\n")
-    
-    
+
     if args.workers > 1:
         print(f"⚠️  Note: Running {args.workers} workers with in-memory cache.")
-        print(f"   Each worker has separate cache. For shared cache, use Redis.\n")
+        print("   Each worker has separate cache.\n")
 
     uvicorn.run(
         "server:app",
@@ -879,6 +784,6 @@ if __name__ == "__main__":
         port=args.port,
         workers=args.workers,
         access_log=True,
-        limit_concurrency=1000,  # Max concurrent connections
-        limit_max_requests=10000,  # Restart worker after N requests (prevents memory leaks)
+        limit_concurrency=1000,
+        limit_max_requests=10000,
     )

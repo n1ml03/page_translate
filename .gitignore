@@ -37,10 +37,15 @@ yarn.lock
 coverage/
 .coverage
 htmlcov/
-tests/
+
+# Test generated files
+token_comparison_report.json
+**/token_comparison_report.json
 
 # Kiro
 .kiro/
+
+tests/
 
 web.html
 prompt.md

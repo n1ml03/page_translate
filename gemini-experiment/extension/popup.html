@@ -83,9 +83,21 @@
       </section>
 
       <footer>
-        <button id="translateBtn" class="btn-primary">
-          <span class="btn-text">Translate Page</span>
-        </button>
+        <div class="translation-actions">
+          <button id="translateBtn" class="btn-primary">
+            <span class="btn-text">Translate Page</span>
+          </button>
+          <button id="toggleTranslationBtn" class="btn-toggle hidden" title="Toggle between original and translated">
+            <span class="toggle-text">Show Original</span>
+          </button>
+        </div>
+        <div id="translationStatus" class="translation-status hidden">
+          <span class="status-badge">
+            <span class="status-dot"></span>
+            <span class="status-label">Translated</span>
+          </span>
+          <span class="status-info"></span>
+        </div>
       </footer>
     </main>
 

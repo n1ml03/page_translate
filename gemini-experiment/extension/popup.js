@@ -1,11 +1,7 @@
-// Popup Script - Gemini Translator with Unified Settings & History
-
-// ============================================================================
-// CONSTANTS & DEFAULTS
-// ============================================================================
+// Popup Script - Gemini Translator
 
 const DEFAULT_SETTINGS = {
-  serverUrl: 'http://192.168.0.101:8001/proxy/translate',
+  serverUrl: 'http://localhost:8001/proxy/translate',
   model: 'gemini-2.0-flash',
   targetLanguage: 'English',
   activeTab: 'page',
@@ -24,37 +20,17 @@ const LANGUAGES = [
   { code: 'Vietnamese', name: 'Vietnamese', native: 'Tiếng Việt' }
 ];
 
-const MAX_TEXT_LENGTH = 5000;
-const MAX_HISTORY_ITEMS = 20;
-const MAX_RECENT_LANGUAGES = 3;
-const CONNECTION_TIMEOUT = 5000;
+const MAX_TEXT_LENGTH = 5000, MAX_HISTORY_ITEMS = 20, MAX_RECENT_LANGUAGES = 3, CONNECTION_TIMEOUT = 5000;
 
-// ============================================================================
-// STORAGE HELPERS
-// ============================================================================
-
-const saveSettings = (settings) => new Promise((resolve, reject) => {
-  chrome.storage.local.set(settings, () => 
-    chrome.runtime.lastError ? reject(chrome.runtime.lastError) : resolve()
-  );
+const saveSettings = settings => new Promise((resolve, reject) => {
+  chrome.storage.local.set(settings, () => chrome.runtime.lastError ? reject(chrome.runtime.lastError) : resolve());
 });
 
 const loadSettings = () => new Promise((resolve, reject) => {
-  chrome.storage.local.get(DEFAULT_SETTINGS, (result) => 
-    chrome.runtime.lastError ? reject(chrome.runtime.lastError) : resolve(result)
-  );
+  chrome.storage.local.get(DEFAULT_SETTINGS, result => chrome.runtime.lastError ? reject(chrome.runtime.lastError) : resolve(result));
 });
 
-// ============================================================================
-// VALIDATION
-// ============================================================================
-
-const validateUrl = (url) => 
-  typeof url === 'string' && /^https?:\/\/[^\s/$.?#].[^\s]*$/i.test(url.trim());
-
-// ============================================================================
-// TOAST NOTIFICATIONS
-// ============================================================================
+const validateUrl = url => typeof url === 'string' && /^https?:\/\/[^\s/$.?#].[^\s]*$/i.test(url.trim());
 
 function showToast(message, type = 'info', autoDismissMs = null) {
   const container = document.getElementById('toastContainer');
@@ -62,14 +38,10 @@ function showToast(message, type = 'info', autoDismissMs = null) {
 
   const toast = document.createElement('div');
   toast.className = `toast toast-${type}`;
-  toast.innerHTML = `
-    <span class="toast-message">${message}</span>
-    <button class="toast-dismiss" aria-label="Dismiss">&times;</button>
-  `;
+  toast.innerHTML = `<span class="toast-message">${message}</span><button class="toast-dismiss" aria-label="Dismiss">&times;</button>`;
   toast.querySelector('.toast-dismiss').addEventListener('click', () => dismissToast(toast));
   container.appendChild(toast);
 
-  // Shorter toast times: error=1500ms, success=800ms, info=600ms
   const defaultTimes = { error: 1500, success: 800, info: 600 };
   const dismissTime = autoDismissMs ?? (defaultTimes[type] || 800);
   if (dismissTime > 0) setTimeout(() => dismissToast(toast), dismissTime);
@@ -80,10 +52,6 @@ function dismissToast(toast) {
   toast.classList.add('toast-exit');
   setTimeout(() => toast.parentNode?.removeChild(toast), 200);
 }
-
-// ============================================================================
-// UI HELPERS
-// ============================================================================
 
 function setButtonLoading(button, loading) {
   if (!button) return;
@@ -100,10 +68,6 @@ function updateConnectionStatusUI({ status, message }) {
   if (statusText) statusText.textContent = message;
 }
 
-// ============================================================================
-// CONNECTION CHECK
-// ============================================================================
-
 async function checkServerConnection(serverUrl) {
   if (!serverUrl?.trim()) return { status: 'unconfigured', message: 'Not configured' };
   if (!validateUrl(serverUrl)) return { status: 'disconnected', message: 'Invalid URL' };
@@ -111,33 +75,20 @@ async function checkServerConnection(serverUrl) {
   try {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), CONNECTION_TIMEOUT);
-    const healthUrl = serverUrl.replace('/proxy/translate', '/health');
-    const response = await fetch(healthUrl, { method: 'GET', signal: controller.signal });
+    const response = await fetch(serverUrl.replace('/proxy/translate', '/health'), { method: 'GET', signal: controller.signal });
     clearTimeout(timeoutId);
-    return response.ok 
-      ? { status: 'connected', message: 'Connected' } 
-      : { status: 'disconnected', message: `Error: ${response.status}` };
+    return response.ok ? { status: 'connected', message: 'Connected' } : { status: 'disconnected', message: `Error: ${response.status}` };
   } catch (error) {
-    return { 
-      status: 'disconnected', 
-      message: error.name === 'AbortError' ? 'Timeout' : 'Cannot connect' 
-    };
+    return { status: 'disconnected', message: error.name === 'AbortError' ? 'Timeout' : 'Cannot connect' };
   }
 }
 
-// ============================================================================
-// SETTINGS MODAL
-// ============================================================================
-
 function openSettingsModal() {
-  const modal = document.getElementById('settingsModal');
-  modal?.classList.remove('hidden');
+  document.getElementById('settingsModal')?.classList.remove('hidden');
   document.getElementById('serverUrl')?.focus();
 }
 
-function closeSettingsModal() {
-  document.getElementById('settingsModal')?.classList.add('hidden');
-}
+function closeSettingsModal() { document.getElementById('settingsModal')?.classList.add('hidden'); }
 
 async function handleTestConnection() {
   const serverUrl = document.getElementById('serverUrl').value;
@@ -149,7 +100,6 @@ async function handleTestConnection() {
   resultEl.className = 'connection-result checking';
   
   const status = await checkServerConnection(serverUrl);
-  
   resultEl.textContent = status.message;
   resultEl.className = `connection-result ${status.status}`;
   setButtonLoading(testBtn, false);
@@ -159,10 +109,7 @@ async function handleSaveSettings() {
   const serverUrl = document.getElementById('serverUrl').value;
   const model = document.getElementById('model').value;
   
-  if (!validateUrl(serverUrl)) {
-    showToast('Please enter a valid server URL', 'error');
-    return;
-  }
+  if (!validateUrl(serverUrl)) { showToast('Please enter a valid server URL', 'error'); return; }
   
   setButtonLoading(document.getElementById('saveSettingsBtn'), true);
   
@@ -170,53 +117,25 @@ async function handleSaveSettings() {
     await saveSettings({ serverUrl, model });
     showToast('Settings saved!', 'success');
     closeSettingsModal();
-    
-    // Update connection status
     updateConnectionStatusUI({ status: 'checking', message: 'Checking...' });
-    const status = await checkServerConnection(serverUrl);
-    updateConnectionStatusUI(status);
-  } catch (error) {
-    showToast('Failed to save settings', 'error');
-  } finally {
-    setButtonLoading(document.getElementById('saveSettingsBtn'), false);
-  }
+    updateConnectionStatusUI(await checkServerConnection(serverUrl));
+  } catch { showToast('Failed to save settings', 'error'); }
+  finally { setButtonLoading(document.getElementById('saveSettingsBtn'), false); }
 }
-
-// ============================================================================
-// TAB MANAGEMENT
-// ============================================================================
 
 function switchTab(tabId) {
-  document.querySelectorAll('.tab-btn').forEach(btn => 
-    btn.classList.toggle('active', btn.dataset.tab === tabId)
-  );
-  document.querySelectorAll('.tab-content').forEach(content => 
-    content.classList.toggle('active', content.id === `${tabId}Tab`)
-  );
+  document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.tab === tabId));
+  document.querySelectorAll('.tab-content').forEach(content => content.classList.toggle('active', content.id === `${tabId}Tab`));
   chrome.storage.local.set({ activeTab: tabId });
-  
-  // Refresh history when switching to history tab
-  if (tabId === 'history') {
-    renderHistoryList();
-  }
+  if (tabId === 'history') renderHistoryList();
 }
-
-// ============================================================================
-// QUICK LANGUAGE TOGGLE
-// ============================================================================
 
 function renderQuickLanguageButtons(containerId, currentLang, recentLanguages, onSelect) {
   const container = document.getElementById(containerId);
   if (!container) return;
   
   container.innerHTML = '';
-  
-  // Show up to MAX_RECENT_LANGUAGES buttons
-  const langsToShow = recentLanguages
-    .filter(code => code !== currentLang)
-    .slice(0, MAX_RECENT_LANGUAGES);
-  
-  langsToShow.forEach(langCode => {
+  recentLanguages.filter(code => code !== currentLang).slice(0, MAX_RECENT_LANGUAGES).forEach(langCode => {
     const lang = LANGUAGES.find(l => l.code === langCode);
     if (!lang) return;
     
@@ -233,35 +152,22 @@ function renderQuickLanguageButtons(containerId, currentLang, recentLanguages, o
 
 async function updateRecentLanguages(langCode) {
   const settings = await loadSettings();
-  let recent = settings.recentLanguages || [];
-  
-  // Move selected language to front, remove duplicates
-  recent = [langCode, ...recent.filter(l => l !== langCode)].slice(0, MAX_RECENT_LANGUAGES + 1);
-  
+  const recent = [langCode, ...(settings.recentLanguages || []).filter(l => l !== langCode)].slice(0, MAX_RECENT_LANGUAGES + 1);
   await saveSettings({ recentLanguages: recent });
   return recent;
 }
 
-// ============================================================================
-// TRANSLATION HISTORY
-// ============================================================================
-
 async function addToHistory(sourceText, translatedText, targetLang) {
   const settings = await loadSettings();
-  const history = settings.translationHistory || [];
-  
   const entry = {
     id: Date.now(),
-    source: sourceText.substring(0, 200), // Truncate for storage
+    source: sourceText.substring(0, 200),
     translation: translatedText.substring(0, 200),
     targetLang,
     timestamp: new Date().toISOString()
   };
-  
-  // Add to front, limit size
-  const newHistory = [entry, ...history].slice(0, MAX_HISTORY_ITEMS);
+  const newHistory = [entry, ...(settings.translationHistory || [])].slice(0, MAX_HISTORY_ITEMS);
   await saveSettings({ translationHistory: newHistory });
-  
   return newHistory;
 }
 
@@ -292,7 +198,7 @@ async function renderHistoryList() {
       <div class="history-source">${escapeHtml(entry.source)}</div>
       <div class="history-translation">${escapeHtml(entry.translation)}</div>
       <div class="history-actions">
-        <button type="button" class="history-copy-btn" data-text="${escapeAttr(entry.translation)}" title="Copy translation">
+        <button type="button" class="history-copy-btn" data-text="${escapeAttr(entry.translation)}" title="Copy">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
             <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
             <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
@@ -300,8 +206,7 @@ async function renderHistoryList() {
         </button>
         <button type="button" class="history-reuse-btn" data-source="${escapeAttr(entry.source)}" title="Translate again">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
-            <path d="M23 4v6h-6"></path>
-            <path d="M1 20v-6h6"></path>
+            <path d="M23 4v6h-6"></path><path d="M1 20v-6h6"></path>
             <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
           </svg>
         </button>
@@ -309,19 +214,16 @@ async function renderHistoryList() {
     </div>
   `).join('');
   
-  // Attach event listeners
   container.querySelectorAll('.history-copy-btn').forEach(btn => {
-    btn.addEventListener('click', async (e) => {
-      const text = e.currentTarget.dataset.text;
-      await navigator.clipboard.writeText(text);
+    btn.addEventListener('click', async e => {
+      await navigator.clipboard.writeText(e.currentTarget.dataset.text);
       showToast('Copied!', 'success');
     });
   });
   
   container.querySelectorAll('.history-reuse-btn').forEach(btn => {
-    btn.addEventListener('click', (e) => {
-      const source = e.currentTarget.dataset.source;
-      document.getElementById('sourceText').value = source;
+    btn.addEventListener('click', e => {
+      document.getElementById('sourceText').value = e.currentTarget.dataset.source;
       switchTab('text');
       updateCharCount();
     });
@@ -329,9 +231,7 @@ async function renderHistoryList() {
 }
 
 function formatRelativeTime(isoString) {
-  const date = new Date(isoString);
-  const now = new Date();
-  const diffMs = now - date;
+  const diffMs = Date.now() - new Date(isoString);
   const diffMins = Math.floor(diffMs / 60000);
   const diffHours = Math.floor(diffMs / 3600000);
   const diffDays = Math.floor(diffMs / 86400000);
@@ -340,22 +240,11 @@ function formatRelativeTime(isoString) {
   if (diffMins < 60) return `${diffMins}m ago`;
   if (diffHours < 24) return `${diffHours}h ago`;
   if (diffDays < 7) return `${diffDays}d ago`;
-  return date.toLocaleDateString();
+  return new Date(isoString).toLocaleDateString();
 }
 
-function escapeHtml(str) {
-  return str.replace(/[&<>"']/g, c => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-  }[c]));
-}
-
-function escapeAttr(str) {
-  return str.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-}
-
-// ============================================================================
-// TEXT TRANSLATION WITH PROGRESS
-// ============================================================================
+const escapeHtml = str => str.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const escapeAttr = str => str.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 
 function showTranslationProgress(show) {
   const progress = document.getElementById('translationProgress');
@@ -364,19 +253,12 @@ function showTranslationProgress(show) {
   if (show) {
     progress?.classList.remove('hidden');
     output?.classList.add('translating');
-    // Animate progress bar
     const fill = progress?.querySelector('.progress-fill');
-    if (fill) {
-      fill.style.width = '0%';
-      setTimeout(() => fill.style.width = '70%', 100);
-    }
+    if (fill) { fill.style.width = '0%'; setTimeout(() => fill.style.width = '70%', 100); }
   } else {
     const fill = progress?.querySelector('.progress-fill');
     if (fill) fill.style.width = '100%';
-    setTimeout(() => {
-      progress?.classList.add('hidden');
-      output?.classList.remove('translating');
-    }, 200);
+    setTimeout(() => { progress?.classList.add('hidden'); output?.classList.remove('translating'); }, 200);
   }
 }
 
@@ -394,27 +276,16 @@ function updateCharCount() {
 
 async function handleTextTranslate() {
   const sourceTextEl = document.getElementById('sourceText');
-  const sourceText = sourceTextEl.value;
   const translatedTextEl = document.getElementById('translatedText');
   const textTargetLang = document.getElementById('textTargetLang').value;
   const translateBtn = document.getElementById('textTranslateBtn');
+  const sourceText = sourceTextEl.value;
 
-  if (!sourceText.trim()) {
-    showToast('Enter text to translate', 'error');
-    return;
-  }
-
-  if (sourceText.length > MAX_TEXT_LENGTH) {
-    showToast(`Text exceeds ${MAX_TEXT_LENGTH} characters`, 'error');
-    return;
-  }
+  if (!sourceText.trim()) { showToast('Enter text to translate', 'error'); return; }
+  if (sourceText.length > MAX_TEXT_LENGTH) { showToast(`Text exceeds ${MAX_TEXT_LENGTH} characters`, 'error'); return; }
 
   const settings = await loadSettings();
-  if (!validateUrl(settings.serverUrl)) {
-    showToast('Configure server URL in Settings', 'error');
-    openSettingsModal();
-    return;
-  }
+  if (!validateUrl(settings.serverUrl)) { showToast('Configure server URL in Settings', 'error'); openSettingsModal(); return; }
 
   setButtonLoading(translateBtn, true);
   showTranslationProgress(true);
@@ -441,17 +312,11 @@ async function handleTextTranslate() {
     const translation = data.choices?.[0]?.message?.content || '';
     translatedTextEl.innerText = translation;
 
-    // Update recent languages and history
     const recentLangs = await updateRecentLanguages(textTargetLang);
     await addToHistory(sourceText, translation, textTargetLang);
-    
-    // Refresh quick language buttons
     renderQuickLanguageButtons('textQuickLangs', textTargetLang, recentLangs, handleTextQuickLangSelect);
-    
-    // Save state
     chrome.storage.local.set({ textTargetLang });
     saveTextTabState();
-    
   } catch (error) {
     showToast(`Translation failed: ${error.message}`, 'error');
     translatedTextEl.textContent = '';
@@ -468,9 +333,7 @@ function handleTextQuickLangSelect(langCode) {
 
 function handlePageQuickLangSelect(langCode) {
   document.getElementById('targetLanguage').value = langCode;
-  updateRecentLanguages(langCode).then(recent => {
-    renderQuickLanguageButtons('pageQuickLangs', langCode, recent, handlePageQuickLangSelect);
-  });
+  updateRecentLanguages(langCode).then(recent => renderQuickLanguageButtons('pageQuickLangs', langCode, recent, handlePageQuickLangSelect));
 }
 
 function handleClearSource() {
@@ -480,62 +343,34 @@ function handleClearSource() {
   saveTextTabState();
 }
 
-// ============================================================================
-// CLIPBOARD FEATURES
-// ============================================================================
+let lastClipboardText = '', clipboardCheckInterval = null, clipboardPermissionGranted = false;
 
-let lastClipboardText = '';
-let clipboardCheckInterval = null;
-let clipboardPermissionGranted = false;
-
-// Check if clipboard-read permission is granted (won't prompt user)
 async function checkClipboardPermission() {
   try {
     if (navigator.permissions?.query) {
       const result = await navigator.permissions.query({ name: 'clipboard-read' });
       clipboardPermissionGranted = result.state === 'granted';
-      // Listen for permission changes
-      result.onchange = () => {
-        clipboardPermissionGranted = result.state === 'granted';
-      };
+      result.onchange = () => { clipboardPermissionGranted = result.state === 'granted'; };
       return clipboardPermissionGranted;
     }
-  } catch (e) {
-    // Permission API not supported or clipboard-read not queryable
-    console.log('Clipboard permission check not available:', e.message);
-  }
+  } catch {}
   return false;
 }
 
 async function readClipboard(requireUserActivation = false) {
-  // Try direct clipboard API - requires user activation or granted permission
   try {
-    if (navigator.clipboard?.readText) {
-      // Only attempt if we have permission granted OR user just clicked (activation)
-      if (clipboardPermissionGranted || requireUserActivation) {
-        const text = await navigator.clipboard.readText();
-        if (text) return text;
-      }
+    if (navigator.clipboard?.readText && (clipboardPermissionGranted || requireUserActivation)) {
+      const text = await navigator.clipboard.readText();
+      if (text) return text;
     }
   } catch (e) {
-    console.log('Clipboard API failed:', e.message);
-    // Don't show error toast for auto-read attempts, only for user-initiated paste
-    if (requireUserActivation && e.name === 'NotAllowedError') {
-      showToast('Clipboard access denied. Try Ctrl+V.', 'error');
-    }
+    if (requireUserActivation && e.name === 'NotAllowedError') showToast('Clipboard access denied. Try Ctrl+V.', 'error');
   }
   
-  // Fallback: check storage for recently copied text from content script
   try {
-    const stored = await new Promise(resolve => {
-      chrome.storage.local.get(['lastCopiedText', 'lastCopiedTimestamp'], resolve);
-    });
-    if (stored.lastCopiedTimestamp && Date.now() - stored.lastCopiedTimestamp < 60000) {
-      return stored.lastCopiedText;
-    }
-  } catch (e) {
-    console.log('Storage fallback failed:', e.message);
-  }
+    const stored = await new Promise(resolve => chrome.storage.local.get(['lastCopiedText', 'lastCopiedTimestamp'], resolve));
+    if (stored.lastCopiedTimestamp && Date.now() - stored.lastCopiedTimestamp < 60000) return stored.lastCopiedText;
+  } catch {}
   
   return null;
 }
@@ -543,30 +378,18 @@ async function readClipboard(requireUserActivation = false) {
 async function handlePasteFromClipboard() {
   const pasteBtn = document.getElementById('pasteBtn');
   const sourceTextEl = document.getElementById('sourceText');
-
   if (!sourceTextEl) return;
 
-  // User clicked paste button - this counts as user activation
-  const text = await readClipboard(true); // true = user-initiated, can prompt for permission
+  const text = await readClipboard(true);
 
-  if (text && text.trim()) {
+  if (text?.trim()) {
     sourceTextEl.value = text.trim();
     updateCharCount();
     saveTextTabState();
-
-    // Clear any stored clipboard text after use
     chrome.storage.local.remove(['lastCopiedText', 'lastCopiedTimestamp']);
-
-    // Visual feedback
     pasteBtn?.classList.add('pasted');
     setTimeout(() => pasteBtn?.classList.remove('pasted'), 1000);
-
-    // Auto-translate if enabled
-    const autoTranslate = document.getElementById('autoTranslateToggle')?.checked;
-    if (autoTranslate) {
-      handleTextTranslate();
-    }
-
+    if (document.getElementById('autoTranslateToggle')?.checked) handleTextTranslate();
     showToast('Pasted from clipboard', 'success');
   } else {
     showToast('Clipboard is empty or inaccessible', 'info');
@@ -574,115 +397,62 @@ async function handlePasteFromClipboard() {
 }
 
 async function checkClipboardForNewText() {
-  // First check if there's recently copied text from storage (from content script)
-  let text = null;
-  let isFromStorage = false;
+  let text = null, isFromStorage = false;
   
   try {
-    const stored = await new Promise(resolve => {
-      chrome.storage.local.get(['lastCopiedText', 'lastCopiedTimestamp'], resolve);
-    });
-    
-    // Use stored text if it was copied within the last 30 seconds
-    const isRecent = stored.lastCopiedTimestamp && (Date.now() - stored.lastCopiedTimestamp < 30000);
-    if (isRecent && stored.lastCopiedText) {
+    const stored = await new Promise(resolve => chrome.storage.local.get(['lastCopiedText', 'lastCopiedTimestamp'], resolve));
+    if (stored.lastCopiedTimestamp && Date.now() - stored.lastCopiedTimestamp < 30000 && stored.lastCopiedText) {
       text = stored.lastCopiedText;
       isFromStorage = true;
     }
-  } catch (e) {
-    console.log('Storage check failed:', e.message);
-  }
+  } catch {}
   
-  // Only try clipboard API if permission is already granted (won't prompt)
-  if (!text && clipboardPermissionGranted) {
-    text = await readClipboard(false); // false = no user activation
-  }
-  
+  if (!text && clipboardPermissionGranted) text = await readClipboard(false);
   if (!text || text === lastClipboardText) return;
   
   lastClipboardText = text;
   const sourceTextEl = document.getElementById('sourceText');
   
-  // Only auto-fill if source is empty and we're on the text tab
-  if (sourceTextEl && !sourceTextEl.value.trim()) {
-    const activeTab = document.querySelector('.tab-btn.active')?.dataset.tab;
-    if (activeTab === 'text') {
-      sourceTextEl.value = text.trim();
-      updateCharCount();
-      saveTextTabState();
-      
-      // Show notification that text was auto-filled
-      showToast('Clipboard text loaded', 'info');
-      
-      // Auto-translate if enabled
-      const autoTranslate = document.getElementById('autoTranslateToggle')?.checked;
-      if (autoTranslate && text.trim()) {
-        handleTextTranslate();
-      }
-    }
+  if (sourceTextEl && !sourceTextEl.value.trim() && document.querySelector('.tab-btn.active')?.dataset.tab === 'text') {
+    sourceTextEl.value = text.trim();
+    updateCharCount();
+    saveTextTabState();
+    showToast('Clipboard text loaded', 'info');
+    if (document.getElementById('autoTranslateToggle')?.checked) handleTextTranslate();
   }
   
-  // Clear the stored copied text after using it
-  if (isFromStorage) {
-    chrome.storage.local.remove(['lastCopiedText', 'lastCopiedTimestamp']);
-  }
+  if (isFromStorage) chrome.storage.local.remove(['lastCopiedText', 'lastCopiedTimestamp']);
 }
 
 async function startClipboardMonitoring() {
-  // First check if we have clipboard permission (won't prompt)
   await checkClipboardPermission();
-  
-  // Check clipboard on popup open
   checkClipboardForNewText();
-  
-  // Periodically check for clipboard changes (every 1.5s)
   clipboardCheckInterval = setInterval(checkClipboardForNewText, 1500);
 }
 
-function stopClipboardMonitoring() {
-  if (clipboardCheckInterval) {
-    clearInterval(clipboardCheckInterval);
-    clipboardCheckInterval = null;
-  }
-}
+function stopClipboardMonitoring() { if (clipboardCheckInterval) { clearInterval(clipboardCheckInterval); clipboardCheckInterval = null; } }
 
 async function handleAutoTranslateToggle(e) {
-  const enabled = e.target.checked;
-  await saveSettings({ autoTranslate: enabled });
-  
-  if (enabled) {
+  await saveSettings({ autoTranslate: e.target.checked });
+  if (e.target.checked) {
     showToast('Auto-translate enabled', 'success');
-    // If there's text in source, translate it
-    const sourceText = document.getElementById('sourceText')?.value.trim();
-    if (sourceText) {
-      handleTextTranslate();
-    }
+    if (document.getElementById('sourceText')?.value.trim()) handleTextTranslate();
   }
 }
 
 function handleSwapTexts() {
   const sourceTextEl = document.getElementById('sourceText');
   const translatedTextEl = document.getElementById('translatedText');
-  
   if (!sourceTextEl || !translatedTextEl) return;
   
-  const sourceText = sourceTextEl.value;
   const translatedText = translatedTextEl.innerText;
+  if (!translatedText.trim()) { showToast('No translation to swap', 'info'); return; }
   
-  // Only swap if there's translated text
-  if (!translatedText.trim()) {
-    showToast('No translation to swap', 'info');
-    return;
-  }
-  
-  // Swap the texts
+  const sourceText = sourceTextEl.value;
   sourceTextEl.value = translatedText;
   translatedTextEl.innerText = sourceText;
-  
   updateCharCount();
   saveTextTabState();
-  
-  // showToast('Texts swapped', 'success');
 }
 
 async function handleCopyResult() {
@@ -695,19 +465,18 @@ async function handleCopyResult() {
     copyBtn?.classList.add('copied');
     showToast('Copied!', 'success');
     setTimeout(() => copyBtn?.classList.remove('copied'), 1500);
-  } catch {
-    showToast('Failed to copy', 'error');
-  }
+  } catch { showToast('Failed to copy', 'error'); }
 }
 
 function saveTextTabState() {
-  const sourceText = document.getElementById('sourceText')?.value || '';
-  const translatedText = document.getElementById('translatedText')?.innerText || '';
-  chrome.storage.local.set({ _textTabState: { sourceText, translatedText } });
+  chrome.storage.local.set({ _textTabState: {
+    sourceText: document.getElementById('sourceText')?.value || '',
+    translatedText: document.getElementById('translatedText')?.innerText || ''
+  }});
 }
 
 function restoreTextTabState() {
-  chrome.storage.local.get({ _textTabState: null }, (r) => {
+  chrome.storage.local.get({ _textTabState: null }, r => {
     if (r._textTabState) {
       const sourceEl = document.getElementById('sourceText');
       const translatedEl = document.getElementById('translatedText');
@@ -718,163 +487,185 @@ function restoreTextTabState() {
   });
 }
 
-// ============================================================================
-// PAGE TRANSLATION
-// ============================================================================
-
 async function handleTranslate() {
   const settings = await loadSettings();
   const targetLanguage = document.getElementById('targetLanguage').value;
   const translateBtn = document.getElementById('translateBtn');
 
-  if (!validateUrl(settings.serverUrl)) {
-    showToast('Configure server URL in Settings', 'error');
-    openSettingsModal();
-    return;
-  }
+  if (!validateUrl(settings.serverUrl)) { showToast('Configure server URL in Settings', 'error'); openSettingsModal(); return; }
 
   setButtonLoading(translateBtn, true);
 
   try {
-    // Save target language preference
     await saveSettings({ targetLanguage });
     await updateRecentLanguages(targetLanguage);
     
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab) {
-      showToast('No active tab found', 'error');
-      return;
-    }
+    if (!tab) { showToast('No active tab found', 'error'); return; }
 
-    chrome.tabs.sendMessage(tab.id, { action: 'translate' }, _response => {
+    chrome.tabs.sendMessage(tab.id, { action: 'translate', targetLanguage }, _response => {
       if (chrome.runtime.lastError) {
         chrome.scripting.executeScript({
           target: { tabId: tab.id, allFrames: true },
           files: ['content.js']
-        }).then(() => {
-          setTimeout(() => chrome.tabs.sendMessage(tab.id, { action: 'translate' }), 100);
-        });
+        }).then(() => setTimeout(() => chrome.tabs.sendMessage(tab.id, { action: 'translate', targetLanguage }), 100));
       }
+      // Check translation status after a short delay
+      setTimeout(checkTranslationStatus, 500);
     });
 
     showToast('Translation started!', 'success');
-  } catch (error) {
-    showToast('Failed: ' + error.message, 'error');
-  } finally {
-    setButtonLoading(translateBtn, false);
+    // Update UI after translation starts
+    setTimeout(checkTranslationStatus, 2000);
+  } catch (error) { showToast('Failed: ' + error.message, 'error'); }
+  finally { setButtonLoading(translateBtn, false); }
+}
+
+// Check translation status from content script
+async function checkTranslationStatus() {
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab) return;
+
+    chrome.tabs.sendMessage(tab.id, { action: 'getTranslationStatus' }, response => {
+      if (chrome.runtime.lastError || !response?.success) {
+        updateTranslationStatusUI(null);
+        return;
+      }
+      updateTranslationStatusUI(response);
+    });
+  } catch {
+    updateTranslationStatusUI(null);
   }
 }
 
-// ============================================================================
-// INITIALIZATION
-// ============================================================================
+// Update UI based on translation status
+function updateTranslationStatusUI(status) {
+  const toggleBtn = document.getElementById('toggleTranslationBtn');
+  const statusEl = document.getElementById('translationStatus');
+  
+  if (!status || !status.isTranslated) {
+    toggleBtn?.classList.add('hidden');
+    statusEl?.classList.add('hidden');
+    return;
+  }
+
+  // Show toggle button
+  toggleBtn?.classList.remove('hidden');
+  statusEl?.classList.remove('hidden');
+  
+  const isShowingOriginal = status.displayMode === 'original';
+  const toggleText = toggleBtn?.querySelector('.toggle-text');
+  const statusLabel = statusEl?.querySelector('.status-label');
+  const statusInfo = statusEl?.querySelector('.status-info');
+  
+  if (isShowingOriginal) {
+    toggleBtn?.classList.add('showing-original');
+    if (toggleText) toggleText.textContent = 'Show Translation';
+    statusEl?.classList.add('original-mode');
+    if (statusLabel) statusLabel.textContent = 'Showing Original';
+  } else {
+    toggleBtn?.classList.remove('showing-original');
+    if (toggleText) toggleText.textContent = 'Show Original';
+    statusEl?.classList.remove('original-mode');
+    if (statusLabel) statusLabel.textContent = 'Translated';
+  }
+  
+  if (statusInfo) {
+    const lang = status.targetLanguage || '';
+    const count = status.totalElements || 0;
+    statusInfo.textContent = lang ? `${lang} • ${count} elements` : `${count} elements`;
+  }
+}
+
+// Handle toggle button click
+async function handleToggleTranslation() {
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab) return;
+
+    chrome.tabs.sendMessage(tab.id, { action: 'toggleTranslation' }, response => {
+      if (chrome.runtime.lastError) {
+        showToast('Failed to toggle translation', 'error');
+        return;
+      }
+      if (response?.success) {
+        updateTranslationStatusUI({ isTranslated: true, displayMode: response.displayMode });
+        // No toast - just update UI silently
+      } else {
+        showToast(response?.error || 'Page not translated', 'error');
+      }
+    });
+  } catch {
+    showToast('Failed to toggle translation', 'error');
+  }
+}
 
 async function initializePopup() {
   let settings;
-  try {
-    settings = await loadSettings();
-  } catch {
-    settings = DEFAULT_SETTINGS;
-  }
+  try { settings = await loadSettings(); } catch { settings = DEFAULT_SETTINGS; }
 
-  // Populate form fields
   document.getElementById('serverUrl').value = settings.serverUrl;
   document.getElementById('model').value = settings.model;
   document.getElementById('targetLanguage').value = settings.targetLanguage;
   document.getElementById('textTargetLang').value = settings.textTargetLang || DEFAULT_SETTINGS.textTargetLang;
 
-  // Tab navigation
-  document.querySelectorAll('.tab-btn').forEach(btn => {
-    btn.addEventListener('click', () => switchTab(btn.dataset.tab));
-  });
-
-  // Restore active tab
+  document.querySelectorAll('.tab-btn').forEach(btn => btn.addEventListener('click', () => switchTab(btn.dataset.tab)));
   if (settings.activeTab) switchTab(settings.activeTab);
 
-  // Settings modal
   document.getElementById('settingsBtn')?.addEventListener('click', openSettingsModal);
   document.getElementById('closeSettingsBtn')?.addEventListener('click', closeSettingsModal);
   document.getElementById('testConnectionBtn')?.addEventListener('click', handleTestConnection);
   document.getElementById('saveSettingsBtn')?.addEventListener('click', handleSaveSettings);
-  
-  // Close modal on overlay click
-  document.getElementById('settingsModal')?.addEventListener('click', (e) => {
-    if (e.target.id === 'settingsModal') closeSettingsModal();
-  });
-  
-  // Close modal on Escape
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') closeSettingsModal();
-  });
+  document.getElementById('settingsModal')?.addEventListener('click', e => { if (e.target.id === 'settingsModal') closeSettingsModal(); });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') closeSettingsModal(); });
 
-  // Page tab events
   document.getElementById('translateBtn')?.addEventListener('click', handleTranslate);
-  document.getElementById('targetLanguage')?.addEventListener('change', (e) => {
-    updateRecentLanguages(e.target.value).then(recent => {
-      renderQuickLanguageButtons('pageQuickLangs', e.target.value, recent, handlePageQuickLangSelect);
-    });
+  document.getElementById('toggleTranslationBtn')?.addEventListener('click', handleToggleTranslation);
+  document.getElementById('targetLanguage')?.addEventListener('change', e => {
+    updateRecentLanguages(e.target.value).then(recent => renderQuickLanguageButtons('pageQuickLangs', e.target.value, recent, handlePageQuickLangSelect));
   });
+  
+  // Check translation status when popup opens
+  checkTranslationStatus();
 
-  // Text tab events
-  document.getElementById('sourceText')?.addEventListener('input', () => {
-    updateCharCount();
-    saveTextTabState();
-  });
+  document.getElementById('sourceText')?.addEventListener('input', () => { updateCharCount(); saveTextTabState(); });
   document.getElementById('textTranslateBtn')?.addEventListener('click', handleTextTranslate);
   document.getElementById('clearSourceBtn')?.addEventListener('click', handleClearSource);
   document.getElementById('copyResultBtn')?.addEventListener('click', handleCopyResult);
   document.getElementById('pasteBtn')?.addEventListener('click', handlePasteFromClipboard);
   document.getElementById('swapBtn')?.addEventListener('click', handleSwapTexts);
-  document.getElementById('textTargetLang')?.addEventListener('change', (e) => {
-    updateRecentLanguages(e.target.value).then(recent => {
-      renderQuickLanguageButtons('textQuickLangs', e.target.value, recent, handleTextQuickLangSelect);
-    });
+  document.getElementById('textTargetLang')?.addEventListener('change', e => {
+    updateRecentLanguages(e.target.value).then(recent => renderQuickLanguageButtons('textQuickLangs', e.target.value, recent, handleTextQuickLangSelect));
   });
   
-  // Auto-translate toggle
   const autoTranslateToggle = document.getElementById('autoTranslateToggle');
   if (autoTranslateToggle) {
     autoTranslateToggle.checked = settings.autoTranslate || false;
     autoTranslateToggle.addEventListener('change', handleAutoTranslateToggle);
   }
 
-  // Keyboard shortcuts
-  document.getElementById('sourceText')?.addEventListener('keydown', (e) => {
-    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
-      e.preventDefault();
-      handleTextTranslate();
-    }
+  document.getElementById('sourceText')?.addEventListener('keydown', e => {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); handleTextTranslate(); }
   });
 
-  // History tab events
   document.getElementById('clearHistoryBtn')?.addEventListener('click', clearHistory);
 
-  // Restore text tab state
   restoreTextTabState();
   updateCharCount();
 
-  // Render quick language buttons
   const recentLangs = settings.recentLanguages || DEFAULT_SETTINGS.recentLanguages;
   renderQuickLanguageButtons('pageQuickLangs', settings.targetLanguage, recentLangs, handlePageQuickLangSelect);
   renderQuickLanguageButtons('textQuickLangs', settings.textTargetLang, recentLangs, handleTextQuickLangSelect);
 
-  // Check connection status
   updateConnectionStatusUI({ status: 'checking', message: 'Checking...' });
-  const status = await checkServerConnection(settings.serverUrl);
-  updateConnectionStatusUI(status);
+  updateConnectionStatusUI(await checkServerConnection(settings.serverUrl));
   
-  // Start clipboard monitoring for Text tab
   startClipboardMonitoring();
-  
-  // Stop monitoring when popup closes
   window.addEventListener('unload', stopClipboardMonitoring);
 }
 
-// Start
 if (typeof chrome !== 'undefined' && chrome.storage) {
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', initializePopup);
-  } else {
-    initializePopup();
-  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initializePopup);
+  else initializePopup();
 }

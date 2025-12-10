@@ -1,390 +1,180 @@
-/**
- * InlineTranslator - Inline translation feature for Chrome extensions
- * Uses Shadow DOM for style isolation
- * Features: Quick language toggle, translation history sync, better loading feedback
- */
+// InlineTranslator - Inline translation with Shadow DOM isolation
+
 class InlineTranslator {
-  static MAX_TEXT_LENGTH = 1000;
-  
-  constructor(options = {}) {
-    this.translateFn = options.translateFn || this._mockTranslate.bind(this);
-    this.languages = options.languages || [
-      { code: 'ja', name: 'Japanese', native: '日本語' },
-      { code: 'en', name: 'English', native: 'English' },
-      { code: 'zh-CN', name: 'Chinese Simplified', native: '简体中文' },
-      { code: 'zh-TW', name: 'Chinese Traditional', native: '繁體中文' },
-      { code: 'ko', name: 'Korean', native: '한국어' },
-      { code: 'vi', name: 'Vietnamese', native: 'Tiếng Việt' },
-    ];
-    this.defaultLang = options.defaultLang || 'ja';
-    this.iconUrl = options.iconUrl || null;
-    this.onHistoryAdd = options.onHistoryAdd || null;
+  static MAX_TEXT = 5000;
+  static INLINE_TAGS = new Set(['B', 'I', 'U', 'STRONG', 'EM', 'SPAN', 'A', 'FONT', 'SMALL', 'BIG', 'SUB', 'SUP', 'BR', 'IMG', 'CODE', 'MARK', 'DEL', 'INS', 'S']);
+  static BLOCK_TAGS = new Set(['P', 'DIV', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'LI', 'TD', 'TH', 'BLOCKQUOTE', 'ARTICLE', 'SECTION']);
+
+  static ERROR_MAP = {
+    UNAUTHORIZED: 'Auth failed', FORBIDDEN: 'Access denied', MODEL_NOT_FOUND: 'Model not found',
+    RATE_LIMIT: 'Rate limited', TIMEOUT: 'Timeout', CONTEXT_LENGTH_EXCEEDED: 'Text too long',
+    BAD_REQUEST: 'Bad request', GATEWAY_ERROR: 'Server unavailable', SERVER_ERROR: 'Server error',
+    UNKNOWN_ERROR: 'Unknown error', CONNECTION_ERROR: 'Connection failed', RATE_LIMITED: 'Rate limited',
+    401: 'Auth failed', 403: 'Forbidden', 404: 'Not found', 429: 'Rate limited',
+    500: 'Server error', 502: 'Bad gateway', 503: 'Unavailable', 504: 'Timeout'
+  };
+
+  static parseError(error) {
+    const msg = error?.message || String(error);
+    for (const [k, v] of Object.entries(this.ERROR_MAP)) {
+      if (msg.includes(k) || msg.toUpperCase().includes(k)) return v;
+    }
+    const m = msg.match(/(\d{3})/);
+    if (m && this.ERROR_MAP[m[1]]) return this.ERROR_MAP[m[1]];
+    if (/fetch|network/i.test(msg)) return this.ERROR_MAP.CONNECTION_ERROR;
+    if (/timeout/i.test(msg)) return this.ERROR_MAP.TIMEOUT;
+    return msg.length > 80 ? msg.substring(0, 80) + '...' : msg;
+  }
+
+  static TagAbstraction = class {
+    constructor() { this.placeholderRegex = /\{\{(\/?)(\d+|br)\}\}/g; }
     
-    // Recent languages for quick toggle (synced with popup)
-    this.recentLanguages = options.recentLanguages || ['ja', 'en', 'zh-CN'];
-    
-    this.hostElement = null;
-    this.shadowRoot = null;
-    this.iconElement = null;
-    this.panelElement = null;
+    abstractSmart(html) {
+      const mapping = new Map();
+      let uid = 0;
+      const stack = [];
+      const tokens = html.split(/(<\/?(?:[a-z0-9]+)[^>]*>)/gi);
+      let result = '';
+      
+      for (const token of tokens) {
+        if (!token.match(/<[^>]+>/)) { result += token; continue; }
+        if (/^<br\s*\/?>$/i.test(token)) { result += '{{br}}'; continue; }
+
+        const isClose = token.startsWith('</');
+        const tagNameMatches = token.match(/<\/?([a-z0-9]+).*/i);
+        const tagName = tagNameMatches ? tagNameMatches[1].toLowerCase() : 'tag';
+        const isSelfClosing = token.endsWith('/>') || ['img', 'hr', 'input', 'meta', 'link'].includes(tagName);
+
+        if (isSelfClosing) {
+          const id = uid++;
+          mapping.set(id, { open: token, close: '' });
+          result += `{{${id}}}`;
+          continue; 
+        }
+
+        if (isClose) {
+          let lastIdx = stack.length - 1;
+          while (lastIdx >= 0 && stack[lastIdx].tagName !== tagName) lastIdx--;
+          
+          if (lastIdx >= 0) {
+            const { id } = stack[lastIdx];
+            mapping.get(id).close = token;
+            result += `{{/${id}}}`;
+            stack.splice(lastIdx, stack.length - lastIdx);
+          } else {
+            const id = uid++;
+            mapping.set(id, { open: token, close: '' });
+            result += `{{${id}}}`;
+          }
+        } else {
+          const id = uid++;
+          mapping.set(id, { open: token, close: '' });
+          stack.push({ tagName, id });
+          result += `{{${id}}}`;
+        }
+      }
+      return { text: result, mapping };
+    }
+
+    restore(translatedText, mapping) {
+      let res = translatedText.replace(/\{\{br\}\}/gi, '<br>');
+      res = res.replace(/\{\{(\/?)([0-9]+)\}\}/g, (match, slash, idDigits) => {
+        const id = parseInt(idDigits, 10);
+        const map = mapping.get(id);
+        if (!map) return '';
+        return slash ? (map.close || '') : (map.open || '');
+      });
+      return res;
+    }
+  }
+
+  constructor(opts = {}) {
+    this.translateFn = opts.translateFn || (async (text) => `[Mock] ${text}`);
+    this.languages = opts.languages || [];
+    this.defaultLang = opts.defaultLang || 'English';
+    this.iconUrl = opts.iconUrl || null;
+    this.onHistoryAdd = opts.onHistoryAdd || null;
+    this.recentLanguages = opts.recentLanguages || [];
+
+    this.host = null;
+    this.shadow = null;
+    this.icon = null;
+    this.panel = null;
     this.selectedText = '';
     this.selectionRect = null;
     this.currentLang = this.defaultLang;
     this.isTranslating = false;
     this.selectionRange = null;
-    this.abortController = null;
-    this.translationStartTime = null;
-    
-    // Bound event handlers
-    this._boundHandleMouseUp = this._handleMouseUp.bind(this);
-    this._boundHandleClickOutside = this._handleClickOutside.bind(this);
-    this._boundHandleKeyDown = this._handleKeyDown.bind(this);
-    this._boundHandleScroll = this._debounce(this._handleScroll.bind(this), 100);
-    this._boundHandleRevertClick = this._handleRevertClick.bind(this);
-    this._panelListeners = [];
+    this.abortCtrl = null;
+    this.startTime = null;
+    this._listeners = [];
+
+    this.tagAbstractor = new InlineTranslator.TagAbstraction();
+    this.currentMapping = null;
+    this.currentOriginalHTML = '';
+    this.selectedPlainText = '';
+    this._needsAbstraction = false;
+
+    this._onMouseUp = this._handleMouseUp.bind(this);
+    this._onMouseDown = this._handleClickOutside.bind(this);
+    this._onKeyDown = this._handleKeyDown.bind(this);
+    this._onScroll = this._debounce(this._handleScroll.bind(this), 100);
+    this._onRevert = this._handleRevert.bind(this);
   }
 
-  // Update recent languages (called from content.js when syncing with popup)
-  updateRecentLanguages(languages) {
-    this.recentLanguages = languages;
+  updateRecentLanguages(langs) { this.recentLanguages = langs; }
+  
+  _debounce(func, wait) {
+    let timeout;
+    return (...args) => { clearTimeout(timeout); timeout = setTimeout(() => func.apply(this, args), wait); };
   }
-
-
-  // ============================================================================
-  // STYLES - With quick language buttons and progress indicator
-  // ============================================================================
 
   static getStyles() {
     return `
-      :host {
-        all: initial;
-        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      }
-      
+      :host { all: initial; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
       * { box-sizing: border-box; }
-      
-      .it-icon {
-        position: fixed;
-        width: 28px;
-        height: 28px;
-        background: transparent;
-        border: none;
-        border-radius: 6px;
-        cursor: pointer;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        z-index: 2147483647;
-        transition: transform 0.15s ease, opacity 0.15s ease;
-        padding: 0;
-        opacity: 0.9;
-        animation: it-iconPulse 0.3s ease-out;
-      }
-      
-      @keyframes it-iconPulse {
-        0% { transform: scale(0.8); opacity: 0; }
-        50% { transform: scale(1.1); }
-        100% { transform: scale(1); opacity: 0.9; }
-      }
-      
-      .it-icon:hover {
-        transform: scale(1.15);
-        opacity: 1;
-      }
-      
-      .it-icon svg {
-        width: 22px;
-        height: 22px;
-        fill: #4285f4;
-        filter: drop-shadow(0 1px 3px rgba(0,0,0,0.25));
-      }
-      
-      .it-icon img {
-        width: 28px;
-        height: 28px;
-        object-fit: contain;
-        filter: drop-shadow(0 1px 3px rgba(0,0,0,0.25));
-      }
-      
-      .it-panel {
-        position: fixed;
-        width: calc(100vw - 30px);
-        max-width: 520px;
-        min-width: 300px;
-        background: #fff;
-        border-radius: 12px;
-        box-shadow: 0 6px 32px rgba(0, 0, 0, 0.18);
-        z-index: 2147483647;
-        overflow: hidden;
-        animation: it-fadeIn 0.2s ease;
-      }
-      
+      .it-icon { position: fixed; width: 28px; height: 28px; background: transparent; border: none; border-radius: 6px; cursor: pointer; display: flex; align-items: center; justify-content: center; z-index: 2147483647; padding: 0; opacity: 0.9; animation: pulse 0.3s ease-out; }
+      @keyframes pulse { 0% { transform: scale(0.8); opacity: 0; } 50% { transform: scale(1.1); } 100% { transform: scale(1); opacity: 0.9; } }
+      .it-icon:hover { transform: scale(1.15); opacity: 1; }
+      .it-icon svg { width: 22px; height: 22px; fill: #4285f4; filter: drop-shadow(0 1px 3px rgba(0,0,0,0.25)); }
+      .it-icon img { width: 28px; height: 28px; object-fit: contain; filter: drop-shadow(0 1px 3px rgba(0,0,0,0.25)); }
+      .it-panel { position: fixed; width: calc(100vw - 30px); max-width: 520px; min-width: 300px; background: #fff; border-radius: 12px; box-shadow: 0 6px 32px rgba(0, 0, 0, 0.18); z-index: 2147483647; overflow: hidden; animation: fadeIn 0.2s ease; }
       @media (min-width: 1200px) { .it-panel { max-width: 600px; } }
-      @media (min-width: 1600px) { .it-panel { max-width: 680px; } }
-      
-      @keyframes it-fadeIn {
-        from { opacity: 0; transform: translateY(-8px); }
-        to { opacity: 1; transform: translateY(0); }
-      }
-      
-      .it-panel-header {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        padding: 8px 12px;
-        background: linear-gradient(135deg, #4285f4, #34a853);
-        color: white;
-      }
-      
-      .it-panel-title {
-        font-size: 14px;
-        font-weight: 600;
-        margin: 0;
-      }
-      
-      .it-close-btn {
-        width: 24px;
-        height: 24px;
-        background: rgba(255, 255, 255, 0.2);
-        border: none;
-        border-radius: 50%;
-        cursor: pointer;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        padding: 0;
-        transition: background 0.15s ease;
-      }
-      
-      .it-close-btn:hover { background: rgba(255, 255, 255, 0.3); }
-      .it-close-btn svg { width: 14px; height: 14px; fill: white; }
-      
-      .it-panel-body {
-        padding: 14px 16px;
-        display: flex;
-        flex-direction: column;
-        gap: 10px;
-      }
-      
-      /* Quick Language Toggle */
-      .it-quick-langs {
-        display: flex;
-        gap: 6px;
-        flex-wrap: wrap;
-      }
-      
-      .it-quick-lang-btn {
-        padding: 4px 10px;
-        font-size: 12px;
-        font-weight: 500;
-        color: #4285f4;
-        background: rgba(66, 133, 244, 0.1);
-        border: 1px solid rgba(66, 133, 244, 0.3);
-        border-radius: 4px;
-        cursor: pointer;
-        transition: all 0.15s ease;
-      }
-      
-      .it-quick-lang-btn:hover {
-        background: rgba(66, 133, 244, 0.2);
-        border-color: #4285f4;
-      }
-      
-      .it-quick-lang-btn.active {
-        background: #4285f4;
-        color: white;
-        border-color: #4285f4;
-      }
-      
-      .it-lang-row {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-      }
-      
-      .it-lang-select {
-        flex: 1;
-        padding: 8px 10px;
-        font-size: 13px;
-        border: 1px solid #e0e0e0;
-        border-radius: 6px;
-        background: #f8f9fa;
-        cursor: pointer;
-        outline: none;
-        appearance: none;
-        background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24'%3E%3Cpath fill='%23666' d='M7 10l5 5 5-5z'/%3E%3C/svg%3E");
-        background-repeat: no-repeat;
-        background-position: right 10px center;
-      }
-      
-      .it-lang-select:focus { border-color: #4285f4; }
-      
-      .it-text-section { margin-top: 0; }
-      
-      .it-text-label {
-        font-size: 10px;
-        font-weight: 600;
-        color: #666;
-        text-transform: uppercase;
-        letter-spacing: 0.5px;
-        margin-bottom: 4px;
-        display: block;
-      }
-      
-      .it-text-box {
-        width: 100%;
-        padding: 10px 12px;
-        font-size: 14px;
-        line-height: 1.5;
-        border: 1px solid #e0e0e0;
-        border-radius: 8px;
-        background: #f8f9fa;
-        min-height: 60px;
-        max-height: 120px;
-        overflow-y: auto;
-        word-wrap: break-word;
-      }
-      
-      .it-text-box.it-source { color: #333; }
-      
-      .it-text-box.it-translated {
-        background: #e8f5e9;
-        border-color: #c8e6c9;
-        color: #2e7d32;
-        position: relative;
-      }
-      
-      .it-text-box.it-loading {
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        justify-content: center;
-        color: #888;
-        min-height: 80px;
-      }
-      
-      .it-text-box.it-error {
-        background: #ffebee;
-        border-color: #ffcdd2;
-        color: #c5221f;
-      }
-      
-      /* Progress Indicator */
-      .it-progress-container {
-        width: 100%;
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        gap: 8px;
-      }
-      
-      .it-progress-bar {
-        width: 80%;
-        height: 4px;
-        background: #e0e0e0;
-        border-radius: 2px;
-        overflow: hidden;
-      }
-      
-      .it-progress-fill {
-        height: 100%;
-        background: linear-gradient(90deg, #4285f4, #34a853);
-        border-radius: 2px;
-        transition: width 0.3s ease;
-        animation: it-progressPulse 1.5s ease-in-out infinite;
-      }
-      
-      @keyframes it-progressPulse {
-        0%, 100% { opacity: 1; }
-        50% { opacity: 0.7; }
-      }
-      
-      .it-progress-text {
-        font-size: 12px;
-        color: #666;
-      }
-      
-      .it-elapsed-time {
-        font-size: 11px;
-        color: #999;
-      }
-      
-      .it-warning {
-        font-size: 11px;
-        color: #f57c00;
-        padding: 4px 8px;
-        background: #fff3e0;
-        border-radius: 4px;
-      }
-      
-      .it-btn-row {
-        display: flex;
-        gap: 8px;
-        margin-top: 4px;
-      }
-      
-      .it-copy-btn, .it-retry-btn, .it-replace-btn {
-        flex: 1;
-        padding: 8px;
-        font-size: 13px;
-        font-weight: 500;
-        color: white;
-        background: linear-gradient(135deg, #4285f4, #34a853);
-        border: none;
-        border-radius: 6px;
-        cursor: pointer;
-        transition: opacity 0.15s ease;
-      }
-      
-      .it-copy-btn:hover, .it-retry-btn:hover, .it-replace-btn:hover { opacity: 0.9; }
-      .it-copy-btn:disabled, .it-retry-btn:disabled, .it-replace-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-      .it-copy-btn.it-copied, .it-replace-btn.it-replaced { background: #34a853; }
-      
-      .it-retry-btn {
-        background: #f44336;
-        flex: 0 0 auto;
-        padding: 8px 16px;
-      }
-      
-      /* Keyboard hint */
-      .it-keyboard-hint {
-        font-size: 10px;
-        color: #999;
-        text-align: center;
-        margin-top: 4px;
-      }
-      
-      .it-kbd {
-        display: inline-block;
-        padding: 1px 4px;
-        background: #f0f0f0;
-        border: 1px solid #ddd;
-        border-radius: 3px;
-        font-family: monospace;
-        font-size: 10px;
-      }
+      @keyframes fadeIn { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
+      .it-header { display: flex; align-items: center; justify-content: space-between; padding: 8px 12px; background: linear-gradient(135deg, #4285f4, #34a853); color: white; }
+      .it-title { font-size: 14px; font-weight: 600; }
+      .it-close { width: 24px; height: 24px; background: rgba(255, 255, 255, 0.2); border: none; border-radius: 50%; cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 0; }
+      .it-close:hover { background: rgba(255, 255, 255, 0.3); }
+      .it-close svg { width: 14px; height: 14px; fill: white; }
+      .it-body { padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; }
+      .it-quick { display: flex; gap: 6px; flex-wrap: wrap; }
+      .it-quick-btn { padding: 4px 10px; font-size: 12px; font-weight: 500; color: #4285f4; background: rgba(66, 133, 244, 0.1); border: 1px solid rgba(66, 133, 244, 0.3); border-radius: 4px; cursor: pointer; }
+      .it-quick-btn:hover { background: rgba(66, 133, 244, 0.2); border-color: #4285f4; }
+      .it-quick-btn.active { background: #4285f4; color: white; border-color: #4285f4; }
+      .it-select { flex: 1; padding: 8px 10px; font-size: 13px; border: 1px solid #e0e0e0; border-radius: 6px; background: #f8f9fa; cursor: pointer; outline: none; appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24'%3E%3Cpath fill='%23666' d='M7 10l5 5 5-5z'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 10px center; }
+      .it-select:focus { border-color: #4285f4; }
+      .it-label { font-size: 10px; font-weight: 600; color: #666; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; display: block; }
+      .it-box { width: 100%; padding: 10px 12px; font-size: 14px; line-height: 1.5; border: 1px solid #e0e0e0; border-radius: 8px; background: #f8f9fa; min-height: 60px; max-height: 120px; overflow-y: auto; word-wrap: break-word; }
+      .it-box.source { color: #333; }
+      .it-box.translated { background: #e8f5e9; border-color: #c8e6c9; color: #2e7d32; }
+      .it-box.loading { display: flex; flex-direction: column; align-items: center; justify-content: center; color: #888; min-height: 80px; }
+      .it-box.error { background: #ffebee; border-color: #ffcdd2; color: #c5221f; }
+      .it-progress { width: 100%; display: flex; flex-direction: column; align-items: center; gap: 8px; }
+      .it-progress-bar { width: 80%; height: 4px; background: #e0e0e0; border-radius: 2px; overflow: hidden; }
+      .it-progress-fill { height: 100%; background: linear-gradient(90deg, #4285f4, #34a853); border-radius: 2px; transition: width 0.3s ease; animation: progressPulse 1.5s ease-in-out infinite; }
+      @keyframes progressPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.7; } }
+      .it-progress-text { font-size: 12px; color: #666; }
+      .it-elapsed { font-size: 11px; color: #999; }
+      .it-btns { display: flex; gap: 8px; margin-top: 4px; }
+      .it-btn { flex: 1; padding: 8px; font-size: 13px; font-weight: 500; color: white; background: linear-gradient(135deg, #4285f4, #34a853); border: none; border-radius: 6px; cursor: pointer; }
+      .it-btn:hover { opacity: 0.9; }
+      .it-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+      .it-btn.copied, .it-btn.replaced { background: #34a853; }
+      .it-btn.retry { background: #f44336; flex: 0 0 auto; padding: 8px 16px; }
+      .it-hint { font-size: 10px; color: #999; text-align: center; margin-top: 4px; }
+      .it-kbd { display: inline-block; padding: 1px 4px; background: #f0f0f0; border: 1px solid #ddd; border-radius: 3px; font-family: monospace; font-size: 10px; }
     `;
   }
-
-
-  // ============================================================================
-  // MOCK TRANSLATE (fallback)
-  // ============================================================================
-
-  async _mockTranslate(text, lang, signal) {
-    await new Promise((resolve, reject) => {
-      const timeout = setTimeout(resolve, 500 + Math.random() * 500);
-      signal?.addEventListener('abort', () => {
-        clearTimeout(timeout);
-        reject(new DOMException('Aborted', 'AbortError'));
-      });
-    });
-    return `[${lang.toUpperCase()}] ${text}`;
-  }
-
-  // ============================================================================
-  // INITIALIZATION
-  // ============================================================================
 
   init() {
     this._createHost();
@@ -392,1323 +182,481 @@ class InlineTranslator {
   }
 
   destroy() {
-    this._cancelPendingRequest();
+    this._cancel();
     this._removeListeners();
-    this._cleanupPanelListeners();
-    
-    if (this.hostElement) {
-      this.hostElement.remove();
-      this.hostElement = null;
-      this.shadowRoot = null;
-    }
-    
-    this.iconElement = null;
-    this.panelElement = null;
+    this._cleanupListeners();
+    if (this.host) { this.host.remove(); this.host = null; this.shadow = null; }
+    this.icon = null;
+    this.panel = null;
   }
 
   _createHost() {
-    this.hostElement = document.createElement('div');
-    this.hostElement.id = 'inline-translator-host';
-    this.shadowRoot = this.hostElement.attachShadow({ mode: 'closed' });
+    if (!document.body) return;
     
+    this.host = document.createElement('div');
+    this.host.id = 'inline-translator-host';
+    this.shadow = this.host.attachShadow({ mode: 'closed' });
     const style = document.createElement('style');
     style.textContent = InlineTranslator.getStyles();
-    this.shadowRoot.appendChild(style);
-    
-    document.body.appendChild(this.hostElement);
-    this._injectReplacedTextStyles();
+    this.shadow.appendChild(style);
+    document.body.appendChild(this.host);
+    this._injectReplacedStyles();
   }
 
-  _injectReplacedTextStyles() {
+  _injectReplacedStyles() {
     if (document.getElementById('inline-translator-replaced-styles')) return;
-    
     const style = document.createElement('style');
     style.id = 'inline-translator-replaced-styles';
     style.textContent = `
-      .pt-inline-replaced {
-        background-color: rgba(52, 168, 83, 0.15) !important;
-        border-radius: 2px !important;
-        cursor: pointer !important;
-        position: relative !important;
-        display: inline !important;
-      }
-      .pt-inline-replaced:hover {
-        background-color: rgba(52, 168, 83, 0.25) !important;
-      }
-      .pt-inline-replaced::after {
-        content: '↩' !important;
-        position: absolute !important;
-        top: -10px !important;
-        right: -10px !important;
-        width: 18px !important;
-        height: 18px !important;
-        background: #f44336 !important;
-        color: white !important;
-        font-size: 11px !important;
-        line-height: 18px !important;
-        text-align: center !important;
-        border-radius: 50% !important;
-        opacity: 0 !important;
-        transform: scale(0.8) !important;
-        transition: opacity 0.15s ease, transform 0.15s ease !important;
-        pointer-events: none !important;
-        z-index: 10000 !important;
-      }
-      .pt-inline-replaced:hover::after {
-        opacity: 1 !important;
-        transform: scale(1) !important;
-      }
+      .pt-inline-replaced { background-color: rgba(52, 168, 83, 0.15) !important; border-radius: 2px !important; cursor: pointer !important; position: relative !important; display: inline !important; }
+      .pt-inline-replaced:hover { background-color: rgba(52, 168, 83, 0.25) !important; }
+      .pt-inline-replaced::after { content: '↩' !important; position: absolute !important; top: -10px !important; right: -10px !important; width: 18px !important; height: 18px !important; background: #f44336 !important; color: white !important; font-size: 11px !important; line-height: 18px !important; text-align: center !important; border-radius: 50% !important; opacity: 0 !important; transform: scale(0.8) !important; transition: opacity 0.15s ease, transform 0.15s ease !important; pointer-events: none !important; z-index: 10000 !important; }
+      .pt-inline-replaced:hover::after { opacity: 1 !important; transform: scale(1) !important; }
     `;
     (document.head || document.documentElement).appendChild(style);
   }
 
   _attachListeners() {
-    document.addEventListener('mouseup', this._boundHandleMouseUp);
-    document.addEventListener('mousedown', this._boundHandleClickOutside);
-    document.addEventListener('keydown', this._boundHandleKeyDown);
-    window.addEventListener('scroll', this._boundHandleScroll, true);
-    document.addEventListener('click', this._boundHandleRevertClick);
+    document.addEventListener('mouseup', this._onMouseUp);
+    document.addEventListener('mousedown', this._onMouseDown);
+    document.addEventListener('keydown', this._onKeyDown);
+    window.addEventListener('scroll', this._onScroll, true);
+    document.addEventListener('click', this._onRevert);
   }
 
   _removeListeners() {
-    document.removeEventListener('mouseup', this._boundHandleMouseUp);
-    document.removeEventListener('mousedown', this._boundHandleClickOutside);
-    document.removeEventListener('keydown', this._boundHandleKeyDown);
-    window.removeEventListener('scroll', this._boundHandleScroll, true);
-    document.removeEventListener('click', this._boundHandleRevertClick);
+    document.removeEventListener('mouseup', this._onMouseUp);
+    document.removeEventListener('mousedown', this._onMouseDown);
+    document.removeEventListener('keydown', this._onKeyDown);
+    window.removeEventListener('scroll', this._onScroll, true);
+    document.removeEventListener('click', this._onRevert);
   }
-
-  // ============================================================================
-  // EVENT HANDLERS
-  // ============================================================================
 
   _handleKeyDown(e) {
     if (e.key === 'Escape') {
-      if (this.panelElement) {
-        this._hidePanel();
-        e.preventDefault();
-      } else if (this.iconElement) {
-        this._hideIcon();
-        e.preventDefault();
-      }
-    }
-    
-    if (e.key === 'Tab' && this.panelElement) {
-      this._handleFocusTrap(e);
-    }
-  }
-
-  _handleFocusTrap(e) {
-    const focusableElements = this.panelElement.querySelectorAll(
-      'button:not([disabled]), select, [tabindex]:not([tabindex="-1"])'
-    );
-    
-    if (focusableElements.length === 0) return;
-    
-    const firstEl = focusableElements[0];
-    const lastEl = focusableElements[focusableElements.length - 1];
-    
-    if (e.shiftKey && this.shadowRoot.activeElement === firstEl) {
-      lastEl.focus();
-      e.preventDefault();
-    } else if (!e.shiftKey && this.shadowRoot.activeElement === lastEl) {
-      firstEl.focus();
-      e.preventDefault();
+      if (this.panel) { this._hidePanel(); e.preventDefault(); }
+      else if (this.icon) { this._hideIcon(); e.preventDefault(); }
     }
   }
 
   _handleScroll() {
-    if (this.panelElement && this.selectionRect) {
-      try {
-        const selection = window.getSelection();
-        if (selection && selection.rangeCount > 0) {
-          const range = selection.getRangeAt(0);
-          this.selectionRect = this._getMultiLineRect(range);
-          const pos = this._calculatePanelPosition(this.selectionRect, this._getPanelWidth(), 320);
-          this.panelElement.style.left = `${pos.left}px`;
-          this.panelElement.style.top = `${pos.top}px`;
+    try {
+      const sel = window.getSelection();
+      if (sel?.rangeCount > 0) {
+        this.selectionRect = sel.getRangeAt(0).getBoundingClientRect();
+        
+        if (this.panel) {
+          const pos = this._panelPos(this.selectionRect, this.panel.offsetWidth || 320, 320);
+          this.panel.style.left = `${pos.left}px`;
+          this.panel.style.top = `${pos.top}px`;
         }
-      } catch (e) {}
-    }
-    
-    if (this.iconElement && this.selectionRect) {
-      const pos = this._calculateIconPosition(this.selectionRect);
-      this.iconElement.style.left = `${pos.left}px`;
-      this.iconElement.style.top = `${pos.top}px`;
-    }
+        
+        if (this.icon) {
+          const pos = this._iconPos(this.selectionRect);
+          this.icon.style.left = `${pos.left}px`;
+          this.icon.style.top = `${pos.top}px`;
+        }
+      }
+    } catch {}
   }
 
   _handleMouseUp(e) {
-    if (this.hostElement?.contains(e.target) || e.target === this.hostElement) return;
-    
+    if (this.host?.contains(e.target) || e.target === this.host) return;
     setTimeout(() => {
-      let selection, text;
-      try {
-        selection = window.getSelection();
-        text = selection?.toString().trim();
-      } catch (err) {
-        return;
-      }
-      
+      let sel;
+      try { sel = window.getSelection(); } catch { return; }
+      if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
+
+      const text = sel.toString().trim();
       if (!text) return;
-      
-      const activeEl = document.activeElement;
-      if (activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA' || activeEl.isContentEditable)) {
-        return;
-      }
-      
+
+      const active = document.activeElement;
+      if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable)) return;
+
       try {
-        const range = selection.getRangeAt(0);
-        this.selectionRect = this._getMultiLineRect(range);
-        this.selectedText = text;
+        const range = sel.getRangeAt(0);
+        this.selectionRect = range.getBoundingClientRect();
         this.selectionRange = range.cloneRange();
+        this.selectedPlainText = text;
+        this._needsAbstraction = true;
         
         this._hidePanel();
         this._showIcon();
-      } catch (err) {
-        return;
-      }
+      } catch {}
     }, 10);
+  }
+  
+  _performAbstraction() {
+    if (!this._needsAbstraction || !this.selectionRange) return false;
+    
+    try {
+      if (!this.selectionRange.commonAncestorContainer || !document.contains(this.selectionRange.commonAncestorContainer)) {
+        this.currentOriginalHTML = this.selectedPlainText;
+        this.selectedText = this.selectedPlainText;
+        this.currentMapping = new Map();
+        this._needsAbstraction = false;
+        return true;
+      }
+      
+      const div = document.createElement('div');
+      div.appendChild(this.selectionRange.cloneContents());
+      this.currentOriginalHTML = div.innerHTML;
+      
+      const { text: abstractText, mapping } = this.tagAbstractor.abstractSmart(this.currentOriginalHTML);
+      this.selectedText = abstractText;
+      this.currentMapping = mapping;
+      this._needsAbstraction = false;
+      return true;
+    } catch {
+      this.currentOriginalHTML = this.selectedPlainText;
+      this.selectedText = this.selectedPlainText;
+      this.currentMapping = new Map();
+      this._needsAbstraction = false;
+      return true;
+    }
   }
 
   _handleClickOutside(e) {
     const path = e.composedPath();
-    const isInsideUI = path.some(el => 
-      el === this.iconElement || 
-      el === this.panelElement || 
-      el === this.hostElement
-    );
-    
-    if (!isInsideUI && !this.shadowRoot?.contains(e.target)) {
+    const inside = path.some(el => el === this.icon || el === this.panel || el === this.host);
+    if (!inside && !this.shadow?.contains(e.target)) {
       this._hideIcon();
       this._hidePanel();
     }
   }
 
-  _handleRevertClick(e) {
+  _handleRevert(e) {
     const target = e.target;
     if (!target.classList?.contains('pt-inline-replaced')) return;
-    
-    const originalText = target.dataset.ptOriginal;
-    const originalHTML = target.dataset.ptOriginalHtml;
-    
-    if (!originalText && !originalHTML) return;
+    const origHtml = target.dataset.ptOriginalHtml;
+    if (!origHtml) return;
     
     e.preventDefault();
     e.stopPropagation();
-    
     const parent = target.parentNode;
     if (!parent) return;
-    
-    // Prefer restoring original HTML if available (preserves formatting)
-    if (originalHTML) {
-      const tempContainer = document.createElement('div');
-      tempContainer.innerHTML = originalHTML;
-      
-      // Move all children from temp container to a fragment
-      const fragment = document.createDocumentFragment();
-      while (tempContainer.firstChild) {
-        fragment.appendChild(tempContainer.firstChild);
-      }
-      
-      parent.replaceChild(fragment, target);
-    } else if (originalText.includes('\n')) {
-      const wrapper = document.createElement('span');
-      wrapper.style.whiteSpace = 'pre-wrap';
-      this._setTextWithLineBreaks(wrapper, originalText);
-      parent.replaceChild(wrapper, target);
-    } else {
-      const textNode = document.createTextNode(originalText);
-      parent.replaceChild(textNode, target);
-    }
+
+    const temp = document.createElement('div');
+    temp.innerHTML = origHtml;
+    const frag = document.createDocumentFragment();
+    while (temp.firstChild) frag.appendChild(temp.firstChild);
+    parent.replaceChild(frag, target);
     
     window.getSelection()?.removeAllRanges();
   }
 
+  _iconPos(r) { return { left: r.right + 5, top: r.bottom + 5 }; }
 
-  // ============================================================================
-  // ICON
-  // ============================================================================
+  _panelPos(r, w, h) {
+    const vpW = window.innerWidth, vpH = window.innerHeight;
+    let left = r.left, top = r.bottom + 10;
+
+    if (left + w > vpW) left = vpW - w - 10;
+    if (left < 10) left = 10;
+    if (top + h > vpH) {
+      top = r.top - h - 10;
+      if (top < 10) top = 10;
+    }
+    return { left, top };
+  }
 
   _showIcon() {
     this._hideIcon();
-    
     const icon = document.createElement('button');
     icon.className = 'it-icon';
-    icon.setAttribute('aria-label', 'Translate selection');
     icon.title = 'Translate selection';
-    
-    if (this.iconUrl && this._isValidIconUrl(this.iconUrl)) {
+
+    if (this.iconUrl) {
       const img = document.createElement('img');
-      img.setAttribute('src', this.iconUrl);
-      img.setAttribute('alt', 'Translate');
+      img.src = this.iconUrl;
       icon.appendChild(img);
     } else {
-      this._appendDefaultIcon(icon);
+      icon.innerHTML = `<svg viewBox="0 0 24 24"><path d="M12.87 15.07l-2.54-2.51.03-.03c1.74-1.94 2.98-4.17 3.71-6.53H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z"/></svg>`;
     }
-    
-    const clickHandler = (e) => {
-      e.stopPropagation();
-      this._hideIcon();
-      this._showPanel();
-    };
-    
-    icon.addEventListener('click', clickHandler);
-    this._panelListeners.push({ element: icon, type: 'click', handler: clickHandler });
-    
-    const pos = this._calculateIconPosition(this.selectionRect);
+
+    const handler = e => { e.stopPropagation(); this._hideIcon(); this._showPanel(); };
+    icon.addEventListener('click', handler);
+    this._listeners.push({ el: icon, type: 'click', fn: handler });
+
+    const pos = this._iconPos(this.selectionRect);
     icon.style.left = `${pos.left}px`;
     icon.style.top = `${pos.top}px`;
-    
-    this.iconElement = icon;
-    this.shadowRoot.appendChild(icon);
-  }
 
-  _isValidIconUrl(url) {
-    try {
-      const parsed = new URL(url, window.location.href);
-      return ['http:', 'https:', 'data:', 'chrome-extension:'].includes(parsed.protocol);
-    } catch {
-      return false;
-    }
-  }
-
-  _appendDefaultIcon(container) {
-    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-    svg.setAttribute('viewBox', '0 0 24 24');
-    
-    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-    path.setAttribute('d', 'M12.87 15.07l-2.54-2.51.03-.03c1.74-1.94 2.98-4.17 3.71-6.53H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z');
-    
-    svg.appendChild(path);
-    container.appendChild(svg);
+    this.icon = icon;
+    this.shadow.appendChild(icon);
   }
 
   _hideIcon() {
-    if (this.iconElement) {
-      this.iconElement.remove();
-      this.iconElement = null;
-    }
+    if (this.icon) { this.icon.remove(); this.icon = null; }
   }
-
-  // ============================================================================
-  // PANEL - With quick language toggle and progress indicator
-  // ============================================================================
 
   _showPanel() {
     this._hidePanel();
     this.isTranslating = false;
-    
-    const isTextTruncated = this.selectedText.length > InlineTranslator.MAX_TEXT_LENGTH;
-    const displayText = isTextTruncated 
-      ? this.selectedText.substring(0, InlineTranslator.MAX_TEXT_LENGTH) 
-      : this.selectedText;
-    
+    this._performAbstraction();
+
+    let plainTextDisplay = this.selectedPlainText || '';
+    try { 
+      const freshText = window.getSelection().toString().trim();
+      if (freshText) plainTextDisplay = freshText;
+    } catch {}
+    if (!plainTextDisplay) plainTextDisplay = this.selectedText;
+
+    const truncated = plainTextDisplay.length > InlineTranslator.MAX_TEXT;
+    const displayText = truncated ? plainTextDisplay.substring(0, InlineTranslator.MAX_TEXT) : plainTextDisplay;
+
     const panel = document.createElement('div');
     panel.className = 'it-panel';
     panel.setAttribute('role', 'dialog');
-    panel.setAttribute('aria-label', 'Translation panel');
-    
-    this._buildPanelContent(panel, displayText, isTextTruncated);
-    
-    const pos = this._calculatePanelPosition(this.selectionRect, this._getPanelWidth(), 380);
+    this._buildPanel(panel, displayText);
+
+    const pos = this._panelPos(this.selectionRect, 320, 380);
     panel.style.left = `${pos.left}px`;
     panel.style.top = `${pos.top}px`;
-    
-    this.panelElement = panel;
-    this.shadowRoot.appendChild(panel);
-    
-    const langSelect = panel.querySelector('.it-lang-select');
-    if (langSelect) langSelect.focus();
-    
-    this._fetchTranslation(panel);
+
+    this.panel = panel;
+    this.shadow.appendChild(panel);
+    panel.querySelector('.it-select')?.focus();
+    this._translate(panel);
   }
 
-  _buildPanelContent(panel, displayText, isTextTruncated) {
-    // Header
+  _buildPanel(panel, text) {
     const header = document.createElement('div');
-    header.className = 'it-panel-header';
-    
-    const title = document.createElement('span');
-    title.className = 'it-panel-title';
-    title.textContent = 'Translate';
-    header.appendChild(title);
-    
-    const closeBtn = document.createElement('button');
-    closeBtn.className = 'it-close-btn';
-    closeBtn.title = 'Close (Esc)';
-    closeBtn.setAttribute('aria-label', 'Close');
-    
-    const closeSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-    closeSvg.setAttribute('viewBox', '0 0 24 24');
-    const closePath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-    closePath.setAttribute('d', 'M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z');
-    closeSvg.appendChild(closePath);
-    closeBtn.appendChild(closeSvg);
-    
+    header.className = 'it-header';
+    header.innerHTML = `<span class="it-title">Translate</span><button class="it-close" title="Close (Esc)"><svg viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg></button>`;
+    const closeBtn = header.querySelector('.it-close');
     const closeHandler = () => this._hidePanel();
     closeBtn.addEventListener('click', closeHandler);
-    this._panelListeners.push({ element: closeBtn, type: 'click', handler: closeHandler });
-    
-    header.appendChild(closeBtn);
+    this._listeners.push({ el: closeBtn, type: 'click', fn: closeHandler });
     panel.appendChild(header);
-    
-    // Body
+
     const body = document.createElement('div');
-    body.className = 'it-panel-body';
-    
-    // Warning for truncated text
-    if (isTextTruncated) {
-      const warning = document.createElement('div');
-      warning.className = 'it-warning';
-      warning.textContent = `Text truncated to ${InlineTranslator.MAX_TEXT_LENGTH.toLocaleString()} characters`;
-      body.appendChild(warning);
-    }
-    
-    // Quick language buttons
-    const quickLangs = document.createElement('div');
-    quickLangs.className = 'it-quick-langs';
-    
-    this.recentLanguages.forEach(langCode => {
-      const lang = this.languages.find(l => l.code === langCode);
+    body.className = 'it-body';
+
+    const quick = document.createElement('div');
+    quick.className = 'it-quick';
+    this.recentLanguages.forEach(code => {
+      const lang = this.languages.find(l => l.code === code);
       if (!lang) return;
-      
       const btn = document.createElement('button');
-      btn.className = 'it-quick-lang-btn';
-      if (langCode === this.currentLang) btn.classList.add('active');
-      btn.textContent = lang.native;
-      btn.title = lang.name;
-      btn.dataset.lang = langCode;
-      
-      const quickLangHandler = () => {
-        this.currentLang = langCode;
-        // Update active state
-        quickLangs.querySelectorAll('.it-quick-lang-btn').forEach(b => b.classList.remove('active'));
+      btn.className = 'it-quick-btn' + (code === this.currentLang ? ' active' : '');
+      btn.textContent = lang.name;
+      btn.dataset.lang = code;
+      const handler = () => {
+        this.currentLang = code;
+        quick.querySelectorAll('.it-quick-btn').forEach(b => b.classList.remove('active'));
         btn.classList.add('active');
-        // Update select
-        const select = panel.querySelector('.it-lang-select');
-        if (select) select.value = langCode;
-        // Re-translate
-        this._fetchTranslation(panel);
+        panel.querySelector('.it-select').value = code;
+        this._translate(panel);
       };
-      
-      btn.addEventListener('click', quickLangHandler);
-      this._panelListeners.push({ element: btn, type: 'click', handler: quickLangHandler });
-      
-      quickLangs.appendChild(btn);
+      btn.addEventListener('click', handler);
+      this._listeners.push({ el: btn, type: 'click', fn: handler });
+      quick.appendChild(btn);
     });
-    
-    body.appendChild(quickLangs);
-    
-    // Language select row
-    const langRow = document.createElement('div');
-    langRow.className = 'it-lang-row';
-    
-    const langSelect = document.createElement('select');
-    langSelect.className = 'it-lang-select';
-    langSelect.setAttribute('aria-label', 'Target language');
-    
-    this.languages.forEach(lang => {
-      const option = document.createElement('option');
-      option.value = lang.code;
-      option.textContent = lang.name;
-      if (lang.code === this.currentLang) option.selected = true;
-      langSelect.appendChild(option);
+    body.appendChild(quick);
+
+    const select = document.createElement('select');
+    select.className = 'it-select';
+    this.languages.forEach(l => {
+      const opt = document.createElement('option');
+      opt.value = l.code;
+      opt.textContent = l.name;
+      if (l.code === this.currentLang) opt.selected = true;
+      select.appendChild(opt);
     });
-    
-    const langChangeHandler = (e) => {
-      e.stopPropagation();
+    const selectHandler = e => {
       this.currentLang = e.target.value;
-      // Update quick lang buttons
-      quickLangs.querySelectorAll('.it-quick-lang-btn').forEach(btn => {
-        btn.classList.toggle('active', btn.dataset.lang === this.currentLang);
-      });
-      this._fetchTranslation(panel);
+      quick.querySelectorAll('.it-quick-btn').forEach(b => b.classList.toggle('active', b.dataset.lang === this.currentLang));
+      this._translate(panel);
     };
-    langSelect.addEventListener('change', langChangeHandler);
-    this._panelListeners.push({ element: langSelect, type: 'change', handler: langChangeHandler });
-    
-    langRow.appendChild(langSelect);
-    body.appendChild(langRow);
-    
-    // Source text section
-    const sourceSection = document.createElement('div');
-    sourceSection.className = 'it-text-section';
-    
-    const sourceLabel = document.createElement('span');
-    sourceLabel.className = 'it-text-label';
-    sourceLabel.textContent = 'Source';
-    sourceSection.appendChild(sourceLabel);
-    
-    const sourceBox = document.createElement('div');
-    sourceBox.className = 'it-text-box it-source';
-    sourceBox.style.whiteSpace = 'pre-wrap';
-    this._setTextWithLineBreaks(sourceBox, displayText);
-    sourceSection.appendChild(sourceBox);
-    
-    body.appendChild(sourceSection);
-    
-    // Translation section
+    select.addEventListener('change', selectHandler);
+    this._listeners.push({ el: select, type: 'change', fn: selectHandler });
+    body.appendChild(select);
+
+    const srcSection = document.createElement('div');
+    srcSection.innerHTML = `<span class="it-label">Source</span>`;
+    const srcBox = document.createElement('div');
+    srcBox.className = 'it-box source';
+    srcBox.style.whiteSpace = 'pre-wrap';
+    srcBox.textContent = text;
+    srcSection.appendChild(srcBox);
+    body.appendChild(srcSection);
+
     const transSection = document.createElement('div');
-    transSection.className = 'it-text-section';
-    
-    const transLabel = document.createElement('span');
-    transLabel.className = 'it-text-label';
-    transLabel.textContent = 'Translation';
-    transSection.appendChild(transLabel);
-    
+    transSection.innerHTML = `<span class="it-label">Translation</span>`;
     const transBox = document.createElement('div');
-    transBox.className = 'it-text-box it-translated it-loading';
-    transBox.setAttribute('aria-live', 'polite');
-    
-    // Progress indicator
-    const progressContainer = document.createElement('div');
-    progressContainer.className = 'it-progress-container';
-    
-    const progressBar = document.createElement('div');
-    progressBar.className = 'it-progress-bar';
-    const progressFill = document.createElement('div');
-    progressFill.className = 'it-progress-fill';
-    progressFill.style.width = '30%';
-    progressBar.appendChild(progressFill);
-    progressContainer.appendChild(progressBar);
-    
-    const progressText = document.createElement('span');
-    progressText.className = 'it-progress-text';
-    progressText.textContent = 'Translating...';
-    progressContainer.appendChild(progressText);
-    
-    const elapsedTime = document.createElement('span');
-    elapsedTime.className = 'it-elapsed-time';
-    elapsedTime.textContent = '';
-    progressContainer.appendChild(elapsedTime);
-    
-    transBox.appendChild(progressContainer);
+    transBox.className = 'it-box translated loading';
+    transBox.innerHTML = `<div class="it-progress"><div class="it-progress-bar"><div class="it-progress-fill" style="width:30%"></div></div><span class="it-progress-text">Translating...</span><span class="it-elapsed"></span></div>`;
     transSection.appendChild(transBox);
     body.appendChild(transSection);
-    
-    // Button row
-    const btnRow = document.createElement('div');
-    btnRow.className = 'it-btn-row';
+
+    const btns = document.createElement('div');
+    btns.className = 'it-btns';
     
     const copyBtn = document.createElement('button');
-    copyBtn.className = 'it-copy-btn';
+    copyBtn.className = 'it-btn';
     copyBtn.textContent = 'Copy';
     copyBtn.disabled = true;
-    
-    const copyHandler = () => this._copyTranslation(panel);
-    copyBtn.addEventListener('click', copyHandler);
-    this._panelListeners.push({ element: copyBtn, type: 'click', handler: copyHandler });
-    
-    btnRow.appendChild(copyBtn);
-    
+    copyBtn.addEventListener('click', () => this._copy(panel));
+    this._listeners.push({ el: copyBtn, type: 'click', fn: () => this._copy(panel) });
+    btns.appendChild(copyBtn);
+
     const replaceBtn = document.createElement('button');
-    replaceBtn.className = 'it-replace-btn';
+    replaceBtn.className = 'it-btn';
     replaceBtn.textContent = 'Replace';
-    replaceBtn.title = 'Replace original text';
     replaceBtn.disabled = true;
-    
-    const replaceHandler = () => this._replaceWithTranslation(panel);
-    replaceBtn.addEventListener('click', replaceHandler);
-    this._panelListeners.push({ element: replaceBtn, type: 'click', handler: replaceHandler });
-    
-    btnRow.appendChild(replaceBtn);
-    body.appendChild(btnRow);
-    
-    // Keyboard hint
+    replaceBtn.addEventListener('click', () => this._replace(panel));
+    this._listeners.push({ el: replaceBtn, type: 'click', fn: () => this._replace(panel) });
+    btns.appendChild(replaceBtn);
+
+    body.appendChild(btns);
+
     const hint = document.createElement('div');
-    hint.className = 'it-keyboard-hint';
+    hint.className = 'it-hint';
     hint.innerHTML = 'Press <span class="it-kbd">Esc</span> to close';
     body.appendChild(hint);
-    
+
     panel.appendChild(body);
   }
 
   _hidePanel() {
-    this._cancelPendingRequest();
-    this._cleanupPanelListeners();
-    
-    if (this.panelElement) {
-      this.panelElement.remove();
-      this.panelElement = null;
-    }
+    this._cancel();
+    this._cleanupListeners();
+    if (this.panel) { this.panel.remove(); this.panel = null; }
     this.isTranslating = false;
-    this.translationStartTime = null;
+    this.startTime = null;
   }
 
-  _cancelPendingRequest() {
-    if (this.abortController) {
-      this.abortController.abort();
-      this.abortController = null;
-    }
+  _cancel() {
+    if (this.abortCtrl) { this.abortCtrl.abort(); this.abortCtrl = null; }
   }
 
-  _cleanupPanelListeners() {
-    this._panelListeners.forEach(({ element, type, handler }) => {
-      element.removeEventListener(type, handler);
-    });
-    this._panelListeners = [];
+  _cleanupListeners() {
+    this._listeners.forEach(({ el, type, fn }) => el.removeEventListener(type, fn));
+    this._listeners = [];
   }
 
+  async _translate(panel) {
+    if (this.isTranslating) this._cancel();
 
-  // ============================================================================
-  // TRANSLATION - With progress tracking
-  // ============================================================================
+    const transBox = panel.querySelector('.it-box.translated');
+    const copyBtn = panel.querySelector('.it-btn');
+    const replaceBtn = panel.querySelectorAll('.it-btn')[1];
+    const btns = panel.querySelector('.it-btns');
 
-  async _fetchTranslation(panel) {
-    if (this.isTranslating) {
-      this._cancelPendingRequest();
-    }
-    
-    const translatedBox = panel.querySelector('.it-translated');
-    const copyBtn = panel.querySelector('.it-copy-btn');
-    const replaceBtn = panel.querySelector('.it-replace-btn');
-    const btnRow = panel.querySelector('.it-btn-row');
-    
-    if (!translatedBox || !copyBtn || !btnRow) return;
-    
-    // Remove existing retry button
-    const existingRetry = btnRow.querySelector('.it-retry-btn');
-    if (existingRetry) existingRetry.remove();
-    
-    // Show loading state with progress
+    btns.querySelector('.it-btn.retry')?.remove();
+
     this.isTranslating = true;
-    this.translationStartTime = Date.now();
-    translatedBox.classList.add('it-loading');
-    translatedBox.classList.remove('it-error');
-    
-    // Build progress UI
-    const progressContainer = document.createElement('div');
-    progressContainer.className = 'it-progress-container';
-    
-    const progressBar = document.createElement('div');
-    progressBar.className = 'it-progress-bar';
-    const progressFill = document.createElement('div');
-    progressFill.className = 'it-progress-fill';
-    progressFill.style.width = '20%';
-    progressBar.appendChild(progressFill);
-    progressContainer.appendChild(progressBar);
-    
-    const progressText = document.createElement('span');
-    progressText.className = 'it-progress-text';
-    progressText.textContent = 'Translating...';
-    progressContainer.appendChild(progressText);
-    
-    const elapsedTime = document.createElement('span');
-    elapsedTime.className = 'it-elapsed-time';
-    progressContainer.appendChild(elapsedTime);
-    
-    translatedBox.replaceChildren(progressContainer);
-    
-    // Animate progress
-    let progressValue = 20;
-    const progressInterval = setInterval(() => {
-      if (progressValue < 85) {
-        progressValue += Math.random() * 10;
-        progressFill.style.width = `${Math.min(progressValue, 85)}%`;
-      }
-      // Update elapsed time
-      const elapsed = ((Date.now() - this.translationStartTime) / 1000).toFixed(1);
-      elapsedTime.textContent = `${elapsed}s`;
+    this.startTime = Date.now();
+    transBox.classList.add('loading');
+    transBox.classList.remove('error');
+    transBox.innerHTML = `<div class="it-progress"><div class="it-progress-bar"><div class="it-progress-fill" style="width:20%"></div></div><span class="it-progress-text">Translating...</span><span class="it-elapsed"></span></div>`;
+
+    const fill = transBox.querySelector('.it-progress-fill');
+    const elapsed = transBox.querySelector('.it-elapsed');
+    let progress = 20;
+    const interval = setInterval(() => {
+      if (progress < 85) { progress += Math.random() * 10; fill.style.width = `${Math.min(progress, 85)}%`; }
+      elapsed.textContent = `${((Date.now() - this.startTime) / 1000).toFixed(1)}s`;
     }, 300);
-    
+
     copyBtn.disabled = true;
     copyBtn.textContent = 'Copy';
-    copyBtn.classList.remove('it-copied');
-    
-    if (replaceBtn) {
-      replaceBtn.disabled = true;
-      replaceBtn.textContent = 'Replace';
-      replaceBtn.classList.remove('it-replaced');
-    }
-    
-    this.abortController = new AbortController();
-    const signal = this.abortController.signal;
-    
-    const textToTranslate = this.selectedText.length > InlineTranslator.MAX_TEXT_LENGTH
-      ? this.selectedText.substring(0, InlineTranslator.MAX_TEXT_LENGTH)
-      : this.selectedText;
-    
+    copyBtn.classList.remove('copied');
+    if (replaceBtn) { replaceBtn.disabled = true; replaceBtn.textContent = 'Replace'; replaceBtn.classList.remove('replaced'); }
+
+    this.abortCtrl = new AbortController();
+    const signal = this.abortCtrl.signal;
+    const textToSend = this.selectedText;
+
     try {
-      const translation = await this.translateFn(textToTranslate, this.currentLang, signal);
-      
-      clearInterval(progressInterval);
-      
-      if (!this.panelElement || signal.aborted) return;
-      
-      // Complete progress
-      progressFill.style.width = '100%';
-      
+      const trans = await this.translateFn(textToSend, this.currentLang, signal);
+      clearInterval(interval);
+      if (!this.panel || signal.aborted) return;
+
+      fill.style.width = '100%';
       setTimeout(() => {
-        translatedBox.classList.remove('it-loading');
-        translatedBox.style.whiteSpace = 'pre-wrap';
-        this._setTextWithLineBreaks(translatedBox, translation);
-        translatedBox.dataset.translation = translation;
+        transBox.classList.remove('loading');
+        transBox.style.whiteSpace = 'pre-wrap';
+        
+        const restoredHTML = this.tagAbstractor.restore(trans, this.currentMapping);
+        const tempDiv = document.createElement('div');
+        tempDiv.innerHTML = restoredHTML;
+        const displayText = tempDiv.textContent;
+
+        transBox.textContent = displayText;
+        transBox.dataset.translationHtml = restoredHTML;
+        transBox.dataset.translationText = displayText;
+        
         copyBtn.disabled = false;
         if (replaceBtn) replaceBtn.disabled = false;
-        
-        // Add to history if callback provided
-        if (this.onHistoryAdd) {
-          this.onHistoryAdd(textToTranslate, translation, this.currentLang);
-        }
+        if (this.onHistoryAdd) this.onHistoryAdd(textToSend, displayText, this.currentLang);
       }, 150);
-      
-    } catch (err) {
-      clearInterval(progressInterval);
-      
-      if (err.name === 'AbortError') return;
-      if (!this.panelElement) return;
-      
-      translatedBox.classList.remove('it-loading');
-      translatedBox.classList.add('it-error');
-      translatedBox.textContent = `Error: ${err.message}`;
-      
-      this._addRetryButton(panel, btnRow);
+    } catch (e) {
+      clearInterval(interval);
+      if (e.name === 'AbortError' || !this.panel) return;
+      transBox.classList.remove('loading');
+      transBox.classList.add('error');
+      transBox.textContent = InlineTranslator.parseError(e);
+      this._addRetry(panel, btns);
     } finally {
       this.isTranslating = false;
-      this.abortController = null;
+      this.abortCtrl = null;
     }
   }
 
-  _addRetryButton(panel, btnRow) {
-    const retryBtn = document.createElement('button');
-    retryBtn.className = 'it-retry-btn';
-    retryBtn.textContent = 'Retry';
-    
-    const retryHandler = () => {
-      retryBtn.remove();
-      this._fetchTranslation(panel);
-    };
-    retryBtn.addEventListener('click', retryHandler);
-    this._panelListeners.push({ element: retryBtn, type: 'click', handler: retryHandler });
-    
-    btnRow.appendChild(retryBtn);
-    retryBtn.focus();
+  _addRetry(panel, btns) {
+    const btn = document.createElement('button');
+    btn.className = 'it-btn retry';
+    btn.textContent = 'Retry';
+    const handler = () => { btn.remove(); this._translate(panel); };
+    btn.addEventListener('click', handler);
+    this._listeners.push({ el: btn, type: 'click', fn: handler });
+    btns.appendChild(btn);
+    btn.focus();
   }
 
-  // ============================================================================
-  // COPY & REPLACE
-  // ============================================================================
-
-  _copyTranslation(panel) {
-    const translatedBox = panel.querySelector('.it-translated');
-    const copyBtn = panel.querySelector('.it-copy-btn');
-    const translation = translatedBox?.dataset.translation;
-    
-    if (!translation) return;
-    
-    if (window.isSecureContext && navigator.clipboard?.writeText) {
-      navigator.clipboard.writeText(translation)
-        .then(() => this._showCopySuccess(copyBtn))
-        .catch(() => this._fallbackCopy(translation, copyBtn));
-    } else {
-      this._fallbackCopy(translation, copyBtn);
-    }
+  _copy(panel) {
+    const trans = panel.querySelector('.it-box.translated')?.dataset.translationText;
+    const btn = panel.querySelector('.it-btn');
+    if (!trans) return;
+    navigator.clipboard.writeText(trans).then(() => {
+      btn.textContent = 'Copied!';
+      btn.classList.add('copied');
+      setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 1500);
+    }).catch(() => {});
   }
 
-  async _fallbackCopy(text, copyBtn) {
+  _replace(panel) {
+    const transHtml = panel.querySelector('.it-box.translated')?.dataset.translationHtml;
+    const btn = panel.querySelectorAll('.it-btn')[1];
+    if (!transHtml || !this.selectionRange) return;
+
     try {
-      if (typeof ClipboardItem !== 'undefined' && navigator.clipboard?.write) {
-        const blob = new Blob([text], { type: 'text/plain' });
-        const item = new ClipboardItem({ 'text/plain': blob });
-        await navigator.clipboard.write([item]);
-        this._showCopySuccess(copyBtn);
-        return;
-      }
-      this._showManualCopyDialog(text, copyBtn);
-    } catch {
-      this._showManualCopyDialog(text, copyBtn);
-    }
-  }
-
-  _showManualCopyDialog(text, copyBtn) {
-    const overlay = document.createElement('div');
-    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:2147483647;display:flex;align-items:center;justify-content:center;';
-
-    const dialog = document.createElement('div');
-    dialog.style.cssText = 'background:#fff;padding:16px;border-radius:8px;max-width:400px;width:90%;box-shadow:0 4px 20px rgba(0,0,0,0.3);';
-    dialog.innerHTML = `
-      <p style="margin:0 0 8px;font-size:14px;color:#333;">Select and copy:</p>
-      <textarea readonly style="width:100%;height:80px;padding:8px;border:1px solid #ddd;border-radius:4px;font-size:13px;resize:none;">${text.replace(/</g, '&lt;')}</textarea>
-      <button style="margin-top:8px;padding:8px 16px;background:#4285f4;color:#fff;border:none;border-radius:4px;cursor:pointer;">Close</button>
-    `;
-
-    const textarea = dialog.querySelector('textarea');
-    const closeBtn = dialog.querySelector('button');
-
-    textarea.addEventListener('focus', () => textarea.select());
-    closeBtn.addEventListener('click', () => overlay.remove());
-    overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
-
-    overlay.appendChild(dialog);
-    document.body.appendChild(overlay);
-    textarea.focus();
-    textarea.select();
-
-    copyBtn.textContent = 'Copy manually';
-    setTimeout(() => { if (copyBtn) copyBtn.textContent = 'Copy'; }, 2000);
-  }
-
-  _showCopySuccess(copyBtn) {
-    if (!copyBtn) return;
-    copyBtn.textContent = 'Copied!';
-    copyBtn.classList.add('it-copied');
-    setTimeout(() => {
-      if (copyBtn) {
-        copyBtn.textContent = 'Copy';
-        copyBtn.classList.remove('it-copied');
-      }
-    }, 1500);
-  }
-
-  _replaceWithTranslation(panel) {
-    const translatedBox = panel.querySelector('.it-translated');
-    const replaceBtn = panel.querySelector('.it-replace-btn');
-    const translation = translatedBox?.dataset.translation;
-    
-    if (!translation || !this.selectionRange) return;
-    
-    try {
-      if (!this.selectionRange.commonAncestorContainer || 
-          !document.contains(this.selectionRange.commonAncestorContainer)) {
-        this._showReplaceError(replaceBtn, 'Selection lost');
+      if (!this.selectionRange.commonAncestorContainer || !document.contains(this.selectionRange.commonAncestorContainer)) {
+        btn.textContent = 'Selection lost';
+        setTimeout(() => btn.textContent = 'Replace', 1500);
         return;
       }
       
-      const container = this.selectionRange.commonAncestorContainer;
-      const parentElement = container.nodeType === Node.TEXT_NODE 
-        ? container.parentElement 
-        : container;
-      
-      if (parentElement?.isContentEditable) {
-        const selection = window.getSelection();
-        selection.removeAllRanges();
-        selection.addRange(this.selectionRange);
-        
-        this.selectionRange.deleteContents();
-        const textNode = document.createTextNode(translation);
-        this.selectionRange.insertNode(textNode);
-        
-        parentElement.dispatchEvent(new InputEvent('input', {
-          inputType: 'insertText',
-          data: translation,
-          bubbles: true
-        }));
-      } else {
-        // Use format-preserving replacement algorithm (similar to content.js)
-        this._replaceWithFormatPreservation(translation);
-        window.getSelection()?.removeAllRanges();
-      }
-      
-      this._showReplaceSuccess(replaceBtn);
+      const wrapper = document.createElement('span');
+      wrapper.className = 'pt-inline-replaced';
+      wrapper.title = 'Click to revert';
+      wrapper.dataset.ptOriginalHtml = this.currentOriginalHTML;
+      wrapper.innerHTML = transHtml;
+
+      this.selectionRange.deleteContents();
+      this.selectionRange.insertNode(wrapper);
+
+      window.getSelection()?.removeAllRanges();
+
+      btn.textContent = 'Replaced!';
+      btn.classList.add('replaced');
+      btn.disabled = true;
       setTimeout(() => this._hidePanel(), 800);
-      
-    } catch (err) {
-      console.error('[InlineTranslator] Replace error:', err);
-      this._showReplaceError(replaceBtn, 'Replace failed');
+    } catch {
+      btn.textContent = 'Failed';
+      setTimeout(() => btn.textContent = 'Replace', 1500);
     }
   }
-
-  // ============================================================================
-  // FORMAT-PRESERVING REPLACEMENT ALGORITHM
-  // Adapted from content.js page translator for better CSS/HTML preservation
-  // ============================================================================
-
-  static INLINE_TAGS = new Set(['B', 'I', 'U', 'STRONG', 'EM', 'SPAN', 'A', 'FONT', 'SMALL', 'BIG', 'SUB', 'SUP', 'BR', 'IMG', 'CODE', 'MARK', 'DEL', 'INS', 'S', 'ABBR', 'CITE', 'DFN', 'KBD', 'Q', 'SAMP', 'VAR', 'TIME', 'DATA', 'RUBY', 'RT', 'RP', 'BDI', 'BDO', 'WBR']);
-  static BLOCK_TAGS = new Set(['P', 'DIV', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'LI', 'TD', 'TH', 'BLOCKQUOTE', 'ARTICLE', 'SECTION', 'HEADER', 'FOOTER', 'NAV', 'ASIDE', 'MAIN', 'FIGURE', 'FIGCAPTION', 'DD', 'DT', 'ADDRESS', 'PRE']);
-
-  _replaceWithFormatPreservation(translation) {
-    const range = this.selectionRange;
-    const container = range.commonAncestorContainer;
-    
-    // Analyze selection structure
-    const selectionInfo = this._analyzeSelection(range);
-    
-    if (selectionInfo.type === 'singleTextNode') {
-      // Simple case: selection within a single text node
-      this._replaceSingleTextNode(range, translation, selectionInfo);
-    } else if (selectionInfo.type === 'inlineOnly') {
-      // Selection spans inline elements only (e.g., <b>text</b><i>more</i>)
-      this._replaceInlineSelection(range, translation, selectionInfo);
-    } else if (selectionInfo.type === 'singleBlock') {
-      // Selection within a single block element with inline content
-      this._replaceBlockInlineContent(range, translation, selectionInfo);
-    } else {
-      // Multi-block selection - use simplified approach
-      this._replaceMultiBlockPreserving(range, translation, selectionInfo);
-    }
-  }
-
-  _analyzeSelection(range) {
-    const container = range.commonAncestorContainer;
-    const startContainer = range.startContainer;
-    const endContainer = range.endContainer;
-    
-    // Single text node selection
-    if (startContainer === endContainer && startContainer.nodeType === Node.TEXT_NODE) {
-      return {
-        type: 'singleTextNode',
-        textNode: startContainer,
-        parentElement: startContainer.parentElement
-      };
-    }
-    
-    // Get the common ancestor element
-    const ancestorElement = container.nodeType === Node.TEXT_NODE 
-      ? container.parentElement 
-      : container;
-    
-    // Check if selection is within a single block
-    const startBlock = this._getBlockParent(startContainer);
-    const endBlock = this._getBlockParent(endContainer);
-    
-    if (startBlock === endBlock) {
-      // Check if the block has only inline content
-      if (this._hasOnlyInlineContent(startBlock)) {
-        return {
-          type: 'singleBlock',
-          blockElement: startBlock,
-          originalHTML: this._getSelectedHTML(range),
-          computedStyles: this._captureComputedStyles(startBlock)
-        };
-      }
-      return {
-        type: 'inlineOnly',
-        ancestorElement,
-        originalHTML: this._getSelectedHTML(range),
-        computedStyles: this._captureInlineStyles(range)
-      };
-    }
-    
-    // Multi-block selection
-    return {
-      type: 'multiBlock',
-      startBlock,
-      endBlock,
-      originalHTML: this._getSelectedHTML(range),
-      blocks: this._getBlocksInRange(range)
-    };
-  }
-
-  _getBlockParent(node) {
-    let current = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
-    
-    while (current && current !== document.body) {
-      if (InlineTranslator.BLOCK_TAGS.has(current.tagName)) return current;
-      current = current.parentElement;
-    }
-    return document.body;
-  }
-
-  _hasOnlyInlineContent(element) {
-    for (const child of element.childNodes) {
-      if (child.nodeType === Node.TEXT_NODE) continue;
-      if (child.nodeType === Node.ELEMENT_NODE) {
-        const tag = child.tagName;
-        if (InlineTranslator.BLOCK_TAGS.has(tag)) return false;
-        if (!InlineTranslator.INLINE_TAGS.has(tag) && !this._hasOnlyInlineContent(child)) return false;
-      }
-    }
-    return true;
-  }
-
-  _getSelectedHTML(range) {
-    const fragment = range.cloneContents();
-    const div = document.createElement('div');
-    div.appendChild(fragment);
-    return div.innerHTML;
-  }
-
-  _captureComputedStyles(element) {
-    const computed = window.getComputedStyle(element);
-    return {
-      fontFamily: computed.fontFamily,
-      fontSize: computed.fontSize,
-      fontWeight: computed.fontWeight,
-      fontStyle: computed.fontStyle,
-      color: computed.color,
-      textDecoration: computed.textDecoration,
-      lineHeight: computed.lineHeight,
-      letterSpacing: computed.letterSpacing,
-      textTransform: computed.textTransform,
-      whiteSpace: computed.whiteSpace
-    };
-  }
-
-  _captureInlineStyles(range) {
-    // Capture styles from the first text node's parent
-    const startElement = range.startContainer.nodeType === Node.TEXT_NODE
-      ? range.startContainer.parentElement
-      : range.startContainer;
-    return startElement ? this._captureComputedStyles(startElement) : {};
-  }
-
-  _getBlocksInRange(range) {
-    const blocks = [];
-    const walker = document.createTreeWalker(
-      range.commonAncestorContainer,
-      NodeFilter.SHOW_ELEMENT,
-      {
-        acceptNode: (node) => {
-          if (!InlineTranslator.BLOCK_TAGS.has(node.tagName)) return NodeFilter.FILTER_SKIP;
-          const nodeRange = document.createRange();
-          nodeRange.selectNodeContents(node);
-          if (range.compareBoundaryPoints(Range.START_TO_END, nodeRange) > 0 &&
-              range.compareBoundaryPoints(Range.END_TO_START, nodeRange) < 0) {
-            return NodeFilter.FILTER_ACCEPT;
-          }
-          return NodeFilter.FILTER_SKIP;
-        }
-      }
-    );
-    
-    let node;
-    while ((node = walker.nextNode())) {
-      blocks.push(node);
-    }
-    return blocks;
-  }
-
-  // ============================================================================
-  // REPLACEMENT METHODS
-  // ============================================================================
-
-  _replaceSingleTextNode(range, translation, info) {
-    const textNode = info.textNode;
-    const parent = info.parentElement;
-    
-    if (!parent) {
-      // Fallback: simple replacement
-      range.deleteContents();
-      range.insertNode(document.createTextNode(translation));
-      return;
-    }
-    
-    const beforeText = textNode.textContent.substring(0, range.startOffset);
-    const afterText = textNode.textContent.substring(range.endOffset);
-    
-    // Create wrapper that preserves parent's inline styling context
-    const wrapper = document.createElement('span');
-    wrapper.className = 'pt-inline-replaced';
-    wrapper.dataset.ptOriginal = this.selectedText;
-    wrapper.title = 'Click to revert';
-    
-    // Copy relevant inline styles from parent
-    this._copyInlineStyles(parent, wrapper);
-    
-    // Set translation text with line break handling
-    this._setTextWithLineBreaks(wrapper, translation);
-    
-    // Build replacement structure
-    const fragment = document.createDocumentFragment();
-    if (beforeText) fragment.appendChild(document.createTextNode(beforeText));
-    fragment.appendChild(wrapper);
-    if (afterText) fragment.appendChild(document.createTextNode(afterText));
-    
-    parent.replaceChild(fragment, textNode);
-  }
-
-  _replaceInlineSelection(range, translation, info) {
-    const wrapper = document.createElement('span');
-    wrapper.className = 'pt-inline-replaced';
-    wrapper.dataset.ptOriginal = this.selectedText;
-    wrapper.dataset.ptOriginalHtml = info.originalHTML;
-    wrapper.title = 'Click to revert';
-    
-    // Apply captured styles
-    if (info.computedStyles) {
-      this._applyComputedStyles(wrapper, info.computedStyles);
-    }
-    
-    this._setTextWithLineBreaks(wrapper, translation);
-    
-    range.deleteContents();
-    range.insertNode(wrapper);
-  }
-
-  _replaceBlockInlineContent(range, translation, info) {
-    const wrapper = document.createElement('span');
-    wrapper.className = 'pt-inline-replaced';
-    wrapper.dataset.ptOriginal = this.selectedText;
-    wrapper.dataset.ptOriginalHtml = info.originalHTML;
-    wrapper.title = 'Click to revert';
-    
-    // Preserve the block's text styling
-    if (info.computedStyles) {
-      this._applyComputedStyles(wrapper, info.computedStyles);
-    }
-    
-    this._setTextWithLineBreaks(wrapper, translation);
-    
-    range.deleteContents();
-    range.insertNode(wrapper);
-  }
-
-  _replaceMultiBlockPreserving(range, translation, info) {
-    // For multi-block, we need to be more careful
-    // Strategy: Replace content in first block, remove content from subsequent blocks
-    
-    const textNodes = this._getTextNodesInRange(range);
-    if (textNodes.length === 0) {
-      // Fallback
-      range.deleteContents();
-      const wrapper = this._createReplacementWrapper(translation, info.originalHTML);
-      range.insertNode(wrapper);
-      return;
-    }
-    
-    const firstNode = textNodes[0];
-    const startOffset = firstNode.node === range.startContainer ? range.startOffset : 0;
-    
-    // Create wrapper with original HTML stored for revert
-    const wrapper = this._createReplacementWrapper(translation, info.originalHTML);
-    
-    const beforeText = firstNode.node.textContent.substring(0, startOffset);
-    
-    // Process nodes in reverse order
-    for (let i = textNodes.length - 1; i >= 0; i--) {
-      const { node } = textNodes[i];
-      
-      if (i === 0) {
-        const parent = node.parentNode;
-        if (!parent) continue;
-        
-        if (beforeText) {
-          parent.insertBefore(document.createTextNode(beforeText), node);
-        }
-        parent.insertBefore(wrapper, node);
-        
-        if (node === range.startContainer && node === range.endContainer) {
-          const afterText = node.textContent.substring(range.endOffset);
-          if (afterText) {
-            parent.insertBefore(document.createTextNode(afterText), node);
-          }
-        }
-        parent.removeChild(node);
-      } else if (i === textNodes.length - 1) {
-        const endOffset = node === range.endContainer 
-          ? range.endOffset : node.textContent.length;
-        const afterText = node.textContent.substring(endOffset);
-        
-        if (afterText) {
-          node.textContent = afterText;
-        } else {
-          node.parentNode?.removeChild(node);
-        }
-      } else {
-        node.parentNode?.removeChild(node);
-      }
-    }
-  }
-
-  _createReplacementWrapper(translation, originalHTML) {
-    const wrapper = document.createElement('span');
-    wrapper.className = 'pt-inline-replaced';
-    wrapper.dataset.ptOriginal = this.selectedText;
-    if (originalHTML) {
-      wrapper.dataset.ptOriginalHtml = originalHTML;
-    }
-    wrapper.title = 'Click to revert';
-    wrapper.style.whiteSpace = 'pre-wrap';
-    this._setTextWithLineBreaks(wrapper, translation);
-    return wrapper;
-  }
-
-  _copyInlineStyles(source, target) {
-    const computed = window.getComputedStyle(source);
-    
-    // Only copy text-related styles that affect appearance
-    const stylesToCopy = ['font-family', 'font-size', 'font-weight', 'font-style', 
-                          'color', 'text-decoration', 'letter-spacing', 'text-transform'];
-    
-    stylesToCopy.forEach(prop => {
-      const value = computed.getPropertyValue(prop);
-      if (value && value !== 'normal' && value !== 'none') {
-        // Don't override if it's a default value
-        const defaultCheck = document.createElement('span');
-        document.body.appendChild(defaultCheck);
-        const defaultValue = window.getComputedStyle(defaultCheck).getPropertyValue(prop);
-        document.body.removeChild(defaultCheck);
-        
-        if (value !== defaultValue) {
-          target.style.setProperty(prop, value);
-        }
-      }
-    });
-  }
-
-  _applyComputedStyles(element, styles) {
-    if (styles.fontWeight && styles.fontWeight !== 'normal' && styles.fontWeight !== '400') {
-      element.style.fontWeight = styles.fontWeight;
-    }
-    if (styles.fontStyle && styles.fontStyle !== 'normal') {
-      element.style.fontStyle = styles.fontStyle;
-    }
-    if (styles.textDecoration && styles.textDecoration !== 'none') {
-      element.style.textDecoration = styles.textDecoration;
-    }
-    if (styles.textTransform && styles.textTransform !== 'none') {
-      element.style.textTransform = styles.textTransform;
-    }
-  }
-
-  _setTextWithLineBreaks(element, text) {
-    element.innerHTML = '';
-    const lines = text.split('\n');
-    lines.forEach((line, index) => {
-      if (index > 0) element.appendChild(document.createElement('br'));
-      if (line) element.appendChild(document.createTextNode(line));
-    });
-  }
-
-  _getTextNodesInRange(range) {
-    const textNodes = [];
-    const container = range.commonAncestorContainer;
-    
-    // Handle case where container is a text node
-    if (container.nodeType === Node.TEXT_NODE) {
-      return [{ node: container, isPartial: true }];
-    }
-    
-    const walker = document.createTreeWalker(
-      container,
-      NodeFilter.SHOW_TEXT,
-      {
-        acceptNode: (node) => {
-          const nodeRange = document.createRange();
-          nodeRange.selectNodeContents(node);
-          
-          const startsBeforeEnd = range.compareBoundaryPoints(Range.START_TO_END, nodeRange) >= 0;
-          const endsAfterStart = range.compareBoundaryPoints(Range.END_TO_START, nodeRange) <= 0;
-          
-          if (startsBeforeEnd && endsAfterStart && node.textContent.trim()) {
-            return NodeFilter.FILTER_ACCEPT;
-          }
-          return NodeFilter.FILTER_REJECT;
-        }
-      }
-    );
-    
-    let node;
-    while ((node = walker.nextNode())) {
-      const isPartial = node === range.startContainer || node === range.endContainer;
-      textNodes.push({ node, isPartial });
-    }
-    
-    return textNodes;
-  }
-
-  _showReplaceSuccess(replaceBtn) {
-    if (!replaceBtn) return;
-    replaceBtn.textContent = 'Replaced!';
-    replaceBtn.classList.add('it-replaced');
-    replaceBtn.disabled = true;
-  }
-
-  _showReplaceError(replaceBtn, message) {
-    if (!replaceBtn) return;
-    replaceBtn.textContent = message;
-    setTimeout(() => { if (replaceBtn) replaceBtn.textContent = 'Replace'; }, 1500);
-  }
-
-
-  // ============================================================================
-  // POSITIONING
-  // ============================================================================
-
-  _getMultiLineRect(range) {
-    const rects = range.getClientRects();
-    
-    if (rects.length === 0) return range.getBoundingClientRect();
-    if (rects.length === 1) return rects[0];
-    
-    let left = Infinity, top = Infinity, right = -Infinity, bottom = -Infinity;
-    
-    for (const rect of rects) {
-      if (rect.width === 0 && rect.height === 0) continue;
-      left = Math.min(left, rect.left);
-      top = Math.min(top, rect.top);
-      right = Math.max(right, rect.right);
-      bottom = Math.max(bottom, rect.bottom);
-    }
-    
-    return { left, top, right, bottom, width: right - left, height: bottom - top, x: left, y: top };
-  }
-
-  _calculateIconPosition(rect) {
-    const iconSize = 28;
-    const gap = 8;
-    const padding = 10;
-    
-    let left = rect.right + gap;
-    let top = rect.top + (rect.height - iconSize) / 2;
-    
-    if (left + iconSize > window.innerWidth - padding) {
-      left = rect.left - iconSize - gap;
-    }
-    
-    if (left < padding) {
-      left = rect.left + rect.width / 2 - iconSize / 2;
-      top = rect.top - iconSize - gap;
-    }
-    
-    left = Math.max(padding, Math.min(left, window.innerWidth - iconSize - padding));
-    top = Math.max(padding, Math.min(top, window.innerHeight - iconSize - padding));
-    
-    return { left, top };
-  }
-
-  _getPanelWidth() {
-    const viewW = window.innerWidth;
-    if (viewW >= 1600) return 680;
-    if (viewW >= 1200) return 600;
-    return 520;
-  }
-
-  _calculatePanelPosition(rect, panelWidth, panelHeight) {
-    const padding = 15;
-    const gap = 12;
-    const viewW = window.innerWidth;
-    const viewH = window.innerHeight;
-    
-    const actualPanelWidth = Math.min(panelWidth, viewW - 30);
-    const maxLeft = viewW - actualPanelWidth - padding;
-    const maxTop = viewH - panelHeight - padding;
-    
-    let left = rect.left + rect.width / 2 - actualPanelWidth / 2;
-    left = Math.max(padding, Math.min(left, maxLeft));
-    
-    const spaceAbove = rect.top - padding - gap;
-    const spaceBelow = viewH - rect.bottom - padding - gap;
-    
-    let top;
-    if (spaceAbove >= panelHeight) {
-      top = rect.top - panelHeight - gap;
-    } else if (spaceBelow >= panelHeight) {
-      top = rect.bottom + gap;
-    } else {
-      top = padding;
-    }
-    
-    top = Math.max(padding, Math.min(top, maxTop));
-    
-    return { left, top };
-  }
-
-  // ============================================================================
-  // UTILITIES
-  // ============================================================================
-
-  _debounce(fn, delay) {
-    let timeoutId;
-    return (...args) => {
-      clearTimeout(timeoutId);
-      timeoutId = setTimeout(() => fn.apply(this, args), delay);
-    };
-  }
-}
-
-// Export
-if (typeof window !== 'undefined') {
-  window.InlineTranslator = InlineTranslator;
 }
