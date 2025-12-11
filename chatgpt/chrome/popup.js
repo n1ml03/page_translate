@@ -10,7 +10,8 @@ const DEFAULT_SETTINGS = {
   textTargetLang: 'English',
   recentLanguages: ['Japanese', 'English', 'Vietnamese'],
   translationHistory: [],
-  autoTranslate: false
+  autoTranslate: false,
+  inlineIconEnabled: true
 };
 
 // Hardcoded base endpoint URL - model will be appended automatically
@@ -587,6 +588,12 @@ async function handleAutoTranslateToggle(e) {
   }
 }
 
+async function handleInlineIconToggle(e) {
+  const enabled = e.target.checked;
+  await saveSettings({ inlineIconEnabled: enabled });
+  showToast(enabled ? 'Selection icon enabled' : 'Selection icon disabled', 'success');
+}
+
 function handleSwapTexts() {
   const sourceTextEl = document.getElementById('sourceText');
   const translatedTextEl = document.getElementById('translatedText');
@@ -845,6 +852,12 @@ async function init() {
   if (autoTranslateToggle) {
     autoTranslateToggle.checked = settings.autoTranslate || false;
     autoTranslateToggle.addEventListener('change', handleAutoTranslateToggle);
+  }
+
+  const inlineIconToggle = document.getElementById('inlineIconEnabled');
+  if (inlineIconToggle) {
+    inlineIconToggle.checked = settings.inlineIconEnabled !== false;
+    inlineIconToggle.addEventListener('change', handleInlineIconToggle);
   }
 
   document.getElementById('clearHistoryBtn')?.addEventListener('click', clearHistory);

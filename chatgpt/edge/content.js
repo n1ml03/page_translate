@@ -8,7 +8,7 @@
   // Translation State Manager - Stores original/translated content for toggle
   // ============================================
   const TranslationStateManager = {
-    // Map of element -> { originalHTML, originalText, translatedHTML, translatedText }
+    // Map of element -> { originalNodes, originalText, translatedHTML, translatedText, type }
     elementStates: new WeakMap(),
     // Array of translated elements (for iteration since WeakMap can't be iterated)
     translatedElements: [],
@@ -20,8 +20,8 @@
     targetLanguage: null,
 
     // Store translation state for an element
-    store(element, originalHTML, originalText, translatedHTML, translatedText) {
-      const state = { originalHTML, originalText, translatedHTML, translatedText };
+    store(element, originalNodes, originalText, translatedHTML, translatedText, type) {
+      const state = { originalNodes, originalText, translatedHTML, translatedText, type };
       this.elementStates.set(element, state);
       if (!this.translatedElements.includes(element)) {
         this.translatedElements.push(element);
@@ -43,24 +43,37 @@
       if (this.displayMode === 'original') return;
       this.displayMode = 'original';
       
+      // Pause mutation observer to prevent re-triggering translation
+      if (window.pageTranslatorObserver) window.pageTranslatorObserver.disconnect();
+
       // Clean up dead references and switch content
       this.translatedElements = this.translatedElements.filter(element => {
-        if (!document.contains(element)) return false;
         const state = this.elementStates.get(element);
-        if (state) {
-          // Check if it's a text span or block element
-          if (element.classList.contains('pt-translated-text')) {
-            element.textContent = state.originalText;
-          } else {
-            element.innerHTML = state.originalHTML;
+        if (!state) return false;
+
+        if (state.type === 'TEXT') {
+          // Check if wrapper is in DOM
+          if (document.contains(element) && element.parentNode) {
+            // Replace wrapper with original node(s)
+            const originalNode = state.originalNodes[0];
+            element.parentNode.replaceChild(originalNode, element);
           }
-          element.classList.remove('pt-translated-block', 'pt-translated-text');
-          element.classList.add('pt-original-shown');
+        } else {
+          // Block element
+          if (document.contains(element)) {
+            element.innerHTML = '';
+            element.append(...state.originalNodes);
+            element.classList.remove('pt-translated-block', 'pt-translated-text');
+            element.classList.add('pt-original-shown');
+          } else {
+            return false;
+          }
         }
         return true;
       });
       
       updateToggleUI();
+      if (observeMutations) observeMutations();
     },
 
     // Switch all elements to show translated text
@@ -68,26 +81,39 @@
       if (this.displayMode === 'translated') return;
       this.displayMode = 'translated';
       
+      if (window.pageTranslatorObserver) window.pageTranslatorObserver.disconnect();
+
       // Clean up dead references and switch content
       this.translatedElements = this.translatedElements.filter(element => {
-        if (!document.contains(element)) return false;
         const state = this.elementStates.get(element);
         if (state) {
-          // Check if it's a text span (has pt-original-shown but was originally pt-translated-text)
-          const isTextSpan = element.tagName === 'SPAN' && element.dataset.ptOriginal;
-          if (isTextSpan) {
-            element.textContent = state.translatedText;
-            element.classList.add('pt-translated-text');
+          if (state.type === 'TEXT') {
+            const originalNode = state.originalNodes[0];
+            if (document.contains(originalNode) && originalNode.parentNode) {
+              originalNode.parentNode.replaceChild(element, originalNode);
+              element.textContent = state.translatedText;
+              element.classList.add('pt-translated-text');
+            } else if (document.contains(element)) {
+              // Already there
+            } else {
+              return false;
+            }
           } else {
-            element.innerHTML = state.translatedHTML;
-            element.classList.add('pt-translated-block');
+            // Block element
+            if (document.contains(element)) {
+              element.innerHTML = state.translatedHTML;
+              element.classList.add('pt-translated-block');
+              element.classList.remove('pt-original-shown');
+            } else {
+              return false;
+            }
           }
-          element.classList.remove('pt-original-shown');
         }
         return true;
       });
       
       updateToggleUI();
+      if (observeMutations) observeMutations();
     },
 
     // Toggle between original and translated
@@ -221,14 +247,19 @@
   function enableRightClick() {
     document.oncontextmenu = null;
     if (document.body) document.body.oncontextmenu = null;
+    if (document.documentElement) document.documentElement.oncontextmenu = null;
+
     const blocked = ['contextmenu', 'dragstart', 'selectstart', 'copy', 'cut', 'paste'];
     blocked.forEach(e => document.addEventListener(e, ev => ev.stopPropagation(), true));
+
     const orig = EventTarget.prototype.addEventListener;
     EventTarget.prototype.addEventListener = function(type, listener, opts) {
       if (blocked.includes(type)) return;
       return orig.call(this, type, listener, opts);
     };
+
     document.addEventListener('mousedown', e => { if (e.button === 2) e.stopPropagation(); }, true);
+
     const style = document.createElement('style');
     style.textContent = '* { -webkit-user-select: text !important; user-select: text !important; }';
     (document.head || document.documentElement).appendChild(style);
@@ -247,14 +278,13 @@
   const STATUS_ID = 'page-translator-status', TOOLTIP_ID = 'page-translator-tooltip';
   const CONCURRENCY = 2, CACHE_MAX = 500, DEBOUNCE_MS = 300, MAX_BATCH = 100, MAX_CHARS = 5000;
 
-  // Full language names used as codes (matching popup.js format)
-  const LANG_NAMES = ['Japanese', 'English', 'Chinese (Simplified)', 'Chinese (Traditional)', 'Korean', 'Vietnamese'];
-  // Legacy short code mapping for backward compatibility
-  const LANG_MAP = { 'ja': 'Japanese', 'en': 'English', 'zh-CN': 'Chinese (Simplified)', 'zh-TW': 'Chinese (Traditional)', 'ko': 'Korean', 'vi': 'Vietnamese' };
-  // Convert any format to full language name
-  const toLangName = code => LANG_MAP[code] || code;
+  const LANG_CODE_MAP = {
+    'ja': 'Japanese', 'en': 'English', 'zh-CN': 'Chinese (Simplified)',
+    'zh-TW': 'Chinese (Traditional)', 'ko': 'Korean', 'vi': 'Vietnamese'
+  };
+  const LANG_NAME_TO_CODE = Object.fromEntries(Object.entries(LANG_CODE_MAP).map(([k, v]) => [v, k]));
+  const toLangName = code => LANG_CODE_MAP[code] || code;
 
-  // Error types must match server (categorize_error + stream/rate limiter)
   const ERROR_MAP = {
     UNAUTHORIZED: 'Auth failed', FORBIDDEN: 'Access denied', MODEL_NOT_FOUND: 'Model not found',
     RATE_LIMIT: 'Rate limited', TIMEOUT: 'Timeout', CONTEXT_LENGTH_EXCEEDED: 'Text too long',
@@ -347,6 +377,11 @@
   const tagAbstractor = new TagAbstraction();
   window.PageTranslator = { TagAbstraction };
 
+  function markProcessed(element) {
+    processed.add(element);
+    element.querySelectorAll('*').forEach(child => processed.add(child));
+  }
+
   // ============================================================================
   // STYLES
   // ============================================================================
@@ -364,7 +399,7 @@
       .pt-inline-replaced:hover { background-color: rgba(52, 168, 83, 0.25) !important; }
       .pt-inline-replaced::after { content: '↩' !important; position: absolute !important; top: -8px !important; right: -8px !important; width: 16px !important; height: 16px !important; background: #f44336 !important; color: white !important; font-size: 10px !important; line-height: 16px !important; text-align: center !important; border-radius: 50% !important; opacity: 0 !important; transform: scale(0.8) !important; transition: opacity 0.15s ease, transform 0.15s ease !important; pointer-events: none !important; }
       .pt-inline-replaced:hover::after { opacity: 1 !important; transform: scale(1) !important; }
-      #page-translator-tooltip { position: fixed !important; max-width: 350px !important; min-width: 200px !important; padding: 0 !important; background: #fff !important; color: #333 !important; font-size: 14px !important; line-height: 1.5 !important; border-radius: 8px !important; box-shadow: 0 6px 32px rgba(0, 0, 0, 0.18) !important; z-index: 2147483647 !important; opacity: 0; transform: translateY(4px); transition: opacity 0.15s ease, transform 0.15s ease !important; overflow: hidden !important; pointer-events: auto !important; word-wrap: break-word !important; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important; box-sizing: border-box !important; }
+      #page-translator-tooltip { position: fixed !important; max-width: 350px !important; min-width: 200px !important; padding: 0 !important; background: #fff !important; color: #333 !important; font-size: 14px !important; line-height: 1.5 !important; border-radius: 8px !important; border: none !important; box-shadow: 0 6px 32px rgba(0, 0, 0, 0.18) !important; z-index: 2147483647 !important; pointer-events: auto !important; opacity: 0; transform: translateY(4px); transition: opacity 0.15s ease, transform 0.15s ease !important; word-wrap: break-word !important; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important; box-sizing: border-box !important; overflow: hidden !important; }
       #page-translator-tooltip.visible { opacity: 1 !important; transform: translateY(0) !important; }
       #page-translator-tooltip .pt-tooltip-header { display: flex !important; align-items: center !important; justify-content: space-between !important; padding: 8px 12px !important; margin: 0 !important; background: linear-gradient(135deg, #4285f4, #34a853) !important; }
       #page-translator-tooltip .pt-tooltip-label { font-size: 11px !important; font-weight: 600 !important; color: white !important; text-transform: uppercase !important; letter-spacing: 0.5px !important; }
@@ -395,24 +430,33 @@
     return tooltip;
   }
 
-  const scheduleHide = (delay = 300) => { clearTimeout(hideTimer); hideTimer = setTimeout(() => { if (!hoveringTooltip) hideTooltip(); }, delay); };
+  const clearHideTimer = () => { if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; } };
+  const scheduleHide = (delay = 150) => {
+    clearHideTimer();
+    hideTimer = setTimeout(() => { if (!hoveringTooltip) hideTooltip(); }, delay);
+  };
+
   const escapeHtml = t => { const d = document.createElement('div'); d.textContent = t; return d.innerHTML; };
 
   function showTooltip(el, original) {
     const t = createTooltip();
     t.innerHTML = `<div class="pt-tooltip-header"><span class="pt-tooltip-label">Original</span><button class="pt-copy-btn" title="Copy">${COPY_ICON}</button></div><span class="pt-tooltip-text">${escapeHtml(original)}</span>`;
+    
     const btn = t.querySelector('.pt-copy-btn');
     btn.onclick = e => {
       e.stopPropagation();
       navigator.clipboard.writeText(original).then(() => {
         btn.innerHTML = CHECK_ICON;
-        setTimeout(() => btn.innerHTML = COPY_ICON, 1500);
+        btn.classList.add('copied');
+        setTimeout(() => { btn.innerHTML = COPY_ICON; btn.classList.remove('copied'); }, 1500);
       });
     };
+
     const rect = el.getBoundingClientRect();
     let top = rect.top - 10, left = rect.left + rect.width / 2;
     t.style.visibility = 'hidden';
     t.classList.add('visible');
+
     requestAnimationFrame(() => {
       const tr = t.getBoundingClientRect();
       top = (top - tr.height < 10) ? rect.bottom + 10 : top - tr.height;
@@ -427,27 +471,29 @@
     if (tooltip) tooltip.classList.remove('visible');
     hoveredEl = null;
     hoveringTooltip = false;
-    clearTimeout(hideTimer);
+    clearHideTimer();
   }
 
   function setupTooltip() {
     document.addEventListener('mouseover', e => {
       if (hoveringTooltip) return;
-      const target = e.target.closest('.pt-translated, .pt-translated-block, .pt-inline-replaced');
+      const target = e.target.closest('.pt-translated, .pt-translated-block');
       if (target && target !== hoveredEl) {
-        clearTimeout(hideTimer);
+        clearHideTimer();
         hoveredEl = target;
         if (target.dataset.ptOriginal) showTooltip(target, target.dataset.ptOriginal);
       }
     });
+
     document.addEventListener('mouseout', e => {
       if (hoveringTooltip) return;
-      const target = e.target.closest('.pt-translated, .pt-translated-block, .pt-inline-replaced');
+      const target = e.target.closest('.pt-translated, .pt-translated-block');
       const t = document.getElementById(TOOLTIP_ID);
       if (t && (t.contains(e.relatedTarget) || e.relatedTarget === t)) return;
       if (target && !target.contains(e.relatedTarget)) scheduleHide(2000);
     });
-    document.addEventListener('scroll', hideTooltip, true);
+
+    document.addEventListener('scroll', () => { clearHideTimer(); hideTooltip(); }, true);
   }
 
   // ============================================================================
@@ -473,7 +519,7 @@
     chrome.storage.local.set({ pageTranslationInProgress: true, pageTranslationStartTime: Date.now() });
     const el = document.createElement('div');
     el.id = STATUS_ID;
-    el.style.cssText = 'position:fixed;top:20px;right:20px;background:linear-gradient(135deg,#4285f4,#34a853);color:white;padding:12px 20px;border-radius:24px;font-family:-apple-system,sans-serif;font-size:14px;font-weight:500;box-shadow:0 4px 12px rgba(66,133,244,0.4);z-index:2147483647;display:flex;align-items:center;gap:10px;';
+    el.style.cssText = 'position:fixed;top:20px;right:20px;background:linear-gradient(135deg,#4285f4,#34a853);color:white;padding:12px 20px;border-radius:24px;font-family:"Google Sans",-apple-system,sans-serif;font-size:14px;font-weight:500;box-shadow:0 4px 12px rgba(66,133,244,0.4);z-index:2147483647;display:flex;align-items:center;gap:10px;transition:opacity 0.3s;';
     el.innerHTML = '<div style="width:16px;height:16px;border:2px solid rgba(255,255,255,0.3);border-top-color:white;border-radius:50%;animation:spin 0.8s linear infinite;"></div><span class="status-text">Initializing...</span>';
     const style = document.createElement('style');
     style.textContent = '@keyframes spin{to{transform:rotate(360deg)}}';
@@ -481,43 +527,42 @@
     document.body.appendChild(el);
   }
 
-  const updateStatus = (cur, total) => { const el = document.getElementById(STATUS_ID); if (el) el.querySelector('.status-text').textContent = `Translating ${cur}/${total}...`; };
+  const updateStatus = (cur, total) => { 
+    const el = document.getElementById(STATUS_ID); 
+    if (el) el.querySelector('.status-text').textContent = `Translating ${cur}/${total}...`; 
+  };
 
   function showComplete(success, msg, errorDetails = null) {
     const el = document.getElementById(STATUS_ID);
     if (!el) return;
     
     if (success) {
-      // On success, just remove the indicator immediately without showing a message
       el.style.opacity = '0';
       setTimeout(() => el.remove(), 300);
       isTranslating = false;
       chrome.storage.local.set({ pageTranslationInProgress: false });
     } else {
-      // On error, show the error message
-      el.style.background = 'linear-gradient(135deg,#ea4335,#c5221f)';
-      const spinner = el.querySelector('div');
-      if (spinner) spinner.style.display = 'none';
-      
-      // Show user-friendly error message
-      let displayMsg = msg || 'Failed';
-      if (errorDetails) {
-        displayMsg = parsePageError(errorDetails);
+      const spinner = el.querySelector('div[style*="animation"]');
+      if (spinner) {
+        spinner.style.animation = 'none';
+        spinner.style.border = 'none';
+        spinner.textContent = '✗';
+        spinner.style.fontSize = '16px';
       }
+      
+      let displayMsg = msg || 'Failed';
+      if (errorDetails) displayMsg = parsePageError(errorDetails);
       el.querySelector('.status-text').textContent = displayMsg;
-      setTimeout(removeStatus, 5000); // Show errors longer
+      el.style.background = 'linear-gradient(135deg,#ea4335,#fbbc05)';
+      
+      setTimeout(() => {
+        el.style.opacity = '0';
+        setTimeout(() => el.remove(), 300);
+        isTranslating = false;
+        chrome.storage.local.set({ pageTranslationInProgress: false });
+      }, 4000);
     }
   }
-
-  function removeStatus() {
-    const el = document.getElementById(STATUS_ID);
-    if (!el) return;
-    isTranslating = false;
-    chrome.storage.local.set({ pageTranslationInProgress: false });
-    el.style.opacity = '0';
-    setTimeout(() => el.remove(), 300);
-  }
-
 
   // ============================================================================
   // DOM EXTRACTION
@@ -554,14 +599,6 @@
     return false;
   }
 
-  function markProcessed(el) {
-    processed.add(el);
-    if (el.nodeType === Node.ELEMENT_NODE) {
-      el.querySelectorAll('*').forEach(child => processed.add(child));
-    }
-  }
-
-  // Semantic clustering - determines if element should be translated as a unit
   function shouldCluster(element) {
     if (!element || element.nodeType !== Node.ELEMENT_NODE) return false;
     if (BLOCK.has(element.tagName) && !isExcluded(element) && !isInFooter(element)) {
@@ -581,7 +618,6 @@
     function process(element) {
       if (processed.has(element) || isExcluded(element) || isInFooter(element)) return;
 
-      // Check for semantic cluster - translate entire block element with HTML preservation
       if (shouldCluster(element)) {
         const originalHTML = element.innerHTML;
         const plainText = element.textContent.trim();
@@ -594,13 +630,9 @@
         }
       }
       
-      // Process child nodes
       for (const child of element.childNodes) {
-        if (child.nodeType === Node.ELEMENT_NODE) {
-          if (EXCLUDED.includes(child.tagName) || child.id === TOOLTIP_ID || child.id === STATUS_ID) continue;
-          if (child.classList?.contains('pt-translated') || child.classList?.contains('pt-translated-block')) continue;
-          process(child);
-        } else if (child.nodeType === Node.TEXT_NODE && child.textContent.trim() && /\p{L}/u.test(child.textContent)) {
+        if (child.nodeType === Node.ELEMENT_NODE) process(child);
+        if (child.nodeType === Node.TEXT_NODE && child.textContent.trim() && /\p{L}/u.test(child.textContent)) {
           nodes.push({ type: 'TEXT', content: child.textContent, node: child });
         }
       }
@@ -617,65 +649,42 @@
     if (!translation) return;
     
     if (info.type === 'TEXT') {
-      // Wrap text node in a span so we can track and toggle it
       try {
         const originalText = info.node.textContent;
         const parent = info.node.parentNode;
         if (!parent) return;
         
-        // Create a wrapper span for the text node
         const wrapper = document.createElement('span');
         wrapper.className = 'pt-translated-text';
         wrapper.textContent = translation;
         wrapper.dataset.ptOriginal = originalText;
         
-        // Store in TranslationStateManager for toggle functionality
-        TranslationStateManager.store(
-          wrapper,
-          originalText,  // originalHTML (just text for TEXT nodes)
-          originalText,
-          translation,   // translatedHTML (just text for TEXT nodes)
-          translation
-        );
-        
-        // Replace text node with wrapper
+        TranslationStateManager.store(wrapper, [info.node], originalText, null, translation, 'TEXT');
         parent.replaceChild(wrapper, info.node);
       } catch {}
       return;
     }
 
-    // CLUSTER type - restore HTML tags from placeholders
-    if (info.type === 'CLUSTER') {
-      const restoredHTML = tagAbstractor.restore(translation, info.mapping);
+    const restoredHTML = tagAbstractor.restore(translation, info.mapping);
+    
+    try {
+      const originalNodes = Array.from(info.element.childNodes);
+      const originalHTML = info.originalHTML;
+      const temp = document.createElement('div');
+      temp.innerHTML = originalHTML;
+      const originalText = temp.textContent.trim();
       
-      try {
-        // Store the state before modifying DOM
-        const originalHTML = info.originalHTML;
-        const temp = document.createElement('div');
-        temp.innerHTML = originalHTML;
-        const originalText = temp.textContent.trim();
-        
-        const tempTrans = document.createElement('div');
-        tempTrans.innerHTML = restoredHTML;
-        const translatedText = tempTrans.textContent.trim();
-        
-        // Store in TranslationStateManager for toggle functionality
-        TranslationStateManager.store(
-          info.element,
-          originalHTML,
-          originalText,
-          restoredHTML,
-          translatedText
-        );
-        
-        // Update DOM
-        info.element.innerHTML = restoredHTML;
-        info.element.classList.add('pt-translated-block');
-        info.element.dataset.ptOriginal = originalText;
-        info.element.dataset.ptOriginalHtml = originalHTML;
-      } catch {}
-      return;
-    }
+      const tempTrans = document.createElement('div');
+      tempTrans.innerHTML = restoredHTML;
+      const translatedText = tempTrans.textContent.trim();
+      
+      TranslationStateManager.store(info.element, originalNodes, originalText, restoredHTML, translatedText, 'BLOCK');
+      
+      info.element.innerHTML = restoredHTML;
+      info.element.classList.add('pt-translated-block');
+      info.element.dataset.ptOriginal = originalText;
+      info.element.dataset.ptOriginalHtml = originalHTML;
+    } catch {}
   }
 
   // ============================================================================
@@ -768,7 +777,6 @@
           }, { useMasking: batchInfo.useMasking }).catch(e => { 
             errors++; 
             lastError = e.message || String(e);
-            console.error('Translation error:', e); 
           })
         );
       }
@@ -778,10 +786,8 @@
     if (errors === 0) {
       showComplete(true, 'Translation complete!');
     } else if (count === 0) {
-      // All failed - show the error
       showComplete(false, null, lastError);
     } else {
-      // Partial success
       showComplete(false, `${count}/${total} translated`, lastError);
     }
   }
@@ -799,7 +805,8 @@
   }
 
   function observeMutations() {
-    const observer = new MutationObserver(mutations => {
+    if (window.pageTranslatorObserver) window.pageTranslatorObserver.disconnect();
+    window.pageTranslatorObserver = new MutationObserver(mutations => {
       for (const m of mutations) {
         for (const node of m.addedNodes) {
           if (isOwnEl(node)) continue;
@@ -815,7 +822,7 @@
         }
       }, DEBOUNCE_MS);
     });
-    observer.observe(document.documentElement, { childList: true, subtree: true });
+    window.pageTranslatorObserver.observe(document.documentElement, { childList: true, subtree: true });
   }
 
   // ============================================================================
@@ -823,7 +830,6 @@
   // ============================================================================
 
   async function translatePage(targetLanguage) {
-    // Reset state for fresh translation
     TranslationStateManager.reset();
     hideToggleUI();
     
@@ -837,14 +843,12 @@
       return;
     }
     
-    // Store target language
     if (targetLanguage) {
       TranslationStateManager.targetLanguage = targetLanguage;
     }
     
     await processNodes(nodes);
     
-    // Mark translation as complete and show toggle UI
     TranslationStateManager.isTranslated = true;
     TranslationStateManager.displayMode = 'translated';
     showToggleUI();
@@ -858,12 +862,9 @@
       return true;
     }
     if (msg.action === 'getSelectedText') {
-      const selection = window.getSelection();
-      const text = selection?.toString().trim() || '';
-      sendResponse({ text });
+      sendResponse({ text: window.getSelection()?.toString().trim() || '' });
       return true;
     }
-    // Toggle translation display
     if (msg.action === 'toggleTranslation') {
       if (!TranslationStateManager.isTranslated) {
         sendResponse({ success: false, error: 'Page not translated yet' });
@@ -873,7 +874,6 @@
       sendResponse({ success: true, displayMode: newMode });
       return true;
     }
-    // Show original text
     if (msg.action === 'showOriginal') {
       if (!TranslationStateManager.isTranslated) {
         sendResponse({ success: false, error: 'Page not translated yet' });
@@ -883,7 +883,6 @@
       sendResponse({ success: true, displayMode: 'original' });
       return true;
     }
-    // Show translated text
     if (msg.action === 'showTranslated') {
       if (!TranslationStateManager.isTranslated) {
         sendResponse({ success: false, error: 'Page not translated yet' });
@@ -893,30 +892,17 @@
       sendResponse({ success: true, displayMode: 'translated' });
       return true;
     }
-    // Get translation status
     if (msg.action === 'getTranslationStatus') {
-      sendResponse({
-        success: true,
-        ...TranslationStateManager.getStats()
-      });
+      sendResponse({ success: true, ...TranslationStateManager.getStats() });
       return true;
     }
   });
 
-  // ============================================================================
-  // COPY EVENT LISTENER - Store copied text for popup
-  // ============================================================================
-
+  // Copy event listener
   document.addEventListener('copy', () => {
     setTimeout(() => {
-      const selection = window.getSelection();
-      const text = selection?.toString().trim();
-      if (text) {
-        chrome.storage.local.set({ 
-          lastCopiedText: text,
-          lastCopiedTimestamp: Date.now()
-        });
-      }
+      const text = window.getSelection()?.toString().trim();
+      if (text) chrome.storage.local.set({ lastCopiedText: text, lastCopiedTimestamp: Date.now() });
     }, 10);
   });
 
@@ -929,7 +915,6 @@
   async function loadInlineSettings() {
     return new Promise(resolve => {
       chrome.storage.local.get({ recentLanguages: ['Japanese', 'English', 'Vietnamese'], textTargetLang: 'English' }, result => {
-        // Use full language names as codes (convert any legacy short codes)
         const recentLangs = result.recentLanguages.map(n => toLangName(n)).filter(c => c);
         const defaultLang = toLangName(result.textTargetLang);
         resolve({ recentLanguages: recentLangs, defaultLang });
@@ -938,7 +923,6 @@
   }
 
   async function addToHistory(src, trans, langCode) {
-    // langCode is now the full name (e.g., 'Vietnamese', not 'vi')
     const langName = toLangName(langCode);
     return new Promise(resolve => {
       chrome.storage.local.get({ translationHistory: [] }, result => {
@@ -949,13 +933,11 @@
   }
 
   async function updateRecentLangs(langCode) {
-    // langCode is now the full name (e.g., 'Vietnamese', not 'vi')
     const langName = toLangName(langCode);
     return new Promise(resolve => {
       chrome.storage.local.get({ recentLanguages: [] }, result => {
         let recent = [langName, ...result.recentLanguages.filter(l => l !== langName)].slice(0, 4);
         chrome.storage.local.set({ recentLanguages: recent }, () => {
-          // Pass full language names to inline translator
           if (inlineTranslator) inlineTranslator.updateRecentLanguages(recent);
           resolve(recent);
         });
@@ -966,7 +948,11 @@
   async function initInline() {
     if (typeof InlineTranslator === 'undefined') return;
     
-    // Initialize tooltip system for inline translations
+    const { inlineIconEnabled } = await new Promise(resolve => 
+      chrome.storage.local.get({ inlineIconEnabled: true }, resolve)
+    );
+    if (!inlineIconEnabled) return;
+    
     injectStyles();
     setupTooltip();
     
@@ -1008,11 +994,18 @@
     inlineTranslator.init();
 
     chrome.storage.onChanged.addListener((changes, area) => {
-      if (area !== 'local' || !inlineTranslator) return;
-      if (changes.recentLanguages) {
-        // Pass full language names to inline translator
+      if (area !== 'local') return;
+      if (changes.recentLanguages && inlineTranslator) {
         const langs = (changes.recentLanguages.newValue || []).map(n => toLangName(n));
         inlineTranslator.updateRecentLanguages(langs);
+      }
+      if (changes.inlineIconEnabled) {
+        if (changes.inlineIconEnabled.newValue === false && inlineTranslator) {
+          inlineTranslator.destroy();
+          inlineTranslator = null;
+        } else if (changes.inlineIconEnabled.newValue === true && !inlineTranslator) {
+          initInline();
+        }
       }
     });
   }

@@ -65,15 +65,21 @@ function buildPayload(batch, settings, stream = false, options = {}) {
   // Construct full endpoint from model
   const fullEndpoint = getFullEndpoint(settings.model);
   
+  // Helper to inject Zero-Width Spaces to prevent merging
+  const protectPlaceholders = (text) => text.replace(/(\{\{\/?[a-z0-9]+\}\})/gi, '\u200B$1\u200B');
+
   // For inline translator - single text with formatting preservation
   if (isInlineTranslator) {
-    const hasPlaceholders = /\{\{\/?(\d+|br)\}\}/.test(batch[0]);
+    const rawText = batch[0];
+    const hasPlaceholders = /\{\{\/?(\d+|br)\}\}/.test(rawText);
+    const textToSend = hasPlaceholders ? protectPlaceholders(rawText) : rawText;
+
     const systemPrompt = hasPlaceholders
       ? `Translate the following text to ${targetLang}. 
 CRITICAL RULES:
 1. Preserve ALL placeholders like {{0}}, {{/0}}, {{1}}, {{/1}}, {{br}} EXACTLY as they appear.
 2. These placeholders represent HTML formatting - keep them in the same relative position around translated words.
-3. Keep all line breaks and paragraph spacing.
+3. Do NOT merge words with placeholders.
 4. Return ONLY the translation, no explanations.
 Example: "Hello {{0}}World{{/0}}" → "Bonjour {{0}}Monde{{/0}}"`
       : `Translate the following text to ${targetLang}. IMPORTANT: Preserve exact formatting - keep all line breaks, paragraph spacing, and special characters exactly as in the original. Return only the translation.`;
@@ -84,7 +90,7 @@ Example: "Hello {{0}}World{{/0}}" → "Bonjour {{0}}Monde{{/0}}"`
       password: settings.password,
       model: settings.model,
       system_prompt: systemPrompt,
-      user_input: batch[0],
+      user_input: textToSend,
       temperature: 0.3,
       top_p: 0.9,
       stream: false
@@ -92,6 +98,8 @@ Example: "Hello {{0}}World{{/0}}" → "Bonjour {{0}}Monde{{/0}}"`
   }
   
   // For batch translation (page translation) - HTML-aware
+  const protectedBatch = batch.map(protectPlaceholders);
+
   const systemPrompt = `You are a professional web translator.
 Task: Translate the following JSON array of strings into ${targetLang}.
 Input: A JSON array of strings.
@@ -101,10 +109,10 @@ Rules:
 2. Translate in context.
 3. Keep the output valid JSON. Escape all double quotes within strings correctly.
 4. Do NOT output Markdown code blocks.
-5. Do NOT add any conversational text.
-6. The input text may contain placeholders like {{0}}, {{/0}}, {{br}}. These represent HTML tags.
+5. The input text contains placeholders like {{0}}, {{/0}}, {{br}}. These represent HTML tags.
    - You MUST preserve them exactly in the translation.
    - You MUST place the translated text INSIDE the corresponding tags if they wrap content.
+   - Do NOT merge text with these placeholders.
    - Example: "Hello {{0}}World{{/0}}" -> "Bonjour {{0}}Monde{{/0}}".`;
 
   return {
@@ -113,7 +121,7 @@ Rules:
     password: settings.password,
     model: settings.model,
     system_prompt: systemPrompt,
-    user_input: JSON.stringify(batch),
+    user_input: JSON.stringify(protectedBatch),
     temperature: 0.3,
     top_p: 0.9,
     stream
@@ -125,13 +133,16 @@ function buildInlinePayload(text, settings) {
   const fullEndpoint = getFullEndpoint(settings.model);
   const hasPlaceholders = /\{\{\/?(\d+|br)\}\}/.test(text);
   
+  // Helper to inject Zero-Width Spaces
+  const protectPlaceholders = (t) => t.replace(/(\{\{\/?[a-z0-9]+\}\})/gi, '\u200B$1\u200B');
+  const textToSend = hasPlaceholders ? protectPlaceholders(text) : text;
+  
   const systemPrompt = hasPlaceholders
     ? `Translate the following text to ${settings.targetLanguage}. 
 CRITICAL RULES:
-1. Preserve ALL placeholders like {{0}}, {{/0}}, {{1}}, {{/1}}, {{br}} EXACTLY as they appear.
-2. These placeholders represent HTML formatting - keep them in the same relative position around translated words.
-3. Keep all line breaks and paragraph spacing.
-4. Return ONLY the translation, no explanations.`
+1. Preserve ALL placeholders like {{0}}, {{/0}}, {{br}} EXACTLY as they appear.
+2. These placeholders represent HTML formatting - keep them in the same relative position.
+3. Return ONLY the translation, no explanations.`
     : `Translate the following text to ${settings.targetLanguage}. Preserve exact formatting - keep all line breaks and spacing. Return only the translation.`;
 
   return {
@@ -140,7 +151,7 @@ CRITICAL RULES:
     password: settings.password,
     model: settings.model,
     system_prompt: systemPrompt,
-    user_input: text,
+    user_input: textToSend,
     temperature: 0.3,
     top_p: 0.9,
     stream: false

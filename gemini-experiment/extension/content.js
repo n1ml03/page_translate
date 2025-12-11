@@ -8,7 +8,7 @@
   // Translation State Manager - Stores original/translated content for toggle
   // ============================================
   const TranslationStateManager = {
-    // Map of element -> { originalHTML, originalText, translatedHTML, translatedText }
+    // Map of element -> { originalNodes, originalText, translatedHTML, translatedText, type }
     elementStates: new WeakMap(),
     // Array of translated elements (for iteration since WeakMap can't be iterated)
     translatedElements: [],
@@ -20,8 +20,8 @@
     targetLanguage: null,
 
     // Store translation state for an element
-    store(element, originalHTML, originalText, translatedHTML, translatedText) {
-      const state = { originalHTML, originalText, translatedHTML, translatedText };
+    store(element, originalNodes, originalText, translatedHTML, translatedText, type) {
+      const state = { originalNodes, originalText, translatedHTML, translatedText, type };
       this.elementStates.set(element, state);
       if (!this.translatedElements.includes(element)) {
         this.translatedElements.push(element);
@@ -43,24 +43,39 @@
       if (this.displayMode === 'original') return;
       this.displayMode = 'original';
       
+      // Pause mutation observer if active to prevent re-triggering translation on restored nodes
+      if (window.pageTranslatorObserver) window.pageTranslatorObserver.disconnect();
+
       // Clean up dead references and switch content
       this.translatedElements = this.translatedElements.filter(element => {
-        if (!document.contains(element)) return false;
         const state = this.elementStates.get(element);
-        if (state) {
-          // Check if it's a text span or block element
-          if (element.classList.contains('pt-translated-text')) {
-            element.textContent = state.originalText;
-          } else {
-            element.innerHTML = state.originalHTML;
-          }
-          element.classList.remove('pt-translated-block', 'pt-translated-text');
-          element.classList.add('pt-original-shown');
+        if (!state) return false;
+
+        if (state.type === 'TEXT') {
+            // Check if wrapper is in DOM
+            if (document.contains(element) && element.parentNode) {
+                // Replace wrapper with original node(s)
+                // For text, it's usually just one text node
+                const originalNode = state.originalNodes[0];
+                element.parentNode.replaceChild(originalNode, element);
+            }
+        } else {
+            // Block element
+            if (document.contains(element)) {
+                element.innerHTML = '';
+                element.append(...state.originalNodes);
+                element.classList.remove('pt-translated-block', 'pt-translated-text');
+                element.classList.add('pt-original-shown');
+            } else {
+                return false;
+            }
         }
         return true;
       });
       
       updateToggleUI();
+      // Re-enable observer (captured in global var or accessible scope)
+      if (observeMutations) observeMutations(); 
     },
 
     // Switch all elements to show translated text
@@ -68,26 +83,40 @@
       if (this.displayMode === 'translated') return;
       this.displayMode = 'translated';
       
+      if (window.pageTranslatorObserver) window.pageTranslatorObserver.disconnect();
+
       // Clean up dead references and switch content
       this.translatedElements = this.translatedElements.filter(element => {
-        if (!document.contains(element)) return false;
         const state = this.elementStates.get(element);
         if (state) {
-          // Check if it's a text span (has pt-original-shown but was originally pt-translated-text)
-          const isTextSpan = element.tagName === 'SPAN' && element.dataset.ptOriginal;
-          if (isTextSpan) {
-            element.textContent = state.translatedText;
-            element.classList.add('pt-translated-text');
+          if (state.type === 'TEXT') {
+             // For text, we need to find the original node and replace it back with wrapper
+             const originalNode = state.originalNodes[0];
+             if (document.contains(originalNode) && originalNode.parentNode) {
+                 originalNode.parentNode.replaceChild(element, originalNode);
+                 element.textContent = state.translatedText; // Ensure text is correct
+                 element.classList.add('pt-translated-text');
+             } else if (document.contains(element)) {
+                 // Already there?
+             } else {
+                 return false; // Lost reference
+             }
           } else {
-            element.innerHTML = state.translatedHTML;
-            element.classList.add('pt-translated-block');
+             // Block element
+             if (document.contains(element)) {
+                 element.innerHTML = state.translatedHTML;
+                 element.classList.add('pt-translated-block');
+                 element.classList.remove('pt-original-shown');
+             } else {
+                 return false;
+             }
           }
-          element.classList.remove('pt-original-shown');
         }
         return true;
       });
       
       updateToggleUI();
+      if (observeMutations) observeMutations();
     },
 
     // Toggle between original and translated
@@ -590,10 +619,11 @@
         // Store in TranslationStateManager for toggle functionality
         TranslationStateManager.store(
           wrapper,
-          originalText,  // originalHTML (just text for TEXT nodes)
+          [info.node],   // originalNodes
           originalText,
-          translation,   // translatedHTML (just text for TEXT nodes)
-          translation
+          null,          // translatedHTML (not generic for text)
+          translation,
+          'TEXT'
         );
         
         // Replace text node with wrapper
@@ -606,6 +636,7 @@
     
     try {
       // Store the state before modifying DOM
+      const originalNodes = Array.from(info.element.childNodes);
       const originalHTML = info.originalHTML;
       const temp = document.createElement('div');
       temp.innerHTML = originalHTML;
@@ -618,10 +649,11 @@
       // Store in TranslationStateManager for toggle functionality
       TranslationStateManager.store(
         info.element,
-        originalHTML,
+        originalNodes,
         originalText,
         restoredHTML,
-        translatedText
+        translatedText,
+        'BLOCK'
       );
       
       // Update DOM
@@ -737,7 +769,8 @@
   }
 
   function observeMutations() {
-    const observer = new MutationObserver(mutations => {
+    if (window.pageTranslatorObserver) window.pageTranslatorObserver.disconnect();
+    window.pageTranslatorObserver = new MutationObserver(mutations => {
       for (const mutation of mutations) {
         for (const node of mutation.addedNodes) {
           if (isOwnElement(node)) continue;
@@ -753,7 +786,7 @@
         }
       }, MUTATION_DEBOUNCE_MS);
     });
-    observer.observe(document.documentElement, { childList: true, subtree: true });
+    window.pageTranslatorObserver.observe(document.documentElement, { childList: true, subtree: true });
   }
 
   // Main
@@ -888,6 +921,12 @@
   async function initInlineTranslator() {
     if (typeof InlineTranslator === 'undefined') return;
 
+    // Check if inline icon is enabled
+    const { inlineIconEnabled } = await new Promise(resolve => 
+      chrome.storage.local.get({ inlineIconEnabled: true }, resolve)
+    );
+    if (!inlineIconEnabled) return;
+
     const settings = await loadInlineSettings();
     const languages = Object.entries(LANG_CODE_MAP).map(([code, name]) => ({ code, name }));
 
@@ -930,9 +969,18 @@
     inlineTranslator.init();
 
     chrome.storage.onChanged.addListener((changes, area) => {
-      if (area !== 'local' || !inlineTranslator) return;
-      if (changes.recentLanguages) {
+      if (area !== 'local') return;
+      if (changes.recentLanguages && inlineTranslator) {
         inlineTranslator.updateRecentLanguages((changes.recentLanguages.newValue || []).map(name => LANG_NAME_TO_CODE[name] || name));
+      }
+      // Handle inline icon enable/disable
+      if (changes.inlineIconEnabled) {
+        if (changes.inlineIconEnabled.newValue === false && inlineTranslator) {
+          inlineTranslator.destroy();
+          inlineTranslator = null;
+        } else if (changes.inlineIconEnabled.newValue === true && !inlineTranslator) {
+          initInlineTranslator();
+        }
       }
     });
   }

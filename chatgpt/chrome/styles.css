@@ -948,3 +948,58 @@ button.loading::after {
 .translation-status.original-mode .status-dot {
   background: var(--text-secondary);
 }
+
+/* Toggle Switch for Inline Icon */
+.inline-icon-toggle {
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border-color);
+}
+
+.toggle-switch {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  cursor: pointer;
+  user-select: none;
+}
+
+.toggle-switch input[type="checkbox"] {
+  display: none;
+}
+
+.toggle-slider {
+  position: relative;
+  width: 36px;
+  height: 20px;
+  background: var(--bg-tertiary);
+  border-radius: 10px;
+  transition: background-color 0.2s ease;
+  flex-shrink: 0;
+}
+
+.toggle-slider::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  background: white;
+  border-radius: 50%;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+  transition: transform 0.2s ease;
+}
+
+.toggle-switch input[type="checkbox"]:checked + .toggle-slider {
+  background: var(--color-primary);
+}
+
+.toggle-switch input[type="checkbox"]:checked + .toggle-slider::after {
+  transform: translateX(16px);
+}
+
+.toggle-switch .toggle-text {
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+}

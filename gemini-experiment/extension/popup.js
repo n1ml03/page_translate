@@ -8,7 +8,8 @@ const DEFAULT_SETTINGS = {
   textTargetLang: 'English',
   recentLanguages: ['Japanese', 'English', 'Vietnamese'],
   translationHistory: [],
-  autoTranslate: false
+  autoTranslate: false,
+  inlineIconEnabled: true
 };
 
 const LANGUAGES = [
@@ -108,13 +109,14 @@ async function handleTestConnection() {
 async function handleSaveSettings() {
   const serverUrl = document.getElementById('serverUrl').value;
   const model = document.getElementById('model').value;
+  const inlineIconEnabled = document.getElementById('inlineIconEnabled')?.checked ?? true;
   
   if (!validateUrl(serverUrl)) { showToast('Please enter a valid server URL', 'error'); return; }
   
   setButtonLoading(document.getElementById('saveSettingsBtn'), true);
   
   try {
-    await saveSettings({ serverUrl, model });
+    await saveSettings({ serverUrl, model, inlineIconEnabled });
     showToast('Settings saved!', 'success');
     closeSettingsModal();
     updateConnectionStatusUI({ status: 'checking', message: 'Checking...' });
@@ -609,6 +611,9 @@ async function initializePopup() {
   document.getElementById('model').value = settings.model;
   document.getElementById('targetLanguage').value = settings.targetLanguage;
   document.getElementById('textTargetLang').value = settings.textTargetLang || DEFAULT_SETTINGS.textTargetLang;
+  
+  const inlineIconToggle = document.getElementById('inlineIconEnabled');
+  if (inlineIconToggle) inlineIconToggle.checked = settings.inlineIconEnabled ?? true;
 
   document.querySelectorAll('.tab-btn').forEach(btn => btn.addEventListener('click', () => switchTab(btn.dataset.tab)));
   if (settings.activeTab) switchTab(settings.activeTab);
